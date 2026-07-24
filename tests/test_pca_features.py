@@ -52,6 +52,43 @@ def test_pca_fit_is_deterministic_subsampled_and_sign_canonicalized() -> None:
     )
 
 
+def test_pca_fit_does_not_call_all_device_manual_seed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def reject_all_device_seed(seed: int) -> None:
+        del seed
+        raise AssertionError("fit_pca_basis must seed only the CPU generator")
+
+    monkeypatch.setattr(torch, "manual_seed", reject_all_device_seed)
+
+    fit_pca_basis(
+        [torch.arange(48, dtype=torch.float32).reshape(1, 4, 3, 4)],
+        seed=42,
+    )
+
+
+def test_pca_fit_preserves_cpu_and_initialized_cuda_rng_state() -> None:
+    if not torch.cuda.is_available() or torch.cuda.device_count() <= 4:
+        pytest.skip("permitted CUDA device 4 is unavailable")
+
+    cpu_before = torch.random.get_rng_state().clone()
+    with torch.cuda.device(4):
+        cuda_original = torch.cuda.get_rng_state(4).clone()
+        try:
+            torch.cuda.manual_seed(17)
+            cuda_before = torch.cuda.get_rng_state(4).clone()
+
+            fit_pca_basis(
+                [torch.arange(48, dtype=torch.float32).reshape(1, 4, 3, 4)],
+                seed=42,
+            )
+
+            torch.testing.assert_close(torch.random.get_rng_state(), cpu_before)
+            torch.testing.assert_close(torch.cuda.get_rng_state(4), cuda_before)
+        finally:
+            torch.cuda.set_rng_state(cuda_original, 4)
+
+
 def test_projection_uses_stored_global_bounds_without_per_image_normalization() -> None:
     incomplete = PCABasis(
         mean=np.zeros(3, dtype=np.float32),
@@ -89,6 +126,31 @@ def test_pca_load_rejects_tampered_parameters(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="fingerprint mismatch"):
         PCABasis.load(path)
+
+
+def test_pca_save_rejects_malformed_basis_with_matching_fingerprint(
+    tmp_path: Path,
+) -> None:
+    incomplete = PCABasis(
+        mean=np.array([np.nan, 0, 0], dtype=np.float32),
+        components=np.eye(3, dtype=np.float32),
+        lower=np.zeros(3, dtype=np.float32),
+        upper=np.ones(3, dtype=np.float32),
+        fingerprint="",
+    )
+    malformed = PCABasis(
+        mean=incomplete.mean,
+        components=incomplete.components,
+        lower=incomplete.lower,
+        upper=incomplete.upper,
+        fingerprint=pca_fingerprint(incomplete),
+    )
+    destination = tmp_path / "malformed.npz"
+
+    with pytest.raises(ValueError, match="finite"):
+        malformed.save(destination)
+
+    assert not destination.exists()
 
 
 @pytest.mark.parametrize("resolution", (74, 148, 296))

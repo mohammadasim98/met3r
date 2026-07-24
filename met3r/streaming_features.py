@@ -42,33 +42,34 @@ def iter_feature_variants(
             continue
         if variant.resolution <= 0:
             raise ValueError("feature resolution must be positive")
-        if variant.feature_mode == "bilinear":
-            upsampled = _retry_cuda_oom(
-                lambda: F.interpolate(
-                    native,
-                    (variant.resolution, variant.resolution),
-                    mode="bilinear",
-                    align_corners=False,
+        with torch.inference_mode():
+            if variant.feature_mode == "bilinear":
+                upsampled = _retry_cuda_oom(
+                    lambda: F.interpolate(
+                        native,
+                        (variant.resolution, variant.resolution),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
                 )
-            )
-        else:
-            try:
-                guide_name = _NAF_GUIDES[variant.feature_mode]
-            except KeyError as error:
-                raise ValueError(
-                    f"unsupported feature mode {variant.feature_mode!r}"
-                ) from error
-            if naf is None:
-                raise ValueError("NAF feature modes require a NAF upsampler")
-            if guides is None:
-                guides = _retry_cuda_oom(lambda: build_naf_guides(images))
-            upsampled = _retry_cuda_oom(
-                lambda: naf(
-                    guides[guide_name],
-                    native,
-                    (variant.resolution, variant.resolution),
+            else:
+                try:
+                    guide_name = _NAF_GUIDES[variant.feature_mode]
+                except KeyError as error:
+                    raise ValueError(
+                        f"unsupported feature mode {variant.feature_mode!r}"
+                    ) from error
+                if naf is None:
+                    raise ValueError("NAF feature modes require a NAF upsampler")
+                if guides is None:
+                    guides = _retry_cuda_oom(lambda: build_naf_guides(images))
+                upsampled = _retry_cuda_oom(
+                    lambda: naf(
+                        guides[guide_name],
+                        native,
+                        (variant.resolution, variant.resolution),
+                    )
                 )
-            )
         try:
             yield variant, upsampled
         finally:

@@ -38,6 +38,7 @@ class PCABasis:
 
     def save(self, path: str | Path) -> Path:
         destination = Path(path)
+        _validate_basis(self)
         if self.fingerprint != pca_fingerprint(self):
             raise ValueError("PCA basis fingerprint mismatch")
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -131,7 +132,7 @@ def fit_pca_basis(
     mean = tokens.mean(dim=0)
     centered = tokens - mean
     with torch.random.fork_rng(devices=[]):
-        torch.manual_seed(seed)
+        torch.random.default_generator.manual_seed(seed)
         _, _, components = torch.pca_lowrank(
             centered,
             q=_PCA_COMPONENTS,

@@ -33,6 +33,21 @@ class FakeNAF(nn.Module):
         return F.interpolate(features, output_size, mode="nearest") + 1
 
 
+class ParameterizedNAF(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.projection = nn.Conv2d(3, 3, kernel_size=1)
+
+    def forward(
+        self,
+        guide: torch.Tensor,
+        features: torch.Tensor,
+        output_size: tuple[int, int],
+    ) -> torch.Tensor:
+        del guide, output_size
+        return self.projection(features)
+
+
 def _variants() -> tuple[FeatureVariant, ...]:
     return (
         FeatureVariant("t", "b", 8, "native", 2),
@@ -73,6 +88,27 @@ def test_streaming_generator_releases_previous_upsampled_variant() -> None:
     next(iterator)
     gc.collect()
 
+    assert reference() is None
+    iterator.close()
+
+
+def test_streaming_parameterized_naf_accepts_native_inference_tensor_without_grad() -> None:
+    images = torch.rand(4, 3, 8, 8)
+    native = MultiScaleFeatureExtractor(FakeBackbone()).extract_native(images)
+    variants = (
+        FeatureVariant("t", "b", 8, "naf_normal_guide", 2),
+        FeatureVariant("t", "b", 8, "naf_blurred_guide", 2),
+    )
+    iterator = iter_feature_variants(native, images, variants, ParameterizedNAF())
+
+    _, first = next(iterator)
+    assert not first.requires_grad
+    reference = weakref.ref(first)
+    del first
+    _, second = next(iterator)
+    gc.collect()
+
+    assert not second.requires_grad
     assert reference() is None
     iterator.close()
 
