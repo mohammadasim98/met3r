@@ -82,6 +82,7 @@ setup(
         entry_points={
                 "console_scripts": [
                         "met3r-known-camera=met3r.cli:main",
+                        "met3r-upper-experiment=met3r.upper_cli:main",
                 ],
         },
 
