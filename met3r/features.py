@@ -174,6 +174,15 @@ class MultiScaleFeatureExtractor(nn.Module):
         self.naf_upsampler = naf_upsampler
 
     @torch.inference_mode()
+    def extract_native(self, images: Tensor) -> Tensor:
+        """Extract only the native BCHW patch grid for streaming callers."""
+
+        native = self.backbone(images)
+        if native.ndim != 4:
+            raise ValueError("backbone must return BCHW patch features")
+        return native
+
+    @torch.inference_mode()
     def extract(
         self,
         images: Tensor,
@@ -182,9 +191,7 @@ class MultiScaleFeatureExtractor(nn.Module):
         naf_scales: Sequence[int] = (),
         naf_guides: Mapping[str, Tensor] | None = None,
     ) -> dict[str, Tensor]:
-        native = self.backbone(images)
-        if native.ndim != 4:
-            raise ValueError("backbone must return BCHW patch features")
+        native = self.extract_native(images)
 
         outputs = {"native": native}
         for scale in bilinear_scales:
