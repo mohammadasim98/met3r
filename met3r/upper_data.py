@@ -113,36 +113,121 @@ def asdict_paths(value: object) -> object:
 
 
 def _selected_attempt(payload: Mapping[str, object]) -> Mapping[str, object]:
-    selected = str(payload["selected_attempt_id"])
-    attempts = payload["attempts"]
+    selected = _required_nonempty_string(
+        payload, "selected_attempt_id", "selected attempt ID"
+    )
+    attempts = payload.get("attempts")
     if not isinstance(attempts, list):
         raise ValueError("deformation attempts must be a list")
     matches = [
         item for item in attempts
-        if isinstance(item, dict) and item.get("attempt_id") == selected
+        if isinstance(item, Mapping) and item.get("attempt_id") == selected
     ]
     if len(matches) != 1:
         raise ValueError(f"selected attempt {selected!r} is not unique")
     return matches[0]
 
 
+def _required_nonempty_string(
+    payload: Mapping[str, object], key: str, label: str
+) -> str:
+    value = payload.get(key)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{label} must be a non-empty string")
+    return value
+
+
+def _required_bool(payload: Mapping[str, object], key: str, label: str) -> bool:
+    value = payload.get(key)
+    if type(value) is not bool:
+        raise ValueError(f"{label} must be a boolean")
+    return value
+
+
+def _required_mapping(
+    payload: Mapping[str, object], key: str, label: str
+) -> Mapping[str, object]:
+    value = payload.get(key)
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} must be a JSON object")
+    return value
+
+
 def _quality(deformation: Mapping[str, object], task: Mapping[str, object]) -> DeformationQuality:
-    selected = _selected_attempt(deformation)
-    semantic = selected["semantic"]
-    preservation = selected["preservation"]
-    comparison = selected["comparison"]
-    if not all(isinstance(value, dict) for value in (semantic, preservation, comparison)):
-        raise ValueError("selected deformation audit is malformed")
-    return DeformationQuality(
-        status=str(deformation["status"]),
-        selected_attempt_id=str(deformation["selected_attempt_id"]),
-        semantic_gate=bool(semantic["passes_gate"]),
-        preservation_gate=bool(preservation["passes_gate"]),
-        camera_preserved=bool(semantic["camera_preserved"]),
-        outsole_preserved=bool(semantic["outsole_preserved"]),
-        fit_relation=str(comparison["relation"]),
-        task_status=str(task["status"]),
+    status = _required_nonempty_string(deformation, "status", "deformation status")
+    selected_attempt_id = _required_nonempty_string(
+        deformation, "selected_attempt_id", "selected attempt ID"
     )
+    selected = _selected_attempt(deformation)
+    semantic = _required_mapping(selected, "semantic", "selected semantic audit")
+    preservation = _required_mapping(selected, "preservation", "selected preservation audit")
+    comparison = _required_mapping(selected, "comparison", "selected comparison audit")
+    fit_relation = _required_nonempty_string(comparison, "relation", "fit relation")
+    if fit_relation not in {"improved", "equivalent", "worsened"}:
+        raise ValueError(f"fit relation is invalid: {fit_relation!r}")
+    return DeformationQuality(
+        status=status,
+        selected_attempt_id=selected_attempt_id,
+        semantic_gate=_required_bool(semantic, "passes_gate", "semantic gate"),
+        preservation_gate=_required_bool(
+            preservation, "passes_gate", "preservation gate"
+        ),
+        camera_preserved=_required_bool(
+            semantic, "camera_preserved", "camera preservation"
+        ),
+        outsole_preserved=_required_bool(
+            semantic, "outsole_preserved", "outsole preservation"
+        ),
+        fit_relation=fit_relation,
+        task_status=_required_nonempty_string(task, "status", "task status"),
+    )
+
+
+def _validate_metrics(
+    metrics: Mapping[str, object],
+    deformation: Mapping[str, object],
+    selected: Mapping[str, object],
+) -> None:
+    """Verify that metrics.json documents the selected deformation attempt."""
+
+    selected_metrics = _required_mapping(selected, "metrics", "selected metrics")
+    selected_comparison = _required_mapping(
+        selected, "comparison", "selected comparison"
+    )
+    selected_preservation = _required_mapping(
+        selected, "preservation", "selected preservation"
+    )
+    status = _required_nonempty_string(deformation, "status", "deformation status")
+    if not _strict_json_equal(
+        _required_mapping(metrics, "after", "metrics after"), selected_metrics
+    ):
+        raise ValueError("metrics after does not match the selected attempt")
+    if not _strict_json_equal(
+        _required_mapping(metrics, "comparison", "metrics comparison"), selected_comparison
+    ):
+        raise ValueError("metrics comparison does not match the selected attempt")
+    if not _strict_json_equal(
+        _required_mapping(metrics, "preservation", "metrics preservation"), selected_preservation
+    ):
+        raise ValueError("metrics preservation does not match the selected attempt")
+    if _required_nonempty_string(metrics, "verdict", "metrics verdict") != status:
+        raise ValueError("metrics verdict does not match deformation status")
+
+
+def _strict_json_equal(left: object, right: object) -> bool:
+    """Compare parsed JSON values without Python's bool/int coercion."""
+
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, Mapping):
+        if not isinstance(right, Mapping) or left.keys() != right.keys():
+            return False
+        return all(_strict_json_equal(value, right[key]) for key, value in left.items())
+    if isinstance(left, list):
+        return isinstance(right, list) and len(left) == len(right) and all(
+            _strict_json_equal(first, second) for first, second in zip(left, right)
+        )
+    return left == right
 
 
 def _require_file(path: Path, *, label: str) -> Path:
@@ -181,6 +266,11 @@ def _validate_image_and_masks(
 ) -> tuple[ImageInfo, ImageInfo]:
     source = _image_info(source_path, label="source image")
     deformed = _image_info(deformed_path, label="deformed image")
+    if source.size != (1080, 1080) or deformed.size != (1080, 1080):
+        raise ValueError(
+            "source and deformed images must be 1080x1080: "
+            f"source={source.size}, deformed={deformed.size}"
+        )
     with Image.open(source_mask_path) as source_mask, Image.open(deformed_mask_path) as deformed_mask:
         sizes = {source.size, deformed.size, source_mask.size, deformed_mask.size}
     if len(sizes) != 1:
@@ -251,6 +341,14 @@ def build_upper_manifest(reconstruction_root: str | Path) -> UpperManifest:
                 camera_index=_UPPER_CAMERA_INDEX_BY_VIEW[view_id],
                 min_correlation=0.99,
             )
+            deformation = _load_json(deformation_json_path, label="deformation metadata")
+            task = _load_json(task_json_path, label="deformation task")
+            selected = _selected_attempt(deformation)
+            _validate_metrics(
+                _load_json(metrics_json_path, label="deformation metrics"),
+                deformation,
+                selected,
+            )
             views.append(
                 UpperViewRecord(
                     shoe_id=shoe_id,
@@ -266,10 +364,7 @@ def build_upper_manifest(reconstruction_root: str | Path) -> UpperManifest:
                     source_image=source_image,
                     deformed_image=deformed_image,
                     processed_image_correlation=correlation,
-                    quality=_quality(
-                        _load_json(deformation_json_path, label="deformation metadata"),
-                        _load_json(task_json_path, label="deformation task"),
-                    ),
+                    quality=_quality(deformation, task),
                 )
             )
         shoes.append(UpperShoeRecord(shoe_id=shoe_id, views=tuple(views)))
