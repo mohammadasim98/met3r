@@ -76,6 +76,7 @@ setup(
                         "Pillow>=9.5",
                         "transformers>=4.56",
                         "natten",
+                        "pyarrow>=14",
                 ],
         },
         entry_points={

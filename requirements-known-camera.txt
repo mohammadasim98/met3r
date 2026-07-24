@@ -9,3 +9,4 @@ pandas>=2.0
 transformers>=4.56
 huggingface-hub>=0.22
 natten
+pyarrow>=14
