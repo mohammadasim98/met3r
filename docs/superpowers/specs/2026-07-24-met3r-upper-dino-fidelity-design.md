@@ -132,10 +132,12 @@ Controlled corruptions are:
 | JPEG | `0.25, 0.50, 0.75, 1.00` | compression invariance |
 | Identity swap | `1.00` | semantic identity |
 
-Translation direction, exposure sign, and TPS displacement seed are assigned by
-a stable hash of shoe, pair, changed view, and condition. Signs/directions must
-be balanced across the complete design while remaining deterministic under
-seed 42. Spatial corruptions transform the foreground mask with the image.
+Translation direction, exposure sign, and TPS displacement seed are assigned
+once per shoe, changed view, corruption, and strength. Signs/directions are
+balanced across the 16 changed-view states at each strength while remaining
+deterministic under seed 42. The assignment deliberately excludes pair ID, so
+the same changed view state can be reused in all three pairs that contain that
+view. Spatial corruptions transform the foreground mask with the image.
 
 Identity swap replaces the complete foreground with another shoe's foreground
 from the same view ID. Donors follow this fixed cyclic mapping:
