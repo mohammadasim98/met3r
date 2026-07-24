@@ -1,0 +1,157 @@
+{
+  "experiment_name": "bytesize_known_camera_dino_fidelity",
+  "reproducibility": {
+    "naf_revision": "37f2dfc180f2de53d98bd601109c0da0dd6b0f43",
+    "da3_model_id": "depth-anything/DA3NESTED-GIANT-LARGE",
+    "da3_revision": "8615eefb62f2db4f8d6ebaa59160086981672829"
+  },
+  "dataset": {
+    "reconstruction_root": "/root/dev/ByteSize/Reconstruction",
+    "camera_mode": "fixed/precomputed (not calibrated GT)",
+    "primary_pair_scope": "intra_group",
+    "cross_group_pair_scope": "sensitivity_only"
+  },
+  "execution": {
+    "corruption_seed": 42,
+    "design_table_role": "audit_only",
+    "part_transfer_donor_policy": "pre-register donor shoe and part mask before execution"
+  },
+  "feature_tracks": {
+    "user_37_grid_track": {
+      "dino_vitb16": {
+        "input_size": 592,
+        "native_grid": 37
+      },
+      "dinov2_vitb14": {
+        "input_size": 588,
+        "native_grid": 42
+      },
+      "dinov3_vitb16": {
+        "input_size": 592,
+        "native_grid": 37
+      },
+      "dinov3_vitl16_pixal3d": {
+        "input_size": 592,
+        "native_grid": 37
+      },
+      "common_evaluation_grids": [
+        37,
+        74,
+        148,
+        296,
+        592
+      ]
+    },
+    "current_pixal3d_code_track": {
+      "dinov3_vitl16_pixal3d": {
+        "input_size": 512,
+        "native_grid": 32,
+        "naf_targets": [
+          128,
+          512
+        ]
+      }
+    }
+  },
+  "upsampling_modes": [
+    "bilinear",
+    "naf_normal_guide",
+    "naf_blurred_guide",
+    "naf_shuffled_guide"
+  ],
+  "corruptions": {
+    "translation": [
+      0.0,
+      0.03,
+      0.06,
+      0.12,
+      0.2
+    ],
+    "thin_plate_warp": [
+      0.0,
+      0.25,
+      0.5,
+      0.75,
+      1.0
+    ],
+    "exposure": [
+      0.0,
+      0.15,
+      0.3,
+      0.5,
+      0.75
+    ],
+    "blur": [
+      0.0,
+      0.2,
+      0.4,
+      0.7,
+      1.0
+    ],
+    "jpeg": [
+      0.0,
+      0.25,
+      0.5,
+      0.75,
+      1.0
+    ],
+    "part_transfer": [
+      0.0,
+      0.25,
+      0.5,
+      0.75,
+      1.0
+    ]
+  },
+  "known_camera_metric": {
+    "relative_depth_tolerance": 0.03,
+    "min_overlap_fraction": 0.1,
+    "confidence_percentile": 10.0
+  },
+  "geometry_calibration": {
+    "rotation_degrees": [
+      0.0,
+      0.25,
+      0.5,
+      1.0,
+      2.0,
+      5.0
+    ],
+    "relative_translation": [
+      0.0,
+      0.0025,
+      0.005,
+      0.01,
+      0.02
+    ],
+    "depth_scale": [
+      1.0,
+      1.01,
+      1.02,
+      1.05,
+      1.1
+    ],
+    "relative_depth_noise_std": [
+      0.0,
+      0.005,
+      0.01,
+      0.02,
+      0.05
+    ]
+  },
+  "statistics": {
+    "cluster_unit": "shoe_id",
+    "bootstrap_repeats": 1000,
+    "bootstrap_seed": 42,
+    "primary_metrics": [
+      "severity_spearman",
+      "clean_corrupt_auc",
+      "pairwise_rank_accuracy",
+      "human_geometric_alignment_disagreement_spearman",
+      "human_semantic_identity_disagreement_spearman",
+      "human_local_detail_alignment_disagreement_spearman",
+      "human_single_view_plausibility_disagreement_spearman",
+      "coverage"
+    ]
+  }
+}

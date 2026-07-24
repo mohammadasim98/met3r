@@ -1,11 +1,11 @@
 import os
-from setuptools import setup, find_packages
+from setuptools import setup
 import subprocess
 import sys
 from distutils.cmd import Command
 with open('requirements.txt') as f:
     required = f.read().splitlines()
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 
 
 class GetSubmodules(Command):
@@ -21,9 +21,11 @@ setup(
         long_description=open('README.md').read(),
         long_description_content_type='text/markdown',
         url='https://github.com/mohammadasim98/met3r',
+        # Keep the upstream nested package layout: met3r/met3r.py resolves the
+        # MASt3R and DUSt3R checkouts as siblings at runtime.
         packages=[
                 "met3r",
-                
+
                 "mast3r/dust3r",
                 "mast3r/dust3r/croco",
                 "mast3r/dust3r/croco/models",
@@ -68,13 +70,26 @@ setup(
                 "featup@git+https://github.com/mhamilton723/FeatUp",
                 "pytorch3d@git+https://github.com/facebookresearch/pytorch3d.git",
         ],
+        extras_require={
+                "known-camera": [
+                        "pandas>=2.0",
+                        "Pillow>=9.5",
+                        "transformers>=4.56",
+                        "natten",
+                ],
+        },
+        entry_points={
+                "console_scripts": [
+                        "met3r-known-camera=met3r.cli:main",
+                ],
+        },
 
         classifiers=[
                 'Programming Language :: Python :: 3',
                 'License :: OSI Approved :: MIT License',
                 'Operating System :: OS Independent',
         ],
-        python_requires='>=3.6',
+        python_requires='>=3.10',
         cmdclass={"submodule": GetSubmodules}
         
 )
