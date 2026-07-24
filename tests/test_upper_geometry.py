@@ -639,3 +639,101 @@ def test_worker_recovers_interrupted_backup_and_cleans_staging(
     assert (second.completed, second.failed) == (0, 1)
     assert _tree_hashes(output_dir) == before
     assert not list((run_root / "geometry").glob(".interrupted.*"))
+
+
+def test_published_hash_failure_restores_prior_complete_bundle(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    run_root, registry = _fake_run(tmp_path)
+    config_sha256 = json.loads(
+        (run_root / "run_manifest.json").read_text()
+    )["config_sha256"]
+    state_dir = _write_state(run_root, "hash-failure", corruption="blur")
+    _register_geometry_job(registry, run_root, state_dir, config_sha256)
+    models = [_FakeDepthModel(1.0), _FakeDepthModel(2.0)]
+    monkeypatch.setattr(
+        "met3r.upper_geometry.load_da3_model",
+        lambda *args, **kwargs: models.pop(0),
+    )
+    monkeypatch.setattr(
+        "met3r.upper_geometry.repository_state",
+        lambda path: {
+            "path": str(path),
+            "revision": "da3-source",
+            "dirty": False,
+            "dirty_fingerprint": None,
+        },
+    )
+    first = run_geometry_worker(run_root, "shoe-a", "cpu", "/fake/da3")
+    output_dir = run_root / "geometry" / "hash-failure"
+    before = _tree_hashes(output_dir)
+    _reset_job_pending(registry, "geometry__hash-failure")
+    from met3r import upper_geometry
+
+    original_hash = upper_geometry.sha256_file
+
+    def fail_published_hash(path: Path) -> str:
+        if Path(path) == output_dir / "depth_geometry.npz":
+            raise ValueError("injected published hash failure")
+        return original_hash(path)
+
+    monkeypatch.setattr("met3r.upper_geometry.sha256_file", fail_published_hash)
+
+    with pytest.raises(ValueError, match="injected published hash failure"):
+        run_geometry_worker(run_root, "shoe-a", "cpu", "/fake/da3")
+
+    assert first.completed == 1
+    assert _tree_hashes(output_dir) == before
+    assert registry.validated_state("geometry__hash-failure") == "failed"
+    assert not list((run_root / "geometry").glob(".hash-failure.*"))
+
+
+def test_registry_completion_failure_restores_prior_complete_bundle(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    run_root, registry = _fake_run(tmp_path)
+    config_sha256 = json.loads(
+        (run_root / "run_manifest.json").read_text()
+    )["config_sha256"]
+    state_dir = _write_state(run_root, "complete-failure", corruption="blur")
+    _register_geometry_job(registry, run_root, state_dir, config_sha256)
+    models = [_FakeDepthModel(1.0), _FakeDepthModel(2.0)]
+    monkeypatch.setattr(
+        "met3r.upper_geometry.load_da3_model",
+        lambda *args, **kwargs: models.pop(0),
+    )
+    monkeypatch.setattr(
+        "met3r.upper_geometry.repository_state",
+        lambda path: {
+            "path": str(path),
+            "revision": "da3-source",
+            "dirty": False,
+            "dirty_fingerprint": None,
+        },
+    )
+    first = run_geometry_worker(run_root, "shoe-a", "cpu", "/fake/da3")
+    output_dir = run_root / "geometry" / "complete-failure"
+    before = _tree_hashes(output_dir)
+    _reset_job_pending(registry, "geometry__complete-failure")
+    original_complete = JobRegistry.complete
+
+    def fail_completion(
+        self: JobRegistry,
+        job_id: str,
+        output_manifest,
+    ) -> None:
+        if job_id == "geometry__complete-failure":
+            raise ValueError("injected registry completion failure")
+        original_complete(self, job_id, output_manifest)
+
+    monkeypatch.setattr(JobRegistry, "complete", fail_completion)
+
+    with pytest.raises(ValueError, match="injected registry completion failure"):
+        run_geometry_worker(run_root, "shoe-a", "cpu", "/fake/da3")
+
+    assert first.completed == 1
+    assert _tree_hashes(output_dir) == before
+    assert registry.validated_state("geometry__complete-failure") == "failed"
+    assert not list((run_root / "geometry").glob(".complete-failure.*"))

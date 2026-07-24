@@ -393,24 +393,33 @@ def _recover_interrupted_install(destination: Path) -> None:
         _remove_path(path)
 
 
-def _install_bundle(staging: Path, destination: Path) -> None:
+def _install_bundle(staging: Path, destination: Path) -> Path | None:
     backup = destination.with_name(
         f".{destination.name}.backup.{uuid.uuid4().hex}"
     )
-    had_destination = destination.exists()
-    if had_destination:
+    if destination.exists():
         destination.rename(backup)
+    else:
+        backup = None
     try:
         staging.rename(destination)
     except Exception:
         if destination.exists():
             _remove_path(destination)
-        if backup.exists():
+        if backup is not None and backup.exists():
             backup.rename(destination)
         raise
-    else:
-        if backup.exists():
-            _remove_path(backup)
+    return backup
+
+
+def _rollback_installed_bundle(
+    destination: Path,
+    backup: Path | None,
+) -> None:
+    if destination.exists():
+        _remove_path(destination)
+    if backup is not None and backup.exists():
+        backup.rename(destination)
 
 
 def _published_paths(
@@ -562,14 +571,18 @@ def run_geometry_worker(
                     staging_dir,
                     output_dir,
                 )
-                _install_bundle(staging_dir, output_dir)
+                backup_path = _install_bundle(staging_dir, output_dir)
             finally:
                 if staging_dir.exists():
                     _remove_path(staging_dir)
-            registry.complete(
-                job.job_id,
-                _output_manifest(published_paths),
-            )
+            try:
+                published_manifest = _output_manifest(published_paths)
+                registry.complete(job.job_id, published_manifest)
+            except Exception:
+                _rollback_installed_bundle(output_dir, backup_path)
+                raise
+            if backup_path is not None and backup_path.exists():
+                _remove_path(backup_path)
             completed += 1
         except (OSError, RuntimeError) as error:
             retryable = _is_transient(error)
