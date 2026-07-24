@@ -130,6 +130,7 @@ def materialize_image_state(
                     donor=donor,
                     donor_foreground_mask=donor_mask,
                 )
+            image = np.where(mask[..., None], image, 255).astype(np.uint8)
             Image.fromarray(image).save(images_dir / f"{view_id}.png")
             Image.fromarray(mask.astype(np.uint8) * 255).save(masks_dir / f"{view_id}.png")
             masks.append(mask)

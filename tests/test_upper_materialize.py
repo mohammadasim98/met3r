@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -62,3 +63,49 @@ def test_materialize_stages_binary_white_background_and_identity_donor(
     np.testing.assert_array_equal(image, expected)
     np.testing.assert_array_equal(result.masks[0], expected_mask)
     assert result.metadata_path.is_file()
+
+
+@pytest.mark.parametrize(
+    ("corruption", "severity", "direction"),
+    [
+        ("exposure", 0.5, -1),
+        ("blur", 1.0, 1),
+        ("jpeg", 0.75, 1),
+        ("thin_plate_warp", 0.75, 1),
+    ],
+)
+def test_materialize_forces_white_background_after_every_corruption(
+    tmp_path: Path,
+    real_upper_manifest,
+    frozen_config,
+    corruption: str,
+    severity: float,
+    direction: int,
+) -> None:
+    design = build_upper_design(real_upper_manifest, frozen_config, scope="full")
+    base_state = next(
+        state
+        for state in design.changed_states
+        if state.shoe_id == "air_huarache_run_ultra_111449"
+        and state.changed_view == "left"
+        and state.corruption == corruption
+        and state.severity == severity
+    )
+    state = replace(
+        base_state,
+        state_id=f"{base_state.state_id}__background_regression",
+        direction=direction,
+    )
+
+    result = materialize_image_state(state, real_upper_manifest, tmp_path)
+
+    for image_path, mask_path, returned_mask in zip(
+        result.image_paths, result.mask_paths, result.masks
+    ):
+        image = np.asarray(Image.open(image_path).convert("RGB"))
+        saved_mask = np.asarray(Image.open(mask_path).convert("L"))
+        assert image.shape[:2] == (504, 504)
+        assert saved_mask.shape == (504, 504)
+        assert set(np.unique(saved_mask)) <= {0, 255}
+        np.testing.assert_array_equal(returned_mask, saved_mask > 127)
+        assert np.all(image[~returned_mask] == 255)
