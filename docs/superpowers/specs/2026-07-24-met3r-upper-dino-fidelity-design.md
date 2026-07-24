@@ -70,6 +70,24 @@ with the deformation task:
 The data loader must verify that all 16 image/mask pairs exist, share the
 expected dimensions, and map to the correct shoe and view.
 
+Deformation model slugs and fixed-camera dataset directory names are different.
+Use this explicit mapping rather than name inference:
+
+```text
+air_huarache_run_ultra_111449
+  -> AIR HUARACHE RUN ULTRA(111449)
+air_max_90_nrg_dc6083_500
+  -> AIR MAX 90 NRG(DC6083-500)
+air_max_90_surplus_cq7743_300
+  -> AIR MAX 90 SURPLUS(CQ7743-300)
+air_tuned_max_cv6984_001
+  -> AIR TUNED MAX(CV6984-001)
+```
+
+The preflight audit must compare each source image with the indexed DA3
+processed camera image after resizing and require grayscale correlation of at
+least 0.99. The current 16 inputs have correlations above 0.9998.
+
 The deformation assets are 1080x1080, while the selected fixed-camera
 intrinsics correspond to the existing 504x504 DA3 processed-image artifacts.
 Materialize every clean, deformed, and controlled-corruption image state at
