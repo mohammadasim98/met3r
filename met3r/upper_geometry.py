@@ -375,20 +375,30 @@ def _remove_path(path: Path) -> None:
         path.unlink()
 
 
-def _recover_interrupted_install(destination: Path) -> None:
+def _bundle_siblings(destination: Path) -> tuple[list[Path], list[Path]]:
     staging_paths = sorted(
         destination.parent.glob(f".{destination.name}.staging.*")
     )
     backup_paths = sorted(
         destination.parent.glob(f".{destination.name}.backup.*")
     )
-    if not destination.exists() and backup_paths:
-        if len(backup_paths) != 1:
-            raise ValueError(
-                f"multiple interrupted backups found for {destination}"
-            )
+    return staging_paths, backup_paths
+
+
+def _recover_uncommitted_install(destination: Path) -> None:
+    staging_paths, backup_paths = _bundle_siblings(destination)
+    if len(backup_paths) > 1:
+        raise ValueError(f"multiple interrupted backups found for {destination}")
+    if backup_paths:
+        if destination.exists():
+            _remove_path(destination)
         backup_paths[0].rename(destination)
-        backup_paths = []
+    for path in staging_paths:
+        _remove_path(path)
+
+
+def _clean_committed_install_debris(destination: Path) -> None:
+    staging_paths, backup_paths = _bundle_siblings(destination)
     for path in (*staging_paths, *backup_paths):
         _remove_path(path)
 
@@ -443,6 +453,7 @@ def _is_transient(error: OSError | RuntimeError) -> bool:
 def _validate_completed_geometry_jobs(
     registry: JobRegistry,
     shoe_id: str,
+    run_root: Path,
 ) -> None:
     with sqlite3.connect(registry.path, timeout=60) as connection:
         rows = connection.execute(
@@ -458,7 +469,16 @@ def _validate_completed_geometry_jobs(
         if not isinstance(payload, Mapping):
             raise ValueError(f"stored geometry payload is malformed: {job_id}")
         if payload.get("shoe_id") == shoe_id:
-            registry.validated_state(str(job_id))
+            output_dir = _path_within(
+                payload["output_dir"],
+                run_root / "geometry",
+                "output_dir",
+            )
+            state = registry.validated_state(str(job_id))
+            if state == "completed":
+                _clean_committed_install_debris(output_dir)
+            else:
+                _recover_uncommitted_install(output_dir)
 
 
 def run_geometry_worker(
@@ -472,7 +492,7 @@ def run_geometry_worker(
     root = Path(run_root).expanduser().resolve()
     config, config_sha256, scope = _load_config(root)
     registry = JobRegistry(root / "registry" / "jobs.sqlite")
-    _validate_completed_geometry_jobs(registry, shoe_id)
+    _validate_completed_geometry_jobs(registry, shoe_id, root)
     registry.requeue_stale(
         phase="geometry",
         max_age_seconds=_STALE_SECONDS,
@@ -529,7 +549,7 @@ def run_geometry_worker(
             if state_payload.get("track") != job.payload.get("track"):
                 raise ValueError("materialized state track does not match geometry job")
             cameras = _load_cameras(camera_path)
-            _recover_interrupted_install(output_dir)
+            _recover_uncommitted_install(output_dir)
             staging_dir = _temporary_bundle(output_dir)
             try:
                 artifact = run_fixed_camera_depth(

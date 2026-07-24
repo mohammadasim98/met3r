@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
@@ -737,3 +738,101 @@ def test_registry_completion_failure_restores_prior_complete_bundle(
     assert _tree_hashes(output_dir) == before
     assert registry.validated_state("geometry__complete-failure") == "failed"
     assert not list((run_root / "geometry").glob(".complete-failure.*"))
+
+
+def test_precompletion_crash_restores_backup_before_failed_resume(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    run_root, registry = _fake_run(tmp_path)
+    config_sha256 = json.loads(
+        (run_root / "run_manifest.json").read_text()
+    )["config_sha256"]
+    state_dir = _write_state(run_root, "precomplete-crash", corruption="blur")
+    _register_geometry_job(registry, run_root, state_dir, config_sha256)
+    monkeypatch.setattr(
+        "met3r.upper_geometry.load_da3_model",
+        lambda *args, **kwargs: _FakeDepthModel(1.0),
+    )
+    monkeypatch.setattr(
+        "met3r.upper_geometry.repository_state",
+        lambda path: {
+            "path": str(path),
+            "revision": "da3-source",
+            "dirty": False,
+            "dirty_fingerprint": None,
+        },
+    )
+    first = run_geometry_worker(run_root, "shoe-a", "cpu", "/fake/da3")
+    output_dir = run_root / "geometry" / "precomplete-crash"
+    before = _tree_hashes(output_dir)
+    _reset_job_pending(registry, "geometry__precomplete-crash")
+    backup = output_dir.with_name(".precomplete-crash.backup.killed")
+    shutil.copytree(output_dir, backup)
+    arrays_path = output_dir / "depth_geometry.npz"
+    with np.load(arrays_path) as source:
+        arrays = {key: np.asarray(source[key]) for key in source.files}
+    arrays["depth"] = np.full((4, 504, 504), 2.0, dtype=np.float32)
+    np.savez_compressed(arrays_path, **arrays)
+    stale_staging = output_dir.with_name(".precomplete-crash.staging.killed")
+    stale_staging.mkdir()
+    (stale_staging / "partial").write_bytes(b"partial")
+
+    class OOMModel:
+        def inference(self, **kwargs: object) -> SimpleNamespace:
+            raise RuntimeError("CUDA out of memory")
+
+    monkeypatch.setattr(
+        "met3r.upper_geometry.load_da3_model",
+        lambda *args, **kwargs: OOMModel(),
+    )
+
+    second = run_geometry_worker(run_root, "shoe-a", "cpu", "/fake/da3")
+
+    assert first.completed == 1
+    assert (second.completed, second.failed) == (0, 1)
+    assert _tree_hashes(output_dir) == before
+    assert not list((run_root / "geometry").glob(".precomplete-crash.*"))
+
+
+def test_postcompletion_crash_keeps_valid_destination_and_cleans_debris(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    run_root, registry = _fake_run(tmp_path)
+    config_sha256 = json.loads(
+        (run_root / "run_manifest.json").read_text()
+    )["config_sha256"]
+    state_dir = _write_state(run_root, "postcomplete-crash", corruption="blur")
+    _register_geometry_job(registry, run_root, state_dir, config_sha256)
+    model = _FakeDepthModel(1.0)
+    monkeypatch.setattr(
+        "met3r.upper_geometry.load_da3_model",
+        lambda *args, **kwargs: model,
+    )
+    monkeypatch.setattr(
+        "met3r.upper_geometry.repository_state",
+        lambda path: {
+            "path": str(path),
+            "revision": "da3-source",
+            "dirty": False,
+            "dirty_fingerprint": None,
+        },
+    )
+    first = run_geometry_worker(run_root, "shoe-a", "cpu", "/fake/da3")
+    output_dir = run_root / "geometry" / "postcomplete-crash"
+    before = _tree_hashes(output_dir)
+    backup = output_dir.with_name(".postcomplete-crash.backup.killed")
+    shutil.copytree(output_dir, backup)
+    stale_staging = output_dir.with_name(".postcomplete-crash.staging.killed")
+    stale_staging.mkdir()
+    (stale_staging / "partial").write_bytes(b"partial")
+
+    second = run_geometry_worker(run_root, "shoe-a", "cpu", "/fake/da3")
+
+    assert first.completed == 1
+    assert second.completed == 0
+    assert len(model.calls) == 1
+    assert _tree_hashes(output_dir) == before
+    assert registry.validated_state("geometry__postcomplete-crash") == "completed"
+    assert not list((run_root / "geometry").glob(".postcomplete-crash.*"))
