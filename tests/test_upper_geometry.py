@@ -16,8 +16,9 @@ from met3r.upper_geometry import run_geometry_worker
 
 
 class _FakeDepthModel:
-    def __init__(self) -> None:
+    def __init__(self, depth_value: float = 1.0) -> None:
         self.calls: list[dict[str, object]] = []
+        self.depth_value = depth_value
 
     def inference(self, **kwargs: object) -> SimpleNamespace:
         self.calls.append(kwargs)
@@ -25,7 +26,11 @@ class _FakeDepthModel:
         intrinsics = np.asarray(kwargs["intrinsics"])
         count = len(UPPER_VIEWS)
         return SimpleNamespace(
-            depth=np.ones((count, 504, 504), dtype=np.float32),
+            depth=np.full(
+                (count, 504, 504),
+                self.depth_value,
+                dtype=np.float32,
+            ),
             conf=np.full((count, 504, 504), 0.75, dtype=np.float32),
             processed_images=np.zeros((count, 504, 504, 3), dtype=np.uint8),
             extrinsics=extrinsics,
@@ -129,6 +134,28 @@ def _register_geometry_job(
             },
         )
     )
+
+
+def _reset_job_pending(registry: JobRegistry, job_id: str) -> None:
+    with sqlite3.connect(registry.path) as connection:
+        connection.execute(
+            """
+            UPDATE jobs
+            SET state = 'pending', worker_id = NULL, attempts = 0,
+                started_at = NULL, finished_at = NULL,
+                output_manifest_json = NULL, error = NULL
+            WHERE job_id = ?
+            """,
+            (job_id,),
+        )
+
+
+def _tree_hashes(root: Path) -> dict[str, str]:
+    return {
+        str(path.relative_to(root)): sha256_file(path)
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
 
 
 def test_geometry_worker_loads_model_once_for_multiple_jobs(
@@ -367,3 +394,248 @@ def test_cuda_oom_is_retried_only_to_registry_attempt_limit(
             ("geometry__oom",),
         ).fetchone()[0]
     assert attempts == 3
+
+
+def test_worker_revalidates_completed_outputs_and_recomputes_corruption(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    run_root, registry = _fake_run(tmp_path)
+    config_sha256 = json.loads(
+        (run_root / "run_manifest.json").read_text()
+    )["config_sha256"]
+    state_dir = _write_state(run_root, "resume", corruption="blur")
+    _register_geometry_job(registry, run_root, state_dir, config_sha256)
+    models = [_FakeDepthModel(1.0), _FakeDepthModel(2.0)]
+    monkeypatch.setattr(
+        "met3r.upper_geometry.load_da3_model",
+        lambda *args, **kwargs: models.pop(0),
+    )
+    monkeypatch.setattr(
+        "met3r.upper_geometry.repository_state",
+        lambda path: {
+            "path": str(path),
+            "revision": "da3-source",
+            "dirty": False,
+            "dirty_fingerprint": None,
+        },
+    )
+
+    first = run_geometry_worker(run_root, "shoe-a", "cpu", "/fake/da3")
+    arrays_path = run_root / "geometry" / "resume" / "depth_geometry.npz"
+    arrays_path.write_bytes(b"corrupted")
+    second = run_geometry_worker(run_root, "shoe-a", "cpu", "/fake/da3")
+
+    assert first.completed == 1
+    assert second.completed == 1
+    with np.load(arrays_path) as artifact:
+        np.testing.assert_allclose(artifact["depth"], 2.0)
+    assert registry.validated_state("geometry__resume") == "completed"
+    with sqlite3.connect(registry.path) as connection:
+        attempts = connection.execute(
+            "SELECT attempts FROM jobs WHERE job_id = ?",
+            ("geometry__resume",),
+        ).fetchone()[0]
+    assert attempts == 1
+
+
+def test_worker_base_failure_never_exposes_partial_final_bundle(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    run_root, registry = _fake_run(tmp_path)
+    config_sha256 = json.loads(
+        (run_root / "run_manifest.json").read_text()
+    )["config_sha256"]
+    state_dir = _write_state(run_root, "base-failure", corruption="blur")
+    _register_geometry_job(registry, run_root, state_dir, config_sha256)
+    monkeypatch.setattr(
+        "met3r.upper_geometry.load_da3_model",
+        lambda *args, **kwargs: _FakeDepthModel(),
+    )
+    monkeypatch.setattr(
+        "met3r.upper_geometry.repository_state",
+        lambda path: {
+            "path": str(path),
+            "revision": "da3-source",
+            "dirty": False,
+            "dirty_fingerprint": None,
+        },
+    )
+    original_write_text = Path.write_text
+
+    def fail_depth_metadata(
+        path: Path,
+        data: str,
+        *args,
+        **kwargs,
+    ) -> int:
+        if path.name == "depth_geometry.json":
+            raise ValueError("injected depth metadata failure")
+        return original_write_text(path, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", fail_depth_metadata)
+
+    with pytest.raises(ValueError, match="injected depth metadata failure"):
+        run_geometry_worker(run_root, "shoe-a", "cpu", "/fake/da3")
+
+    output_dir = run_root / "geometry" / "base-failure"
+    assert not output_dir.exists()
+    assert not list((run_root / "geometry").glob(".base-failure.*"))
+    assert registry.validated_state("geometry__base-failure") == "failed"
+
+
+def test_calibration_failure_preserves_prior_complete_bundle(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    run_root, registry = _fake_run(tmp_path, scope="full")
+    config_sha256 = json.loads(
+        (run_root / "run_manifest.json").read_text()
+    )["config_sha256"]
+    state_dir = _write_state(run_root, "clean", corruption="clean")
+    _register_geometry_job(registry, run_root, state_dir, config_sha256)
+    models = [_FakeDepthModel(1.0), _FakeDepthModel(2.0)]
+    monkeypatch.setattr(
+        "met3r.upper_geometry.load_da3_model",
+        lambda *args, **kwargs: models.pop(0),
+    )
+    monkeypatch.setattr(
+        "met3r.upper_geometry.repository_state",
+        lambda path: {
+            "path": str(path),
+            "revision": "da3-source",
+            "dirty": False,
+            "dirty_fingerprint": None,
+        },
+    )
+    first = run_geometry_worker(run_root, "shoe-a", "cpu", "/fake/da3")
+    output_dir = run_root / "geometry" / "clean"
+    before = _tree_hashes(output_dir)
+    _reset_job_pending(registry, "geometry__clean")
+    from met3r import upper_geometry
+
+    original_writer = upper_geometry.write_geometry_calibration_artifacts
+    calls = 0
+
+    def fail_second_view(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("injected calibration failure")
+        return original_writer(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "met3r.upper_geometry.write_geometry_calibration_artifacts",
+        fail_second_view,
+    )
+
+    second = run_geometry_worker(run_root, "shoe-a", "cpu", "/fake/da3")
+
+    assert first.completed == 1
+    assert (second.completed, second.failed) == (0, 1)
+    assert _tree_hashes(output_dir) == before
+    with np.load(output_dir / "depth_geometry.npz") as artifact:
+        np.testing.assert_allclose(artifact["depth"], 1.0)
+    assert not list((run_root / "geometry").glob(".clean.*"))
+
+
+def test_install_failure_rolls_back_prior_complete_bundle(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    run_root, registry = _fake_run(tmp_path)
+    config_sha256 = json.loads(
+        (run_root / "run_manifest.json").read_text()
+    )["config_sha256"]
+    state_dir = _write_state(run_root, "install", corruption="blur")
+    _register_geometry_job(registry, run_root, state_dir, config_sha256)
+    models = [_FakeDepthModel(1.0), _FakeDepthModel(2.0)]
+    monkeypatch.setattr(
+        "met3r.upper_geometry.load_da3_model",
+        lambda *args, **kwargs: models.pop(0),
+    )
+    monkeypatch.setattr(
+        "met3r.upper_geometry.repository_state",
+        lambda path: {
+            "path": str(path),
+            "revision": "da3-source",
+            "dirty": False,
+            "dirty_fingerprint": None,
+        },
+    )
+    first = run_geometry_worker(run_root, "shoe-a", "cpu", "/fake/da3")
+    output_dir = run_root / "geometry" / "install"
+    before = _tree_hashes(output_dir)
+    _reset_job_pending(registry, "geometry__install")
+    original_rename = Path.rename
+
+    def fail_staging_install(path: Path, target: Path) -> Path:
+        if (
+            path.name.startswith(".install.staging.")
+            and Path(target) == output_dir
+        ):
+            raise OSError("injected install failure")
+        return original_rename(path, target)
+
+    monkeypatch.setattr(Path, "rename", fail_staging_install)
+
+    second = run_geometry_worker(run_root, "shoe-a", "cpu", "/fake/da3")
+
+    assert first.completed == 1
+    assert (second.completed, second.failed) == (0, 1)
+    assert _tree_hashes(output_dir) == before
+    with np.load(output_dir / "depth_geometry.npz") as artifact:
+        np.testing.assert_allclose(artifact["depth"], 1.0)
+    assert not list((run_root / "geometry").glob(".install.*"))
+
+
+def test_worker_recovers_interrupted_backup_and_cleans_staging(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    run_root, registry = _fake_run(tmp_path)
+    config_sha256 = json.loads(
+        (run_root / "run_manifest.json").read_text()
+    )["config_sha256"]
+    state_dir = _write_state(run_root, "interrupted", corruption="blur")
+    _register_geometry_job(registry, run_root, state_dir, config_sha256)
+    first_model = _FakeDepthModel(1.0)
+    monkeypatch.setattr(
+        "met3r.upper_geometry.load_da3_model",
+        lambda *args, **kwargs: first_model,
+    )
+    monkeypatch.setattr(
+        "met3r.upper_geometry.repository_state",
+        lambda path: {
+            "path": str(path),
+            "revision": "da3-source",
+            "dirty": False,
+            "dirty_fingerprint": None,
+        },
+    )
+    first = run_geometry_worker(run_root, "shoe-a", "cpu", "/fake/da3")
+    output_dir = run_root / "geometry" / "interrupted"
+    before = _tree_hashes(output_dir)
+    _reset_job_pending(registry, "geometry__interrupted")
+    backup = output_dir.with_name(".interrupted.backup.killed")
+    output_dir.rename(backup)
+    stale_staging = output_dir.with_name(".interrupted.staging.killed")
+    stale_staging.mkdir()
+    (stale_staging / "partial").write_bytes(b"partial")
+
+    class OOMModel:
+        def inference(self, **kwargs: object) -> SimpleNamespace:
+            raise RuntimeError("CUDA out of memory")
+
+    monkeypatch.setattr(
+        "met3r.upper_geometry.load_da3_model",
+        lambda *args, **kwargs: OOMModel(),
+    )
+
+    second = run_geometry_worker(run_root, "shoe-a", "cpu", "/fake/da3")
+
+    assert first.completed == 1
+    assert (second.completed, second.failed) == (0, 1)
+    assert _tree_hashes(output_dir) == before
+    assert not list((run_root / "geometry").glob(".interrupted.*"))

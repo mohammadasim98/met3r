@@ -5,7 +5,11 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
+import shutil
+import sqlite3
+import tempfile
 import traceback
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -176,7 +180,9 @@ def _validate_fixed_camera_contract(
         if np.asarray(arrays["depth"]).shape != (4, _PROCESS_RES, _PROCESS_RES):
             raise ValueError("depth artifact must contain four 504x504 upper views")
         if np.asarray(arrays["confidence"]).shape != (4, _PROCESS_RES, _PROCESS_RES):
-            raise ValueError("confidence artifact must contain four 504x504 upper views")
+            raise ValueError(
+                "confidence artifact must contain four 504x504 upper views"
+            )
         if np.asarray(arrays["mask"]).shape != (4, _PROCESS_RES, _PROCESS_RES):
             raise ValueError("mask artifact must contain four 504x504 upper views")
         if not np.allclose(
@@ -249,6 +255,7 @@ def _numeric_sequence(
 def _write_full_calibration(
     artifact: DepthArtifact,
     output_dir: Path,
+    published_output_dir: Path,
     config: Mapping[str, object],
     config_sha256: str,
 ) -> tuple[Path, ...]:
@@ -281,6 +288,7 @@ def _write_full_calibration(
         raw_records = view_manifest.get("artifacts")
         if not isinstance(raw_records, list):
             raise ValueError(f"calibration manifest is malformed: {view_manifest_path}")
+        published_view_records: list[dict[str, object]] = []
         paths.append(view_manifest_path)
         for raw_record in raw_records:
             if not isinstance(raw_record, Mapping):
@@ -291,11 +299,33 @@ def _write_full_calibration(
             if not variant_path.is_file():
                 raise ValueError(f"calibration artifact is missing: {variant_path}")
             record = dict(raw_record)
-            record["path"] = str(variant_path)
+            published_path = (
+                published_output_dir / variant_path.relative_to(output_dir)
+            ).resolve()
+            record["path"] = str(published_path)
             record["view_id"] = view_id
             record["sha256"] = sha256_file(variant_path)
             records.append(record)
+            published_view_record = dict(raw_record)
+            published_view_record["path"] = str(published_path)
+            published_view_records.append(published_view_record)
             paths.append(variant_path)
+        view_manifest_path.write_text(
+            json.dumps(
+                {
+                    **view_manifest,
+                    "base_geometry": str(
+                        (
+                            published_output_dir
+                            / artifact.arrays_path.relative_to(output_dir)
+                        ).resolve()
+                    ),
+                    "artifacts": published_view_records,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
     expected_count = len(UPPER_VIEWS) * (
         len(rotations) + len(translations) + len(depth_scales) + len(depth_noise)
     )
@@ -308,7 +338,12 @@ def _write_full_calibration(
         json.dumps(
             {
                 "artifact_type": "upper_geometry_calibration",
-                "base_geometry": str(artifact.arrays_path.resolve()),
+                "base_geometry": str(
+                    (
+                        published_output_dir
+                        / artifact.arrays_path.relative_to(output_dir)
+                    ).resolve()
+                ),
                 "config_sha256": config_sha256,
                 "seed": seed,
                 "views": list(UPPER_VIEWS),
@@ -323,11 +358,98 @@ def _write_full_calibration(
     return tuple(paths)
 
 
+def _temporary_bundle(destination: Path) -> Path:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    return Path(
+        tempfile.mkdtemp(
+            prefix=f".{destination.name}.staging.",
+            dir=destination.parent,
+        )
+    )
+
+
+def _remove_path(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    elif path.exists() or path.is_symlink():
+        path.unlink()
+
+
+def _recover_interrupted_install(destination: Path) -> None:
+    staging_paths = sorted(
+        destination.parent.glob(f".{destination.name}.staging.*")
+    )
+    backup_paths = sorted(
+        destination.parent.glob(f".{destination.name}.backup.*")
+    )
+    if not destination.exists() and backup_paths:
+        if len(backup_paths) != 1:
+            raise ValueError(
+                f"multiple interrupted backups found for {destination}"
+            )
+        backup_paths[0].rename(destination)
+        backup_paths = []
+    for path in (*staging_paths, *backup_paths):
+        _remove_path(path)
+
+
+def _install_bundle(staging: Path, destination: Path) -> None:
+    backup = destination.with_name(
+        f".{destination.name}.backup.{uuid.uuid4().hex}"
+    )
+    had_destination = destination.exists()
+    if had_destination:
+        destination.rename(backup)
+    try:
+        staging.rename(destination)
+    except Exception:
+        if destination.exists():
+            _remove_path(destination)
+        if backup.exists():
+            backup.rename(destination)
+        raise
+    else:
+        if backup.exists():
+            _remove_path(backup)
+
+
+def _published_paths(
+    staging_paths: list[Path],
+    staging_root: Path,
+    destination: Path,
+) -> tuple[Path, ...]:
+    return tuple(
+        destination / path.relative_to(staging_root)
+        for path in staging_paths
+    )
+
+
 def _is_transient(error: OSError | RuntimeError) -> bool:
     if isinstance(error, OSError):
         return error.errno in _TRANSIENT_ERRNOS
     message = str(error).lower()
     return "cuda out of memory" in message or "cuda error: device is busy" in message
+
+
+def _validate_completed_geometry_jobs(
+    registry: JobRegistry,
+    shoe_id: str,
+) -> None:
+    with sqlite3.connect(registry.path, timeout=60) as connection:
+        rows = connection.execute(
+            """
+            SELECT job_id, payload_json
+            FROM jobs
+            WHERE phase = 'geometry' AND state = 'completed'
+            ORDER BY job_id
+            """
+        ).fetchall()
+    for job_id, payload_json in rows:
+        payload = json.loads(payload_json)
+        if not isinstance(payload, Mapping):
+            raise ValueError(f"stored geometry payload is malformed: {job_id}")
+        if payload.get("shoe_id") == shoe_id:
+            registry.validated_state(str(job_id))
 
 
 def run_geometry_worker(
@@ -341,6 +463,7 @@ def run_geometry_worker(
     root = Path(run_root).expanduser().resolve()
     config, config_sha256, scope = _load_config(root)
     registry = JobRegistry(root / "registry" / "jobs.sqlite")
+    _validate_completed_geometry_jobs(registry, shoe_id)
     registry.requeue_stale(
         phase="geometry",
         max_age_seconds=_STALE_SECONDS,
@@ -397,41 +520,55 @@ def run_geometry_worker(
             if state_payload.get("track") != job.payload.get("track"):
                 raise ValueError("materialized state track does not match geometry job")
             cameras = _load_cameras(camera_path)
-            artifact = run_fixed_camera_depth(
-                model,
-                state.image_paths,
-                cameras.extrinsics,
-                cameras.intrinsics,
-                output_dir=output_dir,
-                model_id=DEFAULT_DA3_MODEL_ID,
-                model_revision=DEFAULT_DA3_REVISION,
-                camera_provenance="fixed_precomputed_da3",
-                process_res=_PROCESS_RES,
-                foreground_mask=state.masks,
-                view_ids=UPPER_VIEWS,
-                camera_groups=("upper",) * 4,
-                analysis_tier="primary",
-                source_state=source_state,
-                store_processed_images=False,
-            )
-            _validate_fixed_camera_contract(artifact, cameras)
-            output_paths = [artifact.arrays_path, artifact.metadata_path]
-            if (
-                scope == "full"
-                and job.payload.get("job_type") == "geometry"
-                and state_payload.get("corruption") == "clean"
-            ):
-                output_paths.extend(
-                    _write_full_calibration(
-                        artifact,
-                        output_dir,
-                        config,
-                        config_sha256,
-                    )
+            _recover_interrupted_install(output_dir)
+            staging_dir = _temporary_bundle(output_dir)
+            try:
+                artifact = run_fixed_camera_depth(
+                    model,
+                    state.image_paths,
+                    cameras.extrinsics,
+                    cameras.intrinsics,
+                    output_dir=staging_dir,
+                    model_id=DEFAULT_DA3_MODEL_ID,
+                    model_revision=DEFAULT_DA3_REVISION,
+                    camera_provenance="fixed_precomputed_da3",
+                    process_res=_PROCESS_RES,
+                    foreground_mask=state.masks,
+                    view_ids=UPPER_VIEWS,
+                    camera_groups=("upper",) * 4,
+                    analysis_tier="primary",
+                    source_state=source_state,
+                    store_processed_images=False,
                 )
+                _validate_fixed_camera_contract(artifact, cameras)
+                staging_paths = [artifact.arrays_path, artifact.metadata_path]
+                if (
+                    scope == "full"
+                    and job.payload.get("job_type") == "geometry"
+                    and state_payload.get("corruption") == "clean"
+                ):
+                    staging_paths.extend(
+                        _write_full_calibration(
+                            artifact,
+                            staging_dir,
+                            output_dir,
+                            config,
+                            config_sha256,
+                        )
+                    )
+                _output_manifest(tuple(staging_paths))
+                published_paths = _published_paths(
+                    staging_paths,
+                    staging_dir,
+                    output_dir,
+                )
+                _install_bundle(staging_dir, output_dir)
+            finally:
+                if staging_dir.exists():
+                    _remove_path(staging_dir)
             registry.complete(
                 job.job_id,
-                _output_manifest(tuple(output_paths)),
+                _output_manifest(published_paths),
             )
             completed += 1
         except (OSError, RuntimeError) as error:
