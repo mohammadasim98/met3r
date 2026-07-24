@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import threading
 from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -392,6 +393,38 @@ def test_gate_rejects_missing_or_tampered_design_manifest(
 
 
 @pytest.mark.parametrize(
+    "extra",
+    (
+        "not-an-object",
+        None,
+        [],
+        {"wrong": "keys"},
+    ),
+)
+def test_gate_rejects_malformed_feature_variant_list_entry(
+    valid_pilot_run: Path,
+    extra: object,
+) -> None:
+    path = valid_pilot_run / "manifests/feature_variants.json"
+    variants = json.loads(path.read_text())
+    variants.append(extra)
+    path.write_text(json.dumps(variants), encoding="utf-8")
+
+    assert "design_manifests" in validate_pilot(valid_pilot_run).failed_checks
+
+
+def test_gate_rejects_extra_feature_variant_object_key(
+    valid_pilot_run: Path,
+) -> None:
+    path = valid_pilot_run / "manifests/feature_variants.json"
+    variants = json.loads(path.read_text())
+    variants[0]["unexpected"] = True
+    path.write_text(json.dumps(variants), encoding="utf-8")
+
+    assert "design_manifests" in validate_pilot(valid_pilot_run).failed_checks
+
+
+@pytest.mark.parametrize(
     ("field", "mutate"),
     (
         ("direction", lambda state: -int(state["direction"])),
@@ -650,6 +683,87 @@ def test_storage_projection_splits_basis_and_per_job_pca(
 
 
 @pytest.mark.parametrize(
+    ("generation_count", "generation_bytes"),
+    (
+        (2, 2_640),
+        (0, 0),
+    ),
+)
+def test_storage_projection_accounts_for_exact_generation_retention(
+    valid_pilot_run: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    generation_count: int,
+    generation_bytes: int,
+) -> None:
+    def measured(path: Path) -> int:
+        if path == valid_pilot_run / "metrics/parts":
+            return 1_320
+        return 0
+
+    monkeypatch.setattr(pilot_gate, "_directory_bytes", measured)
+    monkeypatch.setattr(pilot_gate, "_pca_basis_bytes", lambda path: 0)
+    monkeypatch.setattr(
+        pilot_gate,
+        "_aggregate_generation_stats",
+        lambda path: (generation_count, generation_bytes),
+        raising=False,
+    )
+
+    projection = pilot_gate._storage_projection(valid_pilot_run, 1_320)
+    categories = projection["categories"]
+    parts = categories["metric_parts"]
+    generations = categories["aggregate_generations"]
+    assert parts["measured_bytes"] == 1_320
+    assert parts["full_units"] == pilot_gate.FULL_DESIGN_COUNTS["metric_rows"]
+    assert parts["projected_bytes"] == pilot_gate.FULL_DESIGN_COUNTS["metric_rows"]
+    assert generations["measured_bytes"] == generation_bytes
+    assert generations["generation_count"] == generation_count
+    assert generations["retention_limit"] == 2
+    assert generations["projected_generation_count"] == 2
+    assert generations["projected_bytes"] == (
+        pilot_gate.FULL_DESIGN_COUNTS["metric_rows"] * 2
+    )
+
+
+def test_storage_gate_counts_both_retained_aggregate_generations(
+    valid_pilot_run: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pilot_copy_bytes = 1_000_000_000
+
+    def measured(path: Path) -> int:
+        if path == valid_pilot_run / "metrics/parts":
+            return pilot_copy_bytes
+        return 0
+
+    monkeypatch.setattr(pilot_gate, "_directory_bytes", measured)
+    monkeypatch.setattr(pilot_gate, "_pca_basis_bytes", lambda path: 0)
+    monkeypatch.setattr(
+        pilot_gate,
+        "_aggregate_generation_stats",
+        lambda path: (2, pilot_copy_bytes * 2),
+        raising=False,
+    )
+
+    report = validate_pilot(valid_pilot_run)
+    projection = json.loads(
+        (
+            valid_pilot_run / "reports/pilot_storage_projection.json"
+        ).read_text()
+    )
+    parts = projection["categories"]["metric_parts"]["projected_bytes"]
+    generations = projection["categories"]["aggregate_generations"]
+    one_generation = generations["projected_bytes"] // 2
+    limit = 300 * 1024**3
+
+    assert parts + one_generation <= limit
+    assert parts + generations["projected_bytes"] > limit
+    assert generations["generation_count"] == 2
+    assert generations["retention_limit"] == 2
+    assert "storage_limit" in report.failed_checks
+
+
+@pytest.mark.parametrize(
     ("field", "value"),
     (
         ("artifact_type", "not-a-basis"),
@@ -753,7 +867,10 @@ def test_aggregation_rejects_duplicate_primary_keys_without_replacing_output(
     output = aggregate_metric_parts(valid_pilot_run, "controlled")
     prior = output.read_bytes()
     source = sorted((valid_pilot_run / "metrics/parts").rglob("*.parquet"))[0]
-    duplicate = source.parent / "duplicate.parquet"
+    duplicate = (
+        valid_pilot_run
+        / "metrics/parts/user_37_grid_track/feature__duplicate.parquet"
+    )
     pd.read_parquet(source).iloc[:1].to_parquet(duplicate, index=False)
     registry = JobRegistry(valid_pilot_run / "registry/jobs.sqlite")
     registry.register(
@@ -763,6 +880,7 @@ def test_aggregation_rejects_duplicate_primary_keys_without_replacing_output(
             {
                 "job_type": "feature",
                 "analysis_track": "controlled",
+                "track": "controlled",
                 "state_id": "duplicate",
                 "shoe_id": SHOES[0],
                 "backbone": BACKBONE,
@@ -777,6 +895,105 @@ def test_aggregation_rejects_duplicate_primary_keys_without_replacing_output(
     with pytest.raises(ValueError, match="duplicate metric primary key"):
         aggregate_metric_parts(valid_pilot_run, "controlled")
     assert output.read_bytes() == prior
+
+
+def _register_auxiliary_metric_job(
+    root: Path,
+    *,
+    job_type: str,
+    analysis_track: str,
+    state_track: str,
+    directory: str,
+) -> tuple[str, Path]:
+    job_id = f"feature__{job_type}__exact_path"
+    part = root / "metrics/parts" / directory / f"{job_id}.parquet"
+    part.parent.mkdir(parents=True, exist_ok=True)
+    row: dict[str, object] = {
+        "design_id": "D00000001",
+        "variant_key": "variant",
+    }
+    if job_type == "geometry_calibration":
+        row.update(
+            changed_view="left",
+            perturbation_kind="rotation",
+            magnitude=1.0,
+        )
+    pd.DataFrame([row]).to_parquet(part, index=False)
+    registry = JobRegistry(root / "registry/jobs.sqlite")
+    registry.register(
+        JobDefinition(
+            job_id,
+            "feature",
+            {
+                "job_type": job_type,
+                "analysis_track": analysis_track,
+                "track": state_track,
+                "state_id": f"{job_type}-state",
+                "shoe_id": SHOES[0],
+                "backbone": BACKBONE,
+                "feature_track": "user_37_grid_track",
+                "config_sha256": "test",
+            },
+        )
+    )
+    _set_job_state(registry, job_id, "completed", files=(part,))
+    return job_id, part
+
+
+@pytest.mark.parametrize(
+    ("job_type", "track", "expected_directory", "wrong_directory"),
+    (
+        ("stress", "stress", "user_37_grid_track", "real_deformation_stress"),
+        (
+            "geometry_calibration",
+            "geometry_calibration",
+            "geometry_calibration",
+            "user_37_grid_track",
+        ),
+    ),
+)
+def test_aggregation_rejects_auxiliary_part_outside_task7_exact_directory(
+    valid_pilot_run: Path,
+    job_type: str,
+    track: str,
+    expected_directory: str,
+    wrong_directory: str,
+) -> None:
+    state_track = "stress" if job_type == "stress" else "controlled"
+    job_id, source = _register_auxiliary_metric_job(
+        valid_pilot_run,
+        job_type=job_type,
+        analysis_track=track,
+        state_track=state_track,
+        directory=expected_directory,
+    )
+    destination = (
+        valid_pilot_run
+        / "metrics/parts"
+        / wrong_directory
+        / source.name
+    )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    source.rename(destination)
+    _refresh_job_manifest(valid_pilot_run, job_id, destination)
+
+    with pytest.raises(ValueError, match="exact Task 7 path"):
+        aggregate_metric_parts(valid_pilot_run, track)
+
+
+def test_aggregation_rejects_job_type_analysis_track_mismatch(
+    valid_pilot_run: Path,
+) -> None:
+    _register_auxiliary_metric_job(
+        valid_pilot_run,
+        job_type="stress",
+        analysis_track="controlled",
+        state_track="stress",
+        directory="user_37_grid_track",
+    )
+
+    with pytest.raises(ValueError, match="payload routing"):
+        aggregate_metric_parts(valid_pilot_run, "stress")
 
 
 def _register_calibration_duplicate(root: Path) -> None:
@@ -800,6 +1017,7 @@ def _register_calibration_duplicate(root: Path) -> None:
                 {
                     "job_type": "geometry_calibration",
                     "analysis_track": "geometry_calibration",
+                    "track": "controlled",
                     "state_id": f"state-{index}",
                     "shoe_id": SHOES[0],
                     "backbone": BACKBONE,
@@ -941,6 +1159,112 @@ def test_reader_resolves_one_atomic_aggregate_generation_at_pointer_switch(
         (valid_pilot_run / "metrics" / name).is_symlink()
         for name in old_snapshot
     )
+
+
+def test_aggregate_publication_retains_only_current_and_previous_generation(
+    valid_pilot_run: Path,
+) -> None:
+    aggregate_all_metric_parts(valid_pilot_run)
+    snapshots = [pilot_gate.resolve_aggregate_generation(valid_pilot_run)]
+    controlled_part = sorted(
+        (valid_pilot_run / "metrics/parts").rglob("*.parquet")
+    )[0]
+    frame = pd.read_parquet(controlled_part)
+    for delta in (0.31, 0.32):
+        frame.loc[0, "score"] += delta
+        frame.to_parquet(controlled_part, index=False)
+        _refresh_job_manifest(
+            valid_pilot_run,
+            str(frame.loc[0, "job_id"]),
+            controlled_part,
+        )
+        aggregate_all_metric_parts(valid_pilot_run)
+        snapshots.append(
+            pilot_gate.resolve_aggregate_generation(valid_pilot_run)
+        )
+
+    generations = {
+        path.resolve()
+        for path in (
+            valid_pilot_run / "metrics/aggregate_generations"
+        ).iterdir()
+        if path.is_dir() and not path.name.startswith(".")
+    }
+    assert pilot_gate.AGGREGATE_GENERATION_RETENTION == 2
+    assert generations == set(snapshots[-2:])
+    assert not snapshots[0].exists()
+    assert all(
+        {
+            path.name for path in generation.iterdir()
+        } == set(pilot_gate._aggregate_output_names())
+        for generation in snapshots[-2:]
+    )
+    generation_count, generation_bytes = pilot_gate._aggregate_generation_stats(
+        valid_pilot_run / "metrics/aggregate_generations"
+    )
+    assert generation_count == 2
+    assert generation_bytes == sum(
+        pilot_gate._directory_bytes(generation)
+        for generation in snapshots[-2:]
+    )
+    projection = pilot_gate._storage_projection(valid_pilot_run, 1_320)
+    category = projection["categories"]["aggregate_generations"]
+    assert category["generation_count"] == 2
+    assert category["measured_bytes"] == generation_bytes
+    assert category["retention_limit"] == 2
+
+
+@pytest.mark.parametrize("second_mode", ("all", "single"))
+def test_aggregate_publishers_are_serialized(
+    valid_pilot_run: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    second_mode: str,
+) -> None:
+    original = pilot_gate._aggregate_frame
+    guard = threading.Lock()
+    first_entered = threading.Event()
+    release = threading.Event()
+    concurrent = threading.Event()
+    errors: list[BaseException] = []
+    active = 0
+
+    def observed(root: Path, track: str) -> pd.DataFrame:
+        nonlocal active
+        with guard:
+            active += 1
+            if active > 1:
+                concurrent.set()
+            first_entered.set()
+        release.wait(timeout=5)
+        try:
+            return original(root, track)
+        finally:
+            with guard:
+                active -= 1
+
+    def publish(mode: str) -> None:
+        try:
+            if mode == "all":
+                aggregate_all_metric_parts(valid_pilot_run)
+            else:
+                aggregate_metric_parts(valid_pilot_run, "controlled")
+        except BaseException as error:
+            errors.append(error)
+
+    monkeypatch.setattr(pilot_gate, "_aggregate_frame", observed)
+    first = threading.Thread(target=publish, args=("all",))
+    second = threading.Thread(target=publish, args=(second_mode,))
+    first.start()
+    assert first_entered.wait(timeout=5)
+    second.start()
+    assert not concurrent.wait(timeout=0.25)
+    release.set()
+    first.join(timeout=10)
+    second.join(timeout=10)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
 
 
 def test_single_track_aggregation_preserves_published_generation_aliases(

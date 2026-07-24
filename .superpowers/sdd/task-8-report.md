@@ -188,6 +188,167 @@ git diff --check
 exit 0
 ```
 
+---
+
+## Third review remediation: bounded generations and exact all-track inputs
+
+The third Task 8 review identified three important gaps in commit `48b3b22`:
+published immutable generations accumulated without a retention bound or
+matching storage projection, non-object feature-variant list entries were
+silently filtered, and general aggregation accepted registry-authorized
+Parquet files from arbitrary directories below `metrics/parts/`.
+
+The design was recorded and approved in
+`docs/superpowers/specs/2026-07-24-task8-third-review-remediation-design.md`.
+Repository inspection confirmed that Task 7's `_part_path` uses the payload
+feature-track directory for both controlled and stress jobs; only
+geometry-calibration uses a fixed directory. The remediation therefore
+validates that actual writer contract rather than introducing a Task 7 path
+change.
+
+### Third review RED evidence
+
+Strict feature-variant entries:
+
+```text
+4 failed, 1 passed, 33 deselected in 7.02s
+```
+
+Appending a string, null, or list and adding an unexpected object key all
+passed the old gate. The wrong-key object already failed through `KeyError`,
+which established the expected failure classification.
+
+Exact auxiliary part paths and payload routing:
+
+```text
+3 failed, 38 deselected in 3.82s
+```
+
+The old general aggregator accepted a stress part moved from its feature-track
+directory to `real_deformation_stress`, accepted a calibration part moved out
+of `geometry_calibration`, and accepted a stress job labeled with controlled
+analysis routing after all registered hashes were refreshed.
+
+Generation retention and publisher serialization:
+
+```text
+2 failed, 41 deselected in 3.84s
+```
+
+Three distinct publications left three complete generation directories, and a
+second publisher entered aggregate-frame construction while the first was
+still inside the publication operation.
+
+A final lock audit parametrized the competing publisher as either full-set or
+single-track aggregation. The full-set case passed after the first lock fix,
+while the legacy pre-generation single-track path still entered concurrently:
+
+```text
+1 failed, 1 passed, 45 deselected in 3.86s
+```
+
+Retention-aware storage projection:
+
+```text
+3 failed, 43 deselected in 4.79s
+```
+
+The report exposed only the old hardcoded `metrics × 2` category. It had no
+separate metric-part and generation categories, no measured generation
+count/bytes, and no exact two-generation multiplier.
+
+### Third review implementation
+
+- `feature_variants.json` is compared as a raw ordered JSON list with
+  `[asdict(item) for item in build_upper_design(...).feature_variants]`.
+  No entry is filtered or coercively reconstructed.
+- General aggregation derives and requires Task 7's exact resolved part path
+  for every completed job:
+  - controlled and stress:
+    `metrics/parts/<feature_track>/<job_id>.parquet`;
+  - geometry calibration:
+    `metrics/parts/geometry_calibration/<job_id>.parquet`.
+- Job type, state track, and `analysis_track` must agree before a registered
+  file enters a dataset. Sharing a feature-track directory cannot route stress
+  rows into controlled aggregation or the reverse.
+- `AGGREGATE_GENERATION_RETENTION` is fixed at two.
+- A filesystem `flock` serializes publishers across the full cleanup, build,
+  switch, alias, and retention operation.
+- After the atomic pointer switch, cleanup preserves the current generation
+  and the resolved pre-switch generation and removes other complete published
+  generations. Staging and unpublished cleanup remains inside the publisher
+  lock.
+- Storage projection separates `metric_parts` and
+  `aggregate_generations`. The latter reports actual complete-generation
+  count and bytes, retention limit, projection basis, and projected generation
+  count. It projects one full-design part copy plus exactly two full-design
+  aggregate copies; a zero-generation pilot uses measured part bytes as its
+  pre-aggregation proxy.
+
+### Third review GREEN evidence
+
+Incremental results:
+
+```text
+strict feature-variant entries: 5 passed, 33 deselected in 4.95s
+exact auxiliary paths/routing plus duplicate-PK boundary:
+  4 passed, 37 deselected in 4.27s
+atomic visibility, crash, retention, and publisher lock:
+  5 passed, 38 deselected in 6.38s
+full-set and single-track publisher lock plus stable aliases:
+  3 passed, 44 deselected in 4.66s
+retention projection, cap, and PCA category split:
+  4 passed, 42 deselected in 4.59s
+```
+
+The retained-generation test publishes three distinct content generations,
+asserts that only current and immediate prior remain complete, verifies the
+oldest was removed, measures their real directory bytes, and checks the
+projection category reports the same count and byte total. The storage-cap
+test also demonstrates that parts plus one generation remain below 300 GiB
+while parts plus both retained generations exceed it and fail the gate.
+
+Final Task 8 focused boundary:
+
+```text
+/opt/conda/envs/pixal3d/bin/python -m pytest -q \
+  tests/test_pilot_gate.py tests/test_upper_cli.py
+
+54 passed in 37.98s
+```
+
+Cumulative Task 4–8 boundary:
+
+```text
+/opt/conda/envs/pixal3d/bin/python -m pytest -q \
+  tests/test_job_registry.py tests/test_upper_prepare.py \
+  tests/test_upper_geometry.py tests/test_pca_features.py \
+  tests/test_streaming_features.py tests/test_upper_metric_worker.py \
+  tests/test_pipeline_integration.py tests/test_pilot_gate.py \
+  tests/test_upper_cli.py
+
+116 passed in 136.54s (0:02:16)
+```
+
+Fresh full-suite and static surface verification:
+
+```text
+/opt/conda/envs/pixal3d/bin/python -m pytest -q
+224 passed in 162.80s (0:02:42)
+
+/opt/conda/envs/pixal3d/bin/python -m compileall -q met3r tests
+exit 0
+
+bash -n scripts/run_upper_pilot.sh
+exit 0
+
+met3r.upper_cli top-level help and all six command help invocations
+exit 0
+
+git diff --check
+exit 0
+```
+
 ## Self-review and concerns
 
 - Pilot aggregation covers only the controlled track; the two absent pilot

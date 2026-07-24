@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import math
@@ -11,6 +12,7 @@ import sqlite3
 import subprocess
 import tempfile
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -34,6 +36,7 @@ from .upper_design import FeatureVariant, build_upper_design
 EXPECTED_PILOT_METRIC_ROWS = 1_320
 EXPECTED_PILOT_GEOMETRY_JOBS = 32
 EXPECTED_PILOT_FEATURE_JOBS = 64
+AGGREGATE_GENERATION_RETENTION = 2
 EXPECTED_PILOT_SHOES = (
     "air_huarache_run_ultra_111449",
     "air_max_90_surplus_cq7743_300",
@@ -207,20 +210,10 @@ def _load_pilot_design(
     )
     if not isinstance(raw_variants, list):
         raise ValueError("feature variant manifest must be a list")
-    variants = tuple(
-        FeatureVariant(
-            feature_track=str(item["feature_track"]),
-            backbone=str(item["backbone"]),
-            input_size=int(item["input_size"]),
-            feature_mode=str(item["feature_mode"]),
-            resolution=int(item["resolution"]),
-        )
-        for item in raw_variants
-        if isinstance(item, Mapping)
-    )
     expected_variants = canonical.feature_variants
-    if variants != expected_variants or len(variants) != 30:
+    if raw_variants != [asdict(item) for item in expected_variants]:
         raise ValueError("feature variant manifest differs from the frozen pilot")
+    variants = expected_variants
     variants_by_key = {item.key: item for item in variants}
     if len(variants_by_key) != len(variants):
         raise ValueError("feature variant keys must be unique")
@@ -313,6 +306,35 @@ def _track_for_job(row: _RegistryRow) -> str | None:
     }.get(str(row.payload.get("job_type")))
 
 
+def _expected_metric_part(root: Path, row: _RegistryRow, track: str) -> Path:
+    job_type = str(row.payload.get("job_type"))
+    expected = {
+        "feature": ("controlled", "controlled"),
+        "stress": ("stress", "stress"),
+        "geometry_calibration": ("geometry_calibration", "controlled"),
+    }.get(job_type)
+    if expected is None or expected != (
+        track,
+        row.payload.get("track"),
+    ) or row.payload.get("analysis_track") != track:
+        raise ValueError(f"metric job payload routing is invalid: {row.job_id}")
+    feature_track = row.payload.get("feature_track")
+    if not isinstance(feature_track, str) or not feature_track:
+        raise ValueError(f"metric job payload routing is invalid: {row.job_id}")
+    directory = (
+        "geometry_calibration"
+        if job_type == "geometry_calibration"
+        else feature_track
+    )
+    return (
+        root
+        / "metrics"
+        / "parts"
+        / directory
+        / f"{row.job_id}.parquet"
+    ).resolve()
+
+
 def _part_paths(
     root: Path,
     rows: Sequence[_RegistryRow],
@@ -335,6 +357,12 @@ def _part_paths(
         if row.state == "completed" and len(parquet) != 1:
             raise ValueError(
                 f"completed metric job must register one Parquet part: {row.job_id}"
+            )
+        if row.state == "completed" and parquet[0] != _expected_metric_part(
+            root, row, track
+        ):
+            raise ValueError(
+                f"metric part is not at the exact Task 7 path: {row.job_id}"
             )
         parts.extend(parquet)
     if len(parts) != len(set(parts)):
@@ -630,13 +658,16 @@ def aggregate_metric_parts(run_root: str | Path, track: str) -> Path:
     root = Path(run_root).expanduser().resolve()
     if track not in _TRACK_FILENAMES:
         raise ValueError(f"unknown metric track: {track}")
-    current = root / "metrics" / "current"
-    if current.exists() or current.is_symlink():
-        aggregate_all_metric_parts(root)
-        return root / "metrics" / _TRACK_FILENAMES[track]
-    frame = _aggregate_frame(root, track)
-    destination = root / "metrics" / _TRACK_FILENAMES[track]
-    return _atomic_parquet(frame, destination)
+    metrics_root = root / "metrics"
+    metrics_root.mkdir(parents=True, exist_ok=True)
+    with _aggregate_publisher_lock(metrics_root):
+        current = metrics_root / "current"
+        if current.exists() or current.is_symlink():
+            _aggregate_all_metric_parts_locked(root, metrics_root)
+            return metrics_root / _TRACK_FILENAMES[track]
+        frame = _aggregate_frame(root, track)
+        destination = metrics_root / _TRACK_FILENAMES[track]
+        return _atomic_parquet(frame, destination)
 
 
 def _write_aggregate_preview(frame: pd.DataFrame, destination: Path) -> None:
@@ -699,6 +730,17 @@ def _ensure_aggregate_aliases(metrics_root: Path) -> None:
                 temporary.unlink()
 
 
+@contextmanager
+def _aggregate_publisher_lock(metrics_root: Path):
+    metrics_root.mkdir(parents=True, exist_ok=True)
+    with (metrics_root / ".aggregate-publisher.lock").open("a+b") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def _cleanup_unpublished_generations(metrics_root: Path) -> None:
     generations = metrics_root / "aggregate_generations"
     generations.mkdir(parents=True, exist_ok=True)
@@ -722,12 +764,56 @@ def _cleanup_unpublished_generations(metrics_root: Path) -> None:
             marker.unlink()
 
 
+def _cleanup_published_generations(
+    metrics_root: Path,
+    *,
+    current: Path,
+    previous: Path | None,
+) -> None:
+    generations = metrics_root / "aggregate_generations"
+    candidates = [
+        path.resolve()
+        for path in generations.iterdir()
+        if (
+            path.is_dir()
+            and not path.is_symlink()
+            and not path.name.startswith(".")
+            and not (path / ".unpublished").exists()
+            and all((path / name).is_file() for name in _aggregate_output_names())
+        )
+    ]
+    keep: list[Path] = []
+    for path in (current.resolve(), previous.resolve() if previous else None):
+        if path is not None and path in candidates and path not in keep:
+            keep.append(path)
+    for path in sorted(
+        candidates,
+        key=lambda item: item.stat().st_mtime_ns,
+        reverse=True,
+    ):
+        if len(keep) >= AGGREGATE_GENERATION_RETENTION:
+            break
+        if path not in keep:
+            keep.append(path)
+    for path in candidates:
+        if path not in keep:
+            shutil.rmtree(path)
+
+
 def aggregate_all_metric_parts(run_root: str | Path) -> tuple[Path, ...]:
     """Publish all aggregates as one recoverable filesystem generation."""
 
     root = Path(run_root).expanduser().resolve()
     metrics_root = root / "metrics"
     metrics_root.mkdir(parents=True, exist_ok=True)
+    with _aggregate_publisher_lock(metrics_root):
+        return _aggregate_all_metric_parts_locked(root, metrics_root)
+
+
+def _aggregate_all_metric_parts_locked(
+    root: Path,
+    metrics_root: Path,
+) -> tuple[Path, ...]:
     _cleanup_unpublished_generations(metrics_root)
     frames = {
         track: _aggregate_frame(root, track)
@@ -763,8 +849,17 @@ def aggregate_all_metric_parts(run_root: str | Path) -> tuple[Path, ...]:
             shutil.rmtree(staging)
         else:
             staging.rename(generation)
+        try:
+            previous = resolve_aggregate_generation(root)
+        except (OSError, ValueError):
+            previous = None
         _publish_aggregate_pointer(metrics_root, generation)
         _ensure_aggregate_aliases(metrics_root)
+        _cleanup_published_generations(
+            metrics_root,
+            current=generation,
+            previous=previous,
+        )
     except Exception:
         if staging.exists():
             shutil.rmtree(staging)
@@ -819,6 +914,29 @@ def _pca_basis_bytes(path: Path) -> int:
     ) if path.is_dir() else 0
 
 
+def _aggregate_generation_stats(path: Path) -> tuple[int, int]:
+    if not path.is_dir():
+        return 0, 0
+    generations = [
+        generation
+        for generation in path.iterdir()
+        if (
+            generation.is_dir()
+            and not generation.is_symlink()
+            and not generation.name.startswith(".")
+            and not (generation / ".unpublished").exists()
+            and all(
+                (generation / name).is_file()
+                for name in _aggregate_output_names()
+            )
+        )
+    ]
+    return len(generations), sum(
+        _directory_bytes(generation)
+        for generation in generations
+    )
+
+
 def _storage_projection(root: Path, actual_metric_rows: int) -> Mapping[str, object]:
     pilot_geometry_units = EXPECTED_PILOT_GEOMETRY_JOBS
     pilot_feature_units = EXPECTED_PILOT_FEATURE_JOBS
@@ -826,10 +944,15 @@ def _storage_projection(root: Path, actual_metric_rows: int) -> Mapping[str, obj
     pca_total_bytes = _directory_bytes(root / "pca")
     pca_basis_bytes = _pca_basis_bytes(root / "pca")
     pca_job_bytes = max(pca_total_bytes - pca_basis_bytes, 0)
+    metric_part_bytes = _directory_bytes(root / "metrics" / "parts")
+    generation_count, generation_bytes = _aggregate_generation_stats(
+        root / "metrics" / "aggregate_generations"
+    )
     classified = {
         "states": _directory_bytes(root / "states"),
         "geometry": _directory_bytes(root / "geometry"),
-        "metrics": _directory_bytes(root / "metrics" / "parts"),
+        "metric_parts": metric_part_bytes,
+        "aggregate_generations": generation_bytes,
         "pca_basis": pca_basis_bytes,
         "pca_job_outputs": pca_job_bytes,
         "visualizations": _directory_bytes(root / "visualizations"),
@@ -868,11 +991,39 @@ def _storage_projection(root: Path, actual_metric_rows: int) -> Mapping[str, obj
                 + FULL_DESIGN_COUNTS["geometry_calibration_artifacts"]
             ),
         },
-        "metrics": {
-            "measured_bytes": classified["metrics"],
+        "metric_parts": {
+            "measured_bytes": classified["metric_parts"],
             "pilot_units": max(actual_metric_rows, 1),
-            # Parts and the final aggregate are both persistent.
-            "full_units": FULL_DESIGN_COUNTS["metric_rows"] * 2,
+            "full_units": FULL_DESIGN_COUNTS["metric_rows"],
+        },
+        "aggregate_generations": {
+            "measured_bytes": classified["aggregate_generations"],
+            "generation_count": generation_count,
+            "retention_limit": AGGREGATE_GENERATION_RETENTION,
+            "projected_generation_count": AGGREGATE_GENERATION_RETENTION,
+            "projection_basis": (
+                "measured_generations"
+                if generation_count
+                else "metric_parts_proxy"
+            ),
+            "projection_basis_bytes": (
+                generation_bytes if generation_count else metric_part_bytes
+            ),
+            "pilot_units": max(actual_metric_rows, 1)
+            * max(generation_count, 1),
+            "full_units": (
+                FULL_DESIGN_COUNTS["metric_rows"]
+                * AGGREGATE_GENERATION_RETENTION
+            ),
+            "projected_bytes": math.ceil(
+                (generation_bytes if generation_count else metric_part_bytes)
+                * FULL_DESIGN_COUNTS["metric_rows"]
+                * AGGREGATE_GENERATION_RETENTION
+                / (
+                    max(actual_metric_rows, 1)
+                    * max(generation_count, 1)
+                )
+            ),
         },
         "pca_basis": {
             "measured_bytes": classified["pca_basis"],
