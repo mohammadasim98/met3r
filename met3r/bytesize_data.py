@@ -306,13 +306,47 @@ def _write_selected_camera_set(
     analysis_tier: str,
     translation_is_proxy: bool,
 ) -> None:
+    arrays, staged_images = _selected_camera_content(
+        views=views,
+        extrinsics_by_group=extrinsics_by_group,
+    )
     destination.mkdir(parents=True, exist_ok=True)
     image_dir = destination / "images"
     image_dir.mkdir(exist_ok=True)
+    image_paths = []
+    for view, staged_rgb in zip(views, staged_images):
+        staged_path = image_dir / f"{view.view_id}.png"
+        Image.fromarray(staged_rgb).save(staged_path)
+        image_paths.append(str(staged_path))
+
+    np.savez_compressed(destination / "cameras.npz", **arrays)
+    (destination / "images.json").write_text(
+        json.dumps(image_paths, indent=2),
+        encoding="utf-8",
+    )
+    (destination / "metadata.json").write_text(
+        json.dumps(
+            _camera_metadata(
+                views=views,
+                provenance=provenance,
+                analysis_tier=analysis_tier,
+                translation_is_proxy=translation_is_proxy,
+            ),
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _selected_camera_content(
+    *,
+    views: tuple[ViewRecord, ...],
+    extrinsics_by_group: Mapping[str, np.ndarray],
+) -> tuple[dict[str, np.ndarray], tuple[np.ndarray, ...]]:
     intrinsics = []
     extrinsics = []
     masks = []
-    images = []
+    staged_images = []
     for view in views:
         with np.load(view.intrinsics_path) as artifact:
             intrinsics.append(np.asarray(artifact["intrinsics"])[view.camera_index])
@@ -330,42 +364,89 @@ def _write_selected_camera_set(
             processed[..., :3],
             np.asarray([255, 255, 255], dtype=processed.dtype),
         ).astype(np.uint8)
-        staged_path = image_dir / f"{view.view_id}.png"
-        Image.fromarray(staged_rgb).save(staged_path)
-        images.append(str(staged_path))
+        staged_images.append(staged_rgb)
+    return (
+        {
+            "intrinsics": np.stack(intrinsics),
+            "extrinsics": np.stack(extrinsics),
+            "mask": np.stack(masks),
+            "view_ids": np.asarray([view.view_id for view in views]),
+            "camera_groups": np.asarray([view.camera_group for view in views]),
+        },
+        tuple(staged_images),
+    )
 
-    np.savez_compressed(
-        destination / "cameras.npz",
-        intrinsics=np.stack(intrinsics),
-        extrinsics=np.stack(extrinsics),
-        mask=np.stack(masks),
-        view_ids=np.asarray([view.view_id for view in views]),
-        camera_groups=np.asarray([view.camera_group for view in views]),
-    )
-    (destination / "images.json").write_text(
-        json.dumps(images, indent=2),
-        encoding="utf-8",
-    )
-    (destination / "metadata.json").write_text(
-        json.dumps(
+
+def _camera_metadata(
+    *,
+    views: tuple[ViewRecord, ...],
+    provenance: str,
+    analysis_tier: str,
+    translation_is_proxy: bool,
+) -> dict[str, object]:
+    return {
+        "camera_mode": CAMERA_MODE_LABEL,
+        "camera_provenance": provenance,
+        "analysis_tier": analysis_tier,
+        "translation_is_proxy": translation_is_proxy,
+        "views": [
             {
-                "camera_mode": CAMERA_MODE_LABEL,
-                "camera_provenance": provenance,
-                "analysis_tier": analysis_tier,
-                "translation_is_proxy": translation_is_proxy,
-                "views": [
-                    {
-                        "view_id": view.view_id,
-                        "camera_group": view.camera_group,
-                        "camera_index": view.camera_index,
-                    }
-                    for view in views
-                ],
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
+                "view_id": view.view_id,
+                "camera_group": view.camera_group,
+                "camera_index": view.camera_index,
+            }
+            for view in views
+        ],
+    }
+
+
+def _selected_camera_set_matches(
+    destination: Path,
+    *,
+    views: tuple[ViewRecord, ...],
+    extrinsics_by_group: Mapping[str, np.ndarray],
+    provenance: str,
+    analysis_tier: str,
+    translation_is_proxy: bool,
+) -> bool:
+    try:
+        expected_arrays, expected_images = _selected_camera_content(
+            views=views,
+            extrinsics_by_group=extrinsics_by_group,
+        )
+        with np.load(destination / "cameras.npz") as artifact:
+            if set(artifact.files) != set(expected_arrays):
+                return False
+            if any(
+                not np.array_equal(np.asarray(artifact[name]), expected)
+                for name, expected in expected_arrays.items()
+            ):
+                return False
+        expected_paths = [
+            str(destination / "images" / f"{view.view_id}.png")
+            for view in views
+        ]
+        if json.loads(
+            (destination / "images.json").read_text(encoding="utf-8")
+        ) != expected_paths:
+            return False
+        if json.loads(
+            (destination / "metadata.json").read_text(encoding="utf-8")
+        ) != _camera_metadata(
+            views=views,
+            provenance=provenance,
+            analysis_tier=analysis_tier,
+            translation_is_proxy=translation_is_proxy,
+        ):
+            return False
+        for path, expected in zip(expected_paths, expected_images):
+            with Image.open(path) as image:
+                actual = np.asarray(image.convert("RGB"))
+            if not np.array_equal(actual, expected):
+                return False
+        return True
+    except (FileNotFoundError, KeyError, OSError, ValueError, json.JSONDecodeError):
+        return False
 
 
 def write_camera_artifacts(
@@ -454,27 +535,20 @@ def write_upper_camera_artifacts(
             )
         artifact_dir = destination / deformation_slug
         camera_path = artifact_dir / "cameras.npz"
-        if camera_path.is_file():
-            with np.load(camera_path) as artifact:
-                valid = (
-                    artifact["intrinsics"].shape == (4, 3, 3)
-                    and artifact["extrinsics"].shape == (4, 4, 4)
-                    and artifact["mask"].shape
-                    == (4, *manifest.processed_image_size[::-1])
-                    and artifact["view_ids"].tolist()
-                    == ["left", "back", "right", "front"]
-                )
-            if valid and all(
-                (artifact_dir / "images" / f"{view.view_id}.png").is_file()
-                for view in upper_views
-            ) and (artifact_dir / "images.json").is_file() and (
-                artifact_dir / "metadata.json"
-            ).is_file():
-                continue
-            raise ValueError(f"invalid existing upper camera artifact: {artifact_dir}")
         example = upper_views[0]
         with np.load(example.raw_extrinsics_path) as artifact:
             upper_extrinsics = _as_homogeneous(np.asarray(artifact["extrinsics"]))
+        if camera_path.is_file():
+            if _selected_camera_set_matches(
+                artifact_dir,
+                views=upper_views,
+                extrinsics_by_group={"upper": upper_extrinsics},
+                provenance="fixed_precomputed_da3",
+                analysis_tier="primary",
+                translation_is_proxy=False,
+            ):
+                continue
+            raise ValueError(f"invalid existing upper camera artifact: {artifact_dir}")
         _write_selected_camera_set(
             artifact_dir,
             views=upper_views,

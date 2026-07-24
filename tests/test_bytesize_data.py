@@ -204,3 +204,59 @@ def test_upper_camera_artifacts_have_only_four_504_views(tmp_path: Path) -> None
     assert len(list(tmp_path.glob("*/cameras.npz"))) == 4
     assert not list(tmp_path.rglob("bottom"))
     assert not list(tmp_path.rglob("sensitivity"))
+
+
+def _write_real_upper_camera_artifacts(tmp_path: Path):
+    manifest = build_bytesize_manifest("/root/dev/ByteSize/Reconstruction")
+    write_upper_camera_artifacts(
+        manifest,
+        tmp_path,
+        shoe_aliases=CAMERA_DATASET_BY_SHOE,
+    )
+    return manifest, tmp_path / "air_huarache_run_ultra_111449"
+
+
+def test_upper_camera_resume_rejects_mutated_provenance_label(tmp_path: Path) -> None:
+    manifest, artifact_dir = _write_real_upper_camera_artifacts(tmp_path)
+    metadata_path = artifact_dir / "metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["camera_mode"] = "calibrated GT"
+    metadata_path.write_text(json.dumps(metadata))
+
+    with pytest.raises(ValueError, match="invalid existing upper camera artifact"):
+        write_upper_camera_artifacts(
+            manifest,
+            tmp_path,
+            shoe_aliases=CAMERA_DATASET_BY_SHOE,
+        )
+
+
+@pytest.mark.parametrize("mutation", ("camera_array", "staged_image", "group_mapping"))
+def test_upper_camera_resume_rejects_mutated_canonical_content(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    manifest, artifact_dir = _write_real_upper_camera_artifacts(tmp_path)
+    if mutation == "camera_array":
+        camera_path = artifact_dir / "cameras.npz"
+        with np.load(camera_path) as artifact:
+            arrays = {name: np.asarray(artifact[name]) for name in artifact.files}
+        arrays["intrinsics"] = arrays["intrinsics"].copy()
+        arrays["intrinsics"][0, 0, 0] += 1.0
+        np.savez_compressed(camera_path, **arrays)
+    elif mutation == "staged_image":
+        Image.new("RGB", (504, 504), "black").save(
+            artifact_dir / "images/left.png"
+        )
+    else:
+        metadata_path = artifact_dir / "metadata.json"
+        metadata = json.loads(metadata_path.read_text())
+        metadata["views"][0]["camera_group"] = "bottom"
+        metadata_path.write_text(json.dumps(metadata))
+
+    with pytest.raises(ValueError, match="invalid existing upper camera artifact"):
+        write_upper_camera_artifacts(
+            manifest,
+            tmp_path,
+            shoe_aliases=CAMERA_DATASET_BY_SHOE,
+        )

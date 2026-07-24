@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal, Mapping, Sequence
 
+import numpy as np
 import pandas as pd
 from PIL import Image
 
@@ -206,22 +207,28 @@ def _stage_pca_fit_images(
         shoe_dir.mkdir(parents=True, exist_ok=True)
         for view in shoe.views:
             output = shoe_dir / f"{view.view_id}.png"
-            if output.is_file():
-                with Image.open(output) as image:
-                    if image.size != (stage_size, stage_size):
-                        raise ValueError(f"invalid existing PCA-fit image: {output}")
-                continue
             with Image.open(view.source_path) as image:
-                rgb = image.convert("RGB").resize(
-                    (stage_size, stage_size), Image.Resampling.LANCZOS
+                rgb = np.asarray(
+                    image.convert("RGB").resize(
+                        (stage_size, stage_size), Image.Resampling.LANCZOS
+                    )
                 )
             with Image.open(view.source_mask_path) as image:
-                mask = image.convert("L").resize(
-                    (stage_size, stage_size), Image.Resampling.NEAREST
-                )
-            white = Image.new("RGB", (stage_size, stage_size), "white")
-            white.paste(rgb, mask=mask.point(lambda value: 255 if value > 127 else 0))
-            white.save(output)
+                mask = np.asarray(
+                    image.convert("L").resize(
+                        (stage_size, stage_size), Image.Resampling.NEAREST
+                    )
+                ) > 127
+            expected = np.where(mask[..., None], rgb, 255).astype(np.uint8)
+            if output.is_file():
+                try:
+                    with Image.open(output) as image:
+                        actual = np.asarray(image.convert("RGB"))
+                    if np.array_equal(actual, expected):
+                        continue
+                except OSError:
+                    pass
+            Image.fromarray(expected).save(output)
 
 
 def _feature_pairs(

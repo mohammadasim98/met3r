@@ -285,6 +285,7 @@ class JobRegistry:
                     UPDATE jobs
                     SET state = 'pending', worker_id = NULL, started_at = NULL,
                         finished_at = NULL, output_manifest_json = NULL,
+                        attempts = 0,
                         error = 'completed output validation failed'
                     WHERE job_id = ? AND state = 'completed'
                     """,

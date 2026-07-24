@@ -75,7 +75,32 @@ def test_completed_job_requires_valid_output_hash(tmp_path: Path) -> None:
     output.write_bytes(b"changed")
 
     assert registry.validated_state("a") == "pending"
-    assert registry.claim_next("replacement", "feature", {}).attempts == 2
+    assert registry.claim_next("replacement", "feature", {}).attempts == 1
+
+
+def test_invalid_third_attempt_completion_resets_attempt_budget(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "part.parquet"
+    output.write_bytes(b"metric")
+    registry = JobRegistry(tmp_path / "jobs.sqlite")
+    registry.register(JobDefinition("a", "feature", {}))
+    for attempt in (1, 2):
+        claimed = registry.claim_next("worker", "feature", {})
+        assert claimed is not None and claimed.attempts == attempt
+        registry.fail("a", "transient", retryable=True)
+    claimed = registry.claim_next("worker", "feature", {})
+    assert claimed is not None and claimed.attempts == 3
+    registry.complete(
+        "a",
+        {"files": [{"path": str(output), "sha256": sha256_file(output)}]},
+    )
+    output.write_bytes(b"corrupted")
+
+    assert registry.validated_state("a") == "pending"
+    replacement = registry.claim_next("replacement", "feature", {})
+    assert replacement is not None
+    assert replacement.attempts == 1
 
 
 def test_complete_rejects_missing_or_mismatched_outputs(tmp_path: Path) -> None:

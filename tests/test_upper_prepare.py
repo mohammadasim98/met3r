@@ -11,7 +11,11 @@ from PIL import Image
 from met3r.job_registry import JobRegistry
 from met3r.upper_data import build_upper_manifest
 from met3r.upper_design import build_upper_design
-from met3r.upper_prepare import _register_state_jobs, prepare_run
+from met3r.upper_prepare import (
+    _register_state_jobs,
+    _stage_pca_fit_images,
+    prepare_run,
+)
 
 
 ROOT = Path("/root/dev/ByteSize/Reconstruction")
@@ -65,6 +69,19 @@ def test_prepare_stages_all_sixteen_clean_pca_images_in_pilot(tmp_path: Path) ->
 
     assert len(paths) == 16
     assert all(Image.open(path).size == (504, 504) for path in paths)
+
+
+def test_pca_fit_staging_repairs_altered_same_size_image(tmp_path: Path) -> None:
+    manifest = build_upper_manifest(ROOT)
+    destination = tmp_path / "pca_fit_images"
+    _stage_pca_fit_images(manifest, destination, 504)
+    target = destination / manifest.shoes[0].shoe_id / "left.png"
+    expected = hashlib.sha256(target.read_bytes()).hexdigest()
+    Image.new("RGB", (504, 504), "black").save(target)
+
+    _stage_pca_fit_images(manifest, destination, 504)
+
+    assert hashlib.sha256(target.read_bytes()).hexdigest() == expected
 
 
 def test_prepare_is_idempotent_and_preserves_registered_state(tmp_path: Path) -> None:
