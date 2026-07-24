@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Mapping
@@ -305,6 +307,7 @@ def _write_selected_camera_set(
     provenance: str,
     analysis_tier: str,
     translation_is_proxy: bool,
+    image_manifest_destination: Path | None = None,
 ) -> None:
     arrays, staged_images = _selected_camera_content(
         views=views,
@@ -314,10 +317,13 @@ def _write_selected_camera_set(
     image_dir = destination / "images"
     image_dir.mkdir(exist_ok=True)
     image_paths = []
+    manifest_destination = image_manifest_destination or destination
     for view, staged_rgb in zip(views, staged_images):
         staged_path = image_dir / f"{view.view_id}.png"
         Image.fromarray(staged_rgb).save(staged_path)
-        image_paths.append(str(staged_path))
+        image_paths.append(
+            str(manifest_destination / "images" / f"{view.view_id}.png")
+        )
 
     np.savez_compressed(destination / "cameras.npz", **arrays)
     (destination / "images.json").write_text(
@@ -408,6 +414,7 @@ def _selected_camera_set_matches(
     provenance: str,
     analysis_tier: str,
     translation_is_proxy: bool,
+    image_manifest_destination: Path | None = None,
 ) -> bool:
     try:
         expected_arrays, expected_images = _selected_camera_content(
@@ -422,8 +429,9 @@ def _selected_camera_set_matches(
                 for name, expected in expected_arrays.items()
             ):
                 return False
+        manifest_destination = image_manifest_destination or destination
         expected_paths = [
-            str(destination / "images" / f"{view.view_id}.png")
+            str(manifest_destination / "images" / f"{view.view_id}.png")
             for view in views
         ]
         if json.loads(
@@ -439,14 +447,105 @@ def _selected_camera_set_matches(
             translation_is_proxy=translation_is_proxy,
         ):
             return False
-        for path, expected in zip(expected_paths, expected_images):
+        actual_paths = [
+            destination / "images" / f"{view.view_id}.png" for view in views
+        ]
+        for path, expected in zip(actual_paths, expected_images):
             with Image.open(path) as image:
                 actual = np.asarray(image.convert("RGB"))
             if not np.array_equal(actual, expected):
                 return False
+        expected_files = {
+            "cameras.npz",
+            "images.json",
+            "metadata.json",
+            *(f"images/{view.view_id}.png" for view in views),
+        }
+        actual_files = {
+            str(path.relative_to(destination))
+            for path in destination.rglob("*")
+            if path.is_file()
+        }
+        if actual_files != expected_files:
+            return False
         return True
     except (FileNotFoundError, KeyError, OSError, ValueError, json.JSONDecodeError):
         return False
+
+
+def _remove_artifact_path(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    elif path.exists() or path.is_symlink():
+        path.unlink()
+
+
+def _replace_selected_camera_set(
+    destination: Path,
+    *,
+    views: tuple[ViewRecord, ...],
+    extrinsics_by_group: Mapping[str, np.ndarray],
+    provenance: str,
+    analysis_tier: str,
+    translation_is_proxy: bool,
+) -> None:
+    """Stage and validate a complete bundle before swapping it into place."""
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(
+        tempfile.mkdtemp(
+            prefix=f".{destination.name}.staging.",
+            dir=destination.parent,
+        )
+    )
+    backup: Path | None = None
+    try:
+        _write_selected_camera_set(
+            temporary,
+            views=views,
+            extrinsics_by_group=dict(extrinsics_by_group),
+            provenance=provenance,
+            analysis_tier=analysis_tier,
+            translation_is_proxy=translation_is_proxy,
+            image_manifest_destination=destination,
+        )
+        if not _selected_camera_set_matches(
+            temporary,
+            views=views,
+            extrinsics_by_group=extrinsics_by_group,
+            provenance=provenance,
+            analysis_tier=analysis_tier,
+            translation_is_proxy=translation_is_proxy,
+            image_manifest_destination=destination,
+        ):
+            raise RuntimeError("staged camera artifact failed canonical validation")
+        if destination.exists() or destination.is_symlink():
+            backup = Path(
+                tempfile.mkdtemp(
+                    prefix=f".{destination.name}.backup.",
+                    dir=destination.parent,
+                )
+            )
+            backup.rmdir()
+            destination.rename(backup)
+        try:
+            temporary.rename(destination)
+        except Exception:
+            if backup is not None and backup.exists():
+                backup.rename(destination)
+                backup = None
+            raise
+        if backup is not None:
+            _remove_artifact_path(backup)
+            backup = None
+    finally:
+        if temporary.exists():
+            _remove_artifact_path(temporary)
+        if backup is not None and backup.exists():
+            if not destination.exists():
+                backup.rename(destination)
+            else:
+                _remove_artifact_path(backup)
 
 
 def write_camera_artifacts(
@@ -534,11 +633,10 @@ def write_upper_camera_artifacts(
                 f"camera dataset {camera_dataset_id!r} lacks the canonical upper views"
             )
         artifact_dir = destination / deformation_slug
-        camera_path = artifact_dir / "cameras.npz"
         example = upper_views[0]
         with np.load(example.raw_extrinsics_path) as artifact:
             upper_extrinsics = _as_homogeneous(np.asarray(artifact["extrinsics"]))
-        if camera_path.is_file():
+        if artifact_dir.exists():
             if _selected_camera_set_matches(
                 artifact_dir,
                 views=upper_views,
@@ -548,8 +646,7 @@ def write_upper_camera_artifacts(
                 translation_is_proxy=False,
             ):
                 continue
-            raise ValueError(f"invalid existing upper camera artifact: {artifact_dir}")
-        _write_selected_camera_set(
+        _replace_selected_camera_set(
             artifact_dir,
             views=upper_views,
             extrinsics_by_group={"upper": upper_extrinsics},

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -7,6 +8,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
+import met3r.bytesize_data as bytesize_data
 from met3r.bytesize_data import (
     build_bytesize_manifest,
     recover_bottom_camera_alignment,
@@ -216,27 +218,61 @@ def _write_real_upper_camera_artifacts(tmp_path: Path):
     return manifest, tmp_path / "air_huarache_run_ultra_111449"
 
 
-def test_upper_camera_resume_rejects_mutated_provenance_label(tmp_path: Path) -> None:
+def _camera_bundle_content(artifact_dir: Path) -> dict[str, object]:
+    with np.load(artifact_dir / "cameras.npz") as artifact:
+        arrays = {
+            name: (
+                str(np.asarray(artifact[name]).dtype),
+                np.asarray(artifact[name]).shape,
+                hashlib.sha256(np.asarray(artifact[name]).tobytes()).hexdigest(),
+            )
+            for name in artifact.files
+        }
+    image_paths = json.loads((artifact_dir / "images.json").read_text())
+    return {
+        "arrays": arrays,
+        "metadata": json.loads((artifact_dir / "metadata.json").read_text()),
+        "image_paths": image_paths,
+        "images": {
+            Path(path).name: hashlib.sha256(
+                np.asarray(Image.open(path).convert("RGB")).tobytes()
+            ).hexdigest()
+            for path in image_paths
+        },
+        "files": sorted(
+            str(path.relative_to(artifact_dir))
+            for path in artifact_dir.rglob("*")
+            if path.is_file()
+        ),
+    }
+
+
+def test_upper_camera_resume_repairs_mutated_provenance_label(tmp_path: Path) -> None:
     manifest, artifact_dir = _write_real_upper_camera_artifacts(tmp_path)
+    canonical = _camera_bundle_content(artifact_dir)
     metadata_path = artifact_dir / "metadata.json"
     metadata = json.loads(metadata_path.read_text())
     metadata["camera_mode"] = "calibrated GT"
     metadata_path.write_text(json.dumps(metadata))
 
-    with pytest.raises(ValueError, match="invalid existing upper camera artifact"):
-        write_upper_camera_artifacts(
-            manifest,
-            tmp_path,
-            shoe_aliases=CAMERA_DATASET_BY_SHOE,
-        )
+    write_upper_camera_artifacts(
+        manifest,
+        tmp_path,
+        shoe_aliases=CAMERA_DATASET_BY_SHOE,
+    )
+
+    assert _camera_bundle_content(artifact_dir) == canonical
+    repaired = json.loads(metadata_path.read_text())
+    assert repaired["camera_mode"] == "fixed/precomputed DA3 cameras (not calibrated GT)"
 
 
 @pytest.mark.parametrize("mutation", ("camera_array", "staged_image", "group_mapping"))
-def test_upper_camera_resume_rejects_mutated_canonical_content(
+def test_upper_camera_resume_repairs_mutated_canonical_content(
     tmp_path: Path,
     mutation: str,
 ) -> None:
     manifest, artifact_dir = _write_real_upper_camera_artifacts(tmp_path)
+    canonical = _camera_bundle_content(artifact_dir)
     if mutation == "camera_array":
         camera_path = artifact_dir / "cameras.npz"
         with np.load(camera_path) as artifact:
@@ -254,9 +290,63 @@ def test_upper_camera_resume_rejects_mutated_canonical_content(
         metadata["views"][0]["camera_group"] = "bottom"
         metadata_path.write_text(json.dumps(metadata))
 
-    with pytest.raises(ValueError, match="invalid existing upper camera artifact"):
+    write_upper_camera_artifacts(
+        manifest,
+        tmp_path,
+        shoe_aliases=CAMERA_DATASET_BY_SHOE,
+    )
+
+    assert _camera_bundle_content(artifact_dir) == canonical
+
+
+def test_upper_camera_resume_replaces_partial_bundle_and_removes_junk(
+    tmp_path: Path,
+) -> None:
+    manifest, artifact_dir = _write_real_upper_camera_artifacts(tmp_path)
+    canonical = _camera_bundle_content(artifact_dir)
+    (artifact_dir / "metadata.json").unlink()
+    (artifact_dir / "junk.txt").write_text("partial write")
+
+    write_upper_camera_artifacts(
+        manifest,
+        tmp_path,
+        shoe_aliases=CAMERA_DATASET_BY_SHOE,
+    )
+
+    assert _camera_bundle_content(artifact_dir) == canonical
+
+
+def test_upper_camera_atomic_repair_preserves_old_bundle_when_staging_fails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    manifest, artifact_dir = _write_real_upper_camera_artifacts(tmp_path)
+    metadata_path = artifact_dir / "metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["camera_mode"] = "calibrated GT"
+    metadata_path.write_text(json.dumps(metadata))
+    calls = []
+
+    def fail_staging(destination: Path, **_: object) -> None:
+        calls.append(destination)
+        destination.mkdir(parents=True, exist_ok=True)
+        (destination / "partial").write_text("incomplete")
+        raise OSError("simulated interrupted staging")
+
+    monkeypatch.setattr(
+        bytesize_data,
+        "_write_selected_camera_set",
+        fail_staging,
+    )
+
+    with pytest.raises(OSError, match="interrupted staging"):
         write_upper_camera_artifacts(
             manifest,
             tmp_path,
             shoe_aliases=CAMERA_DATASET_BY_SHOE,
         )
+
+    assert len(calls) == 1
+    assert (artifact_dir / "cameras.npz").is_file()
+    assert json.loads(metadata_path.read_text())["camera_mode"] == "calibrated GT"
+    assert not list(tmp_path.glob(".air_huarache_run_ultra_111449.*"))
