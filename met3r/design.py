@@ -6,7 +6,7 @@ import itertools
 from collections.abc import Mapping, Sequence
 
 
-def _feature_variants(
+def feature_variants(
     config: Mapping[str, object],
 ) -> list[dict[str, object]]:
     tracks = config.get("feature_tracks")
@@ -83,7 +83,7 @@ def build_design_rows(
     corruption_seed = execution.get("corruption_seed", 42)
     if not isinstance(corruption_seed, int):
         raise ValueError("execution.corruption_seed must be an integer")
-    variants = _feature_variants(config)
+    variants = feature_variants(config)
     cells: list[dict[str, object]] = []
     for raw_shoe in shoes:
         if not isinstance(raw_shoe, Mapping):

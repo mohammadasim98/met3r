@@ -28,6 +28,49 @@ def test_translation_has_monotonic_pixel_displacement() -> None:
     assert source_x < mild_x < strong_x
 
 
+def test_translation_direction_moves_pixels_left_or_right() -> None:
+    source = _image()
+
+    left = apply_corruption(source, CorruptionSpec("translation", 0.20, -1))
+    right = apply_corruption(source, CorruptionSpec("translation", 0.20, 1))
+
+    source_x = np.argwhere(np.any(source < 250, axis=-1))[:, 1].mean()
+    left_x = np.argwhere(np.any(left < 250, axis=-1))[:, 1].mean()
+    right_x = np.argwhere(np.any(right < 250, axis=-1))[:, 1].mean()
+    assert left_x < source_x < right_x
+
+
+def test_exposure_uses_reciprocal_signed_factors() -> None:
+    source = np.full((2, 2, 3), 100, dtype=np.uint8)
+
+    darker = apply_corruption(source, CorruptionSpec("exposure", 0.5, -1))
+    brighter = apply_corruption(source, CorruptionSpec("exposure", 0.5, 1))
+
+    assert darker[0, 0, 0] == 70
+    assert brighter[0, 0, 0] == 141
+
+
+def test_identity_swap_uses_donor_foreground_and_mask() -> None:
+    source = _image()
+    source_mask = np.any(source < 250, axis=-1)
+    donor = np.full_like(source, [20, 220, 50])
+    donor_mask = np.zeros(source.shape[:2], dtype=bool)
+    donor_mask[3:12, 5:18] = True
+
+    changed, changed_mask = apply_corruption_with_mask(
+        source,
+        source_mask,
+        CorruptionSpec("identity_swap", 1.0),
+        donor=donor,
+        donor_foreground_mask=donor_mask,
+    )
+
+    assert changed_mask.dtype == bool
+    np.testing.assert_array_equal(changed_mask, donor_mask)
+    np.testing.assert_array_equal(changed[donor_mask], donor[donor_mask])
+    assert np.all(changed[~donor_mask] == 255)
+
+
 def test_thin_plate_warp_is_seeded_and_changes_geometry() -> None:
     source = _image()
     spec = CorruptionSpec("thin_plate_warp", 0.25)

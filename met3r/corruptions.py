@@ -17,6 +17,7 @@ SUPPORTED_CORRUPTIONS = {
     "blur",
     "jpeg",
     "part_transfer",
+    "identity_swap",
 }
 
 
@@ -24,12 +25,15 @@ SUPPORTED_CORRUPTIONS = {
 class CorruptionSpec:
     kind: str
     strength: float
+    direction: int = 1
 
     def __post_init__(self) -> None:
         if self.kind not in SUPPORTED_CORRUPTIONS:
             raise ValueError(f"unknown corruption {self.kind!r}")
         if not 0.0 <= self.strength <= 1.0:
             raise ValueError("corruption strength must be in [0, 1]")
+        if self.direction not in (-1, 1):
+            raise ValueError("corruption direction must be -1 or 1")
 
 
 def _as_rgb_uint8(image: np.ndarray) -> np.ndarray:
@@ -39,11 +43,11 @@ def _as_rgb_uint8(image: np.ndarray) -> np.ndarray:
     return np.clip(value[..., :3], 0, 255).astype(np.uint8)
 
 
-def _translate(image: np.ndarray, strength: float) -> np.ndarray:
+def _translate(image: np.ndarray, strength: float, direction: int = 1) -> np.ndarray:
     import cv2
 
     height, width = image.shape[:2]
-    offset_x = int(round(width * strength))
+    offset_x = direction * int(round(width * strength))
     transform = np.array([[1.0, 0.0, offset_x], [0.0, 1.0, 0.0]], dtype=np.float32)
     return cv2.warpAffine(
         image,
@@ -121,18 +125,29 @@ def apply_corruption(
     seed: int = 0,
     donor: np.ndarray | None = None,
     part_mask: np.ndarray | None = None,
+    donor_foreground_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     """Apply one controlled corruption while preserving size and uint8 RGB format."""
 
     source = _as_rgb_uint8(image)
+    if spec.kind == "identity_swap":
+        if spec.strength != 1.0:
+            raise ValueError("identity_swap requires strength 1.0")
+        if donor is None or donor_foreground_mask is None:
+            raise ValueError("identity_swap requires donor and donor_foreground_mask")
+        donor_rgb = _as_rgb_uint8(donor)
+        donor_mask = np.asarray(donor_foreground_mask, dtype=bool)
+        if donor_rgb.shape != source.shape or donor_mask.shape != source.shape[:2]:
+            raise ValueError("donor and donor_foreground_mask shapes must match source")
+        return np.where(donor_mask[..., None], donor_rgb, 255).astype(np.uint8)
     if spec.kind == "clean" or spec.strength == 0:
         return source.copy()
     if spec.kind == "translation":
-        return _translate(source, spec.strength)
+        return _translate(source, spec.strength, spec.direction)
     if spec.kind == "thin_plate_warp":
         return _thin_plate_warp(source, spec.strength, seed)
     if spec.kind == "exposure":
-        factor = 1.0 + spec.strength
+        factor = 2.0 ** (spec.direction * spec.strength)
         return np.clip(source.astype(np.float32) * factor, 0, 255).astype(np.uint8)
     if spec.kind == "blur":
         radius = 0.25 + 5.75 * spec.strength
@@ -173,6 +188,7 @@ def apply_corruption_with_mask(
     seed: int = 0,
     donor: np.ndarray | None = None,
     part_mask: np.ndarray | None = None,
+    donor_foreground_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Apply a corruption and move the foreground mask for spatial variants."""
 
@@ -188,10 +204,11 @@ def apply_corruption_with_mask(
         seed=seed,
         donor=donor,
         part_mask=part_mask,
+        donor_foreground_mask=donor_foreground_mask,
     )
     if spec.kind == "translation" and spec.strength > 0:
         height, width = mask.shape
-        offset_x = int(round(width * spec.strength))
+        offset_x = spec.direction * int(round(width * spec.strength))
         transform = np.array(
             [[1.0, 0.0, offset_x], [0.0, 1.0, 0.0]],
             dtype=np.float32,
@@ -212,6 +229,12 @@ def apply_corruption_with_mask(
             interpolation=cv2.INTER_NEAREST,
             border_value=0,
         ) > 0
+    elif spec.kind == "identity_swap":
+        if donor_foreground_mask is None:
+            raise ValueError("identity_swap requires donor_foreground_mask")
+        changed_mask = np.asarray(donor_foreground_mask, dtype=bool)
+        if changed_mask.shape != mask.shape:
+            raise ValueError("donor_foreground_mask must match the image spatial shape")
     else:
         changed_mask = mask.copy()
     return changed, changed_mask
