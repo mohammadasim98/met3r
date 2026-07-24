@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Mapping
 
 import numpy as np
 from PIL import Image
@@ -418,4 +419,67 @@ def write_camera_artifacts(
             provenance=correction.cross_group_provenance,
             analysis_tier="sensitivity_only",
             translation_is_proxy=True,
+        )
+
+
+def write_upper_camera_artifacts(
+    manifest: DatasetManifest,
+    output_dir: str | Path,
+    shoe_aliases: Mapping[str, str],
+) -> None:
+    """Write exactly one four-view upper camera artifact per deformation slug."""
+
+    destination = Path(output_dir).expanduser().resolve()
+    shoes_by_camera_id = {shoe.shoe_id: shoe for shoe in manifest.shoes}
+    if len(shoe_aliases) != len(set(shoe_aliases.values())):
+        raise ValueError("upper camera aliases must be one-to-one")
+    for deformation_slug, camera_dataset_id in shoe_aliases.items():
+        shoe = shoes_by_camera_id.get(camera_dataset_id)
+        if shoe is None:
+            raise ValueError(
+                f"camera dataset {camera_dataset_id!r} for {deformation_slug!r} "
+                "is absent from the ByteSize manifest"
+            )
+        upper_views = tuple(
+            view for view in shoe.views if view.camera_group == "upper"
+        )
+        if tuple(view.view_id for view in upper_views) != (
+            "left",
+            "back",
+            "right",
+            "front",
+        ):
+            raise ValueError(
+                f"camera dataset {camera_dataset_id!r} lacks the canonical upper views"
+            )
+        artifact_dir = destination / deformation_slug
+        camera_path = artifact_dir / "cameras.npz"
+        if camera_path.is_file():
+            with np.load(camera_path) as artifact:
+                valid = (
+                    artifact["intrinsics"].shape == (4, 3, 3)
+                    and artifact["extrinsics"].shape == (4, 4, 4)
+                    and artifact["mask"].shape
+                    == (4, *manifest.processed_image_size[::-1])
+                    and artifact["view_ids"].tolist()
+                    == ["left", "back", "right", "front"]
+                )
+            if valid and all(
+                (artifact_dir / "images" / f"{view.view_id}.png").is_file()
+                for view in upper_views
+            ) and (artifact_dir / "images.json").is_file() and (
+                artifact_dir / "metadata.json"
+            ).is_file():
+                continue
+            raise ValueError(f"invalid existing upper camera artifact: {artifact_dir}")
+        example = upper_views[0]
+        with np.load(example.raw_extrinsics_path) as artifact:
+            upper_extrinsics = _as_homogeneous(np.asarray(artifact["extrinsics"]))
+        _write_selected_camera_set(
+            artifact_dir,
+            views=upper_views,
+            extrinsics_by_group={"upper": upper_extrinsics},
+            provenance="fixed_precomputed_da3",
+            analysis_tier="primary",
+            translation_is_proxy=False,
         )

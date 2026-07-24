@@ -12,7 +12,9 @@ from met3r.bytesize_data import (
     recover_bottom_camera_alignment,
     validate_processed_image,
     write_camera_artifacts,
+    write_upper_camera_artifacts,
 )
+from met3r.upper_data import CAMERA_DATASET_BY_SHOE, UPPER_VIEWS
 
 def test_manifest_maps_zero_based_camera_to_one_based_source_and_mask(tmp_path: Path) -> None:
     shoe = "TEST SHOE"
@@ -181,3 +183,24 @@ def test_camera_artifacts_separate_primary_groups_from_cross_group_proxy(
     assert metadata["camera_mode"] == "fixed/precomputed DA3 cameras (not calibrated GT)"
     assert metadata["analysis_tier"] == "sensitivity_only"
     assert metadata["translation_is_proxy"] is True
+
+
+def test_upper_camera_artifacts_have_only_four_504_views(tmp_path: Path) -> None:
+    manifest = build_bytesize_manifest("/root/dev/ByteSize/Reconstruction")
+
+    write_upper_camera_artifacts(
+        manifest,
+        tmp_path,
+        shoe_aliases=CAMERA_DATASET_BY_SHOE,
+    )
+
+    shoe_id = "air_huarache_run_ultra_111449"
+    with np.load(tmp_path / shoe_id / "cameras.npz") as data:
+        assert data["intrinsics"].shape == (4, 3, 3)
+        assert data["extrinsics"].shape == (4, 4, 4)
+        assert data["mask"].shape == (4, 504, 504)
+        assert data["view_ids"].tolist() == list(UPPER_VIEWS)
+        assert data["camera_groups"].tolist() == ["upper"] * 4
+    assert len(list(tmp_path.glob("*/cameras.npz"))) == 4
+    assert not list(tmp_path.rglob("bottom"))
+    assert not list(tmp_path.rglob("sensitivity"))
