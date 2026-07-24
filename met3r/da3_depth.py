@@ -81,6 +81,7 @@ def run_fixed_camera_depth(
     analysis_tier: str | None = None,
     source_state: Mapping[str, object] | None = None,
     runtime_state: Mapping[str, object] | None = None,
+    store_processed_images: bool = True,
 ) -> DepthArtifact:
     """Infer depth with fixed cameras and verify the aligned-output camera contract."""
 
@@ -167,7 +168,6 @@ def run_fixed_camera_depth(
         depth=depth,
         confidence=np.asarray(prediction.conf),
         mask=metric_mask,
-        processed_images=np.asarray(prediction.processed_images),
         extrinsics=fixed_extrinsics,
         intrinsics=returned_intrinsics,
         meta__artifact_type=np.asarray("fixed_camera_depth"),
@@ -180,6 +180,8 @@ def run_fixed_camera_depth(
         meta__camera_provenance=np.asarray(camera_provenance),
         meta__image_set_id=np.asarray(content_id),
     )
+    if store_processed_images:
+        saved_arrays["processed_images"] = np.asarray(prediction.processed_images)
     if view_ids is not None:
         saved_arrays["meta__view_ids"] = np.asarray(view_ids)
     if camera_groups is not None:
@@ -207,6 +209,7 @@ def run_fixed_camera_depth(
         "view_ids": list(view_ids) if view_ids is not None else None,
         "camera_groups": list(camera_groups) if camera_groups is not None else None,
         "analysis_tier": analysis_tier,
+        "store_processed_images": store_processed_images,
     }
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     return DepthArtifact(arrays_path=arrays_path, metadata_path=metadata_path)

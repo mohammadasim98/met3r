@@ -105,6 +105,35 @@ def test_fixed_camera_depth_passes_poses_and_writes_provenance(tmp_path: Path) -
     assert metadata["mask_source"] == "provided_foreground_mask"
 
 
+def test_depth_artifact_can_omit_processed_images(tmp_path: Path) -> None:
+    model = _FakeDA3()
+    extrinsics, intrinsics = _cameras()
+    image_paths = []
+    for name in ("a.png", "b.png"):
+        path = tmp_path / name
+        path.write_bytes(name.encode())
+        image_paths.append(path)
+
+    artifact = run_fixed_camera_depth(
+        model,
+        image_paths,
+        extrinsics,
+        intrinsics,
+        tmp_path,
+        model_id="fake/da3",
+        camera_provenance="fixed_precomputed_da3",
+        store_processed_images=False,
+    )
+
+    with np.load(artifact.arrays_path) as arrays:
+        assert "processed_images" not in arrays.files
+        assert {"depth", "confidence", "mask", "extrinsics", "intrinsics"} <= set(
+            arrays.files
+        )
+    metadata = json.loads(artifact.metadata_path.read_text())
+    assert metadata["store_processed_images"] is False
+
+
 def test_fixed_camera_depth_rejects_pose_drift(tmp_path: Path) -> None:
     extrinsics, intrinsics = _cameras()
     image_paths = []
