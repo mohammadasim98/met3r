@@ -9,9 +9,13 @@ import pytest
 from met3r.upper_analysis import (
     FIGURE_FILENAMES,
     TABLE_FILENAMES,
+    _geometry_envelope,
+    _naf_ablation_from_raw,
+    _resolution_utility_from_raw,
     analyze_upper_run,
     prepare_primary_metric,
     robust_clean_normalize,
+    summarize_attribution,
     summarize_controlled_fidelity,
     summarize_stress,
 )
@@ -164,6 +168,115 @@ def test_abstention_and_small_samples_return_nan_instead_of_crashing() -> None:
     assert np.isnan(row["pairwise_rank_accuracy"])
 
 
+def test_bootstrap_requires_two_distinct_finite_shoes_per_endpoint() -> None:
+    frame = _controlled_rows().query(
+        "corruption == 'translation' and pair_id == 'left__back' "
+        "and changed_view == 'left'"
+    ).copy()
+    frame["abstained"] = frame["shoe_id"] != "a"
+
+    one_valid = summarize_controlled_fidelity(frame, bootstrap_repeats=100).iloc[0]
+
+    assert one_valid["severity_spearman_n_shoes_valid"] == 1
+    assert np.isnan(one_valid["severity_spearman_ci_low"])
+    assert np.isnan(one_valid["severity_spearman_ci_high"])
+
+    frame["abstained"] = ~frame["shoe_id"].isin(["a", "b"])
+    two_valid = summarize_controlled_fidelity(frame, bootstrap_repeats=100).iloc[0]
+    assert two_valid["severity_spearman_n_shoes_valid"] == 2
+    assert np.isfinite(two_valid["severity_spearman_ci_low"])
+    assert np.isfinite(two_valid["severity_spearman_ci_high"])
+
+
+def test_attribution_ratios_weighted_absolute_effects_not_rowwise_ratios() -> None:
+    frame = pd.DataFrame(
+        [
+            {
+                **VARIANT,
+                "shoe_id": shoe,
+                "pair_id": "left__back",
+                "changed_view": changed,
+                "corruption": "translation",
+                "s00": 0.0,
+                "s10": feature,
+                "s01": geometry,
+                "s11": feature + geometry,
+                "abstained": False,
+            }
+            for shoe in ("a", "b")
+            for changed, feature, geometry in (
+                ("left", 100.0, 0.0),
+                ("back", 0.0, 1.0),
+            )
+        ]
+    )
+
+    row = summarize_attribution(frame, bootstrap_repeats=50).iloc[0]
+
+    assert row["feature_effect_abs_mean"] == pytest.approx(50.0)
+    assert row["geometry_effect_abs_mean"] == pytest.approx(0.5)
+    assert row["absolute_effect_denominator"] == pytest.approx(50.5)
+    assert row["absolute_feature_share"] == pytest.approx(100 / 101)
+    assert row["absolute_feature_share_n_shoes_valid"] == 2
+
+
+def test_geometry_envelope_interpolates_and_counts_missing_or_abstained_curves() -> None:
+    observed = pd.DataFrame(
+        [
+            {
+                **VARIANT,
+                "shoe_id": "a",
+                "pair_id": "left__back",
+                "changed_view": "left",
+                "corruption": "translation",
+                "severity": 0.2,
+                "s00": 0.0,
+                "s10": 0.15,
+                "s01": 0.0,
+                "s11": 0.15,
+                "abstained": False,
+            }
+        ]
+    )
+    calibration = pd.DataFrame(
+        [
+            {
+                **VARIANT,
+                "shoe_id": "a",
+                "pair_id": "left__back",
+                "changed_view": "left",
+                "perturbation_kind": kind,
+                "magnitude": magnitude,
+                "geometry_effect": effect,
+                "abstained": abstained,
+            }
+            for kind, magnitude, effect, abstained in (
+                ("rotation", 0.1, 0.1, False),
+                ("rotation", 0.2, 0.2, False),
+                ("relative_translation", 0.1, 0.2, True),
+            )
+        ]
+    )
+
+    summary = _geometry_envelope(
+        observed,
+        calibration,
+        bootstrap_repeats=0,
+        seed=42,
+    )
+    rotation = summary[summary["perturbation_kind"] == "rotation"].iloc[0]
+    assert rotation["matched_magnitude_raw"] == pytest.approx(0.15)
+    assert rotation["matched_magnitude_effective"] == pytest.approx(0.15)
+    assert rotation["n_feature_cells_covered"] == 1
+    for kind in ("relative_translation", "depth_scale", "relative_depth_noise"):
+        row = summary[summary["perturbation_kind"] == kind].iloc[0]
+        assert row["n_feature_cells_total"] == 1
+        assert row["n_feature_cells_covered"] == 0
+        assert row["n_feature_cells_censored"] == 1
+        assert row["envelope_coverage"] == pytest.approx(0.0)
+        assert np.isnan(row["matched_magnitude_raw"])
+
+
 def test_stress_report_keeps_required_quality_and_fit_strata() -> None:
     outputs = summarize_stress(_stress_rows(), bootstrap_repeats=20)
     assert {
@@ -171,9 +284,55 @@ def test_stress_report_keeps_required_quality_and_fit_strata() -> None:
         "both_camera_preserved",
         "both_semantic_gate",
         "both_preservation_gate",
-        "fit_relation:improved",
-        "fit_relation:equivalent",
+        "mixed_fit_relation:improved|equivalent",
     } <= set(outputs["stratum"])
+    fit = outputs[outputs["stratum"].str.contains("fit_relation")]
+    assert set(fit["stratum"]) == {"mixed_fit_relation:improved|equivalent"}
+
+
+def test_resolution_and_all_naf_contrasts_include_validity_endpoints() -> None:
+    controlled = _controlled_rows().query(
+        "corruption in ['blur', 'translation']"
+    )
+    variants = [controlled]
+    for mode in (
+        "bilinear",
+        "naf_normal_guide",
+        "naf_blurred_guide",
+        "naf_shuffled_guide",
+    ):
+        variants.append(
+            controlled.assign(
+                feature_mode=mode,
+                resolution=74,
+                s10=controlled["s10"] + 0.01,
+            )
+        )
+    frame = pd.concat(variants, ignore_index=True)
+
+    resolution = _resolution_utility_from_raw(
+        frame, bootstrap_repeats=20, seed=42
+    )
+    naf = _naf_ablation_from_raw(frame, bootstrap_repeats=20, seed=42)
+
+    for endpoint in (
+        "coverage",
+        "abstention_rate",
+        "first_to_second_overlap",
+        "second_to_first_overlap",
+        "nuisance_signed_delta",
+    ):
+        resolution_column = f"{endpoint}_difference_from_native"
+        assert resolution_column in resolution
+        assert f"{resolution_column}_n_shoes_valid" in resolution
+        naf_column = f"{endpoint}_normal_minus_comparator"
+        assert naf_column in naf
+        assert f"{naf_column}_n_shoes_valid" in naf
+    assert set(naf["comparator"]) == {
+        "bilinear",
+        "naf_blurred_guide",
+        "naf_shuffled_guide",
+    }
 
 
 def test_analyze_upper_run_writes_complete_named_snapshot(tmp_path: Path) -> None:
@@ -218,6 +377,24 @@ def test_analyze_upper_run_writes_complete_named_snapshot(tmp_path: Path) -> Non
         "naf_shuffled_guide",
     }
     assert "clean_corrupt_auc_normal_minus_comparator_ci_low" in naf
+    expected_valid_counts = {
+        "controlled_fidelity.csv": "severity_spearman_n_shoes_valid",
+        "backbone_comparison.csv": "severity_spearman_n_shoes_valid",
+        "resolution_utility.csv": (
+            "coverage_difference_from_native_n_shoes_valid"
+        ),
+        "naf_guide_ablation.csv": (
+            "coverage_normal_minus_comparator_n_shoes_valid"
+        ),
+        "attribution.csv": "absolute_feature_share_n_shoes_valid",
+        "geometry_calibration.csv": (
+            "matched_magnitude_raw_n_shoes_valid"
+        ),
+        "real_deformation_stress.csv": "metric_delta_n_shoes_valid",
+        "leave_one_shoe_out.csv": "severity_spearman_n_shoes_valid",
+    }
+    for filename, column in expected_valid_counts.items():
+        assert column in pd.read_csv(tmp_path / "reports/tables" / filename)
     report = outputs.report_path.read_text(encoding="utf-8")
     assert report.startswith("# fixed/precomputed DA3 cameras (not calibrated GT)")
     assert "upper views only" in report

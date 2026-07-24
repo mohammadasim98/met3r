@@ -201,3 +201,118 @@ Ruff is not installed in the required Pixal3D environment:
   baselines and calibration curves.
 - Task 9 validates software and synthetic statistical contracts only. The real
   GPU-4 pilot and four-GPU experiment remain Tasks 10 and 11.
+
+---
+
+## Review remediation: endpoint validity and hierarchical calibration
+
+The first Task 9 review rejected commit `8770168` for five important
+statistical issues: endpoint bootstrap intervals could be formed from only
+one distinct finite shoe; the geometry envelope omitted missing kinds and
+snapped to tested magnitudes; absolute feature share averaged rowwise ratios;
+mixed fit relations duplicated stress rows; and resolution/NAF contrasts
+omitted validity endpoints.
+
+### Review RED evidence
+
+Five independent regression tests were added first:
+
+```text
+/opt/conda/envs/pixal3d/bin/python -m pytest \
+  tests/test_upper_analysis.py -q
+
+5 failed, 6 passed in 10.76s
+```
+
+Each failure mapped directly to one review finding:
+
+- missing `severity_spearman_n_shoes_valid`;
+- missing hierarchy-weighted `feature_effect_abs_mean`;
+- missing interpolated `matched_magnitude_raw`;
+- absent mutually exclusive mixed fit-relation label;
+- absent `coverage_difference_from_native`.
+
+### Incremental GREEN evidence
+
+```text
+finite-shoe bootstrap/count regression: 1 passed in 3.07s
+hierarchical absolute attribution ratio: 1 passed in 2.82s
+joint two-view fit stratum: 1 passed in 3.19s
+resolution/NAF validity contrasts: 1 passed in 4.03s
+geometry interpolation/censoring: 1 passed in 3.15s
+all Task 9 analysis regressions: 11 passed in 11.49s
+```
+
+### Statistical corrections
+
+- Every endpoint now reports `<endpoint>_n_shoes_valid`. Bootstrap bounds are
+  NaN unless at least two distinct shoes have finite values for that endpoint.
+  Point estimates and leave-one-shoe-out rows remain available with their
+  explicit valid-shoe counts.
+- Every observed feature cell contributes one geometry-envelope record for
+  each canonical kind: rotation, relative translation, depth scale, and
+  relative depth noise. Missing, wholly abstained, and out-of-range curves are
+  censored rather than removed from coverage.
+- Geometry crossings are linearly interpolated at the first crossing of the
+  monotone cumulative absolute-effect envelope. Neutral origins are explicit.
+  Depth scale reports both raw scale factor and effective absolute distance
+  from neutral 1; every kind records raw/effective units and total, covered,
+  and censored cell counts.
+- Absolute feature and geometry effects are separately averaged by changed
+  placement, pair, and shoe. The reported feature share is the ratio of those
+  equal-shoe weighted absolute effects. Its bootstrap repeats the ratio after
+  shoe-cluster resampling. Numerator, denominator, and valid-shoe counts are
+  explicit.
+- Fit-relation strata are mutually exclusive. Equal relations use
+  `both_fit_relation:<value>`; mixed pairs use one canonical first/second label
+  such as `mixed_fit_relation:improved|equivalent`.
+- Paired resolution and all three NAF comparator contrasts now include
+  coverage, abstention rate, both directional overlaps, signed and absolute
+  nuisance deltas, and discrimination endpoints, each with a paired
+  valid-shoe count and descriptive interval.
+
+### Review cumulative verification
+
+Focused Task 9 plus legacy analysis:
+
+```text
+/opt/conda/envs/pixal3d/bin/python -m pytest \
+  tests/test_analysis.py tests/test_upper_analysis.py tests/test_upper_cli.py -q
+
+24 passed in 18.46s
+```
+
+Relevant Task 7-9 integration:
+
+```text
+/opt/conda/envs/pixal3d/bin/python -m pytest \
+  tests/test_upper_metric_worker.py tests/test_pipeline_integration.py \
+  tests/test_pilot_gate.py tests/test_upper_cli.py \
+  tests/test_upper_analysis.py -q
+
+79 passed in 77.11s (0:01:17)
+```
+
+Fresh full suite:
+
+```text
+/opt/conda/envs/pixal3d/bin/python -m pytest -q
+
+237 passed in 170.69s (0:02:50)
+```
+
+Fresh static surface verification:
+
+```text
+bash -n scripts/run_upper_full.sh
+all seven `met3r.upper_cli COMMAND --help` invocations
+/opt/conda/envs/pixal3d/bin/python -m compileall -q met3r tests
+git diff --check
+
+exit 0
+```
+
+The remediation preserves the exact limitation label
+`fixed/precomputed DA3 cameras (not calibrated GT)`, upper-only/four-shoe
+scope, descriptive-interval wording, and separate controlled, calibration,
+and stress tracks.

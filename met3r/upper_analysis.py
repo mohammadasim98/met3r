@@ -39,6 +39,12 @@ CONTINUOUS_CORRUPTIONS = {
     "jpeg",
 }
 NUISANCE_CORRUPTIONS = {"exposure", "blur", "jpeg"}
+CALIBRATION_KINDS = (
+    "rotation",
+    "relative_translation",
+    "depth_scale",
+    "relative_depth_noise",
+)
 TABLE_FILENAMES = (
     "controlled_fidelity.csv",
     "backbone_comparison.csv",
@@ -61,6 +67,7 @@ FIGURE_FILENAMES = (
 )
 _METRIC_COLUMNS = (
     "coverage",
+    "abstention_rate",
     "severity_spearman",
     "clean_corrupt_auc",
     "pairwise_rank_accuracy",
@@ -295,6 +302,11 @@ def _series_endpoints(series: pd.DataFrame, corruption: str) -> dict[str, float]
         "coverage": (
             float(valid[observed].mean()) if bool(observed.any()) else float("nan")
         ),
+        "abstention_rate": (
+            float(1.0 - valid[observed].mean())
+            if bool(observed.any())
+            else float("nan")
+        ),
         "severity_spearman": (
             _safe_spearman(rows["severity"], rows["score"])
             if continuous
@@ -391,9 +403,15 @@ def _bootstrap_intervals(
     rng = np.random.default_rng(seed)
     samples: dict[str, list[float]] = {metric: [] for metric in metrics}
     matrix = shoe_values.loc[:, list(metrics)].to_numpy(float)
+    eligible = {
+        metric: int(np.isfinite(matrix[:, column]).sum()) >= 2
+        for column, metric in enumerate(metrics)
+    }
     for _ in range(repeats):
         sampled = matrix[rng.integers(0, len(matrix), size=len(matrix))]
         for column, metric in enumerate(metrics):
+            if not eligible[metric]:
+                continue
             value = _safe_mean(sampled[:, column])
             if np.isfinite(value):
                 samples[metric].append(value)
@@ -402,6 +420,12 @@ def _bootstrap_intervals(
         for metric, values in samples.items()
         if values
     }
+
+
+def _valid_shoe_count(shoe_values: pd.DataFrame, metric: str) -> int:
+    return int(
+        np.isfinite(pd.to_numeric(shoe_values[metric], errors="coerce")).sum()
+    )
 
 
 def summarize_controlled_fidelity(
@@ -426,6 +450,7 @@ def summarize_controlled_fidelity(
                 "n_pairs",
                 "n_directional_series",
                 *_METRIC_COLUMNS,
+                *(f"{metric}_n_shoes_valid" for metric in _METRIC_COLUMNS),
                 *(
                     f"{metric}_{bound}"
                     for metric in _METRIC_COLUMNS
@@ -452,6 +477,7 @@ def summarize_controlled_fidelity(
         }
         for metric in _METRIC_COLUMNS:
             record[metric] = _safe_mean(shoes[metric])
+            record[f"{metric}_n_shoes_valid"] = _valid_shoe_count(shoes, metric)
             if metric in intervals:
                 record[f"{metric}_ci_low"], record[f"{metric}_ci_high"] = intervals[
                     metric
@@ -514,6 +540,7 @@ def _summarize_means(
                 *group_columns,
                 "n_shoes",
                 *value_columns,
+                *(f"{value}_n_shoes_valid" for value in value_columns),
                 *(
                     f"{value}_{bound}"
                     for value in value_columns
@@ -535,6 +562,7 @@ def _summarize_means(
         }
         for value in value_columns:
             record[value] = _safe_mean(group[value])
+            record[f"{value}_n_shoes_valid"] = _valid_shoe_count(group, value)
             if value in intervals:
                 record[f"{value}_ci_low"], record[f"{value}_ci_high"] = intervals[
                     value
@@ -552,20 +580,29 @@ def summarize_attribution(
     bootstrap_repeats: int = 1000,
     seed: int = 42,
 ) -> pd.DataFrame:
+    value_columns = (
+        "feature_effect",
+        "geometry_effect",
+        "interaction",
+        "adaptive_total_effect",
+        "feature_effect_abs_mean",
+        "geometry_effect_abs_mean",
+        "absolute_effect_denominator",
+    )
     if frame.empty:
-        return _summarize_means(
-            pd.DataFrame(),
-            [*VARIANT_COLUMNS, "corruption"],
-            (
-                "feature_effect",
-                "geometry_effect",
-                "interaction",
-                "adaptive_total_effect",
+        return pd.DataFrame(
+            columns=[
+                *VARIANT_COLUMNS,
+                "corruption",
+                "n_shoes",
+                *value_columns,
                 "absolute_feature_share",
-            ),
-            placement=True,
-            bootstrap_repeats=bootstrap_repeats,
-            seed=seed,
+                *(
+                    f"{value}_{suffix}"
+                    for value in (*value_columns, "absolute_feature_share")
+                    for suffix in ("n_shoes_valid", "ci_low", "ci_high")
+                ),
+            ]
         )
     prepared = prepare_primary_metric(frame)
     valid = prepared[
@@ -577,27 +614,106 @@ def summarize_attribution(
     valid["geometry_effect"] = valid["geometry_delta"]
     valid["interaction"] = valid["interaction_delta"]
     valid["adaptive_total_effect"] = valid["adaptive_delta"]
-    denominator = valid["feature_effect"].abs() + valid["geometry_effect"].abs()
-    valid["absolute_feature_share"] = np.divide(
-        valid["feature_effect"].abs(),
-        denominator,
-        out=np.full(len(valid), np.nan),
-        where=np.asarray(denominator > 0),
-    )
-    return _summarize_means(
+    valid["feature_effect_abs_mean"] = valid["feature_effect"].abs()
+    valid["geometry_effect_abs_mean"] = valid["geometry_effect"].abs()
+    groups = [*VARIANT_COLUMNS, "corruption"]
+    shoes = _mean_hierarchy(
         valid,
-        [*VARIANT_COLUMNS, "corruption"],
-        (
-            "feature_effect",
-            "geometry_effect",
-            "interaction",
-            "adaptive_total_effect",
-            "absolute_feature_share",
-        ),
+        groups,
+        value_columns[:-1],
         placement=True,
-        bootstrap_repeats=bootstrap_repeats,
-        seed=seed,
     )
+    shoes["absolute_effect_denominator"] = (
+        shoes["feature_effect_abs_mean"] + shoes["geometry_effect_abs_mean"]
+    )
+    records: list[dict[str, object]] = []
+    for key, group in shoes.groupby(groups, dropna=False, sort=True):
+        intervals = _bootstrap_intervals(
+            group,
+            value_columns,
+            repeats=bootstrap_repeats,
+            seed=seed,
+        )
+        numerator = _safe_mean(group["feature_effect_abs_mean"])
+        geometry = _safe_mean(group["geometry_effect_abs_mean"])
+        denominator = numerator + geometry
+        share = (
+            float(numerator / denominator)
+            if np.isfinite(denominator) and denominator > 0
+            else float("nan")
+        )
+        share_interval = _bootstrap_ratio_interval(
+            group,
+            "feature_effect_abs_mean",
+            "geometry_effect_abs_mean",
+            repeats=bootstrap_repeats,
+            seed=seed,
+        )
+        record: dict[str, object] = {
+            **dict(zip(groups, key)),
+            "n_shoes": int(group["shoe_id"].nunique()),
+        }
+        for value in value_columns:
+            record[value] = (
+                denominator
+                if value == "absolute_effect_denominator"
+                else _safe_mean(group[value])
+            )
+            record[f"{value}_n_shoes_valid"] = _valid_shoe_count(group, value)
+            if value in intervals:
+                record[f"{value}_ci_low"], record[f"{value}_ci_high"] = intervals[
+                    value
+                ]
+            else:
+                record[f"{value}_ci_low"] = float("nan")
+                record[f"{value}_ci_high"] = float("nan")
+        share_valid = (
+            np.isfinite(group["feature_effect_abs_mean"])
+            & np.isfinite(group["geometry_effect_abs_mean"])
+            & (group["absolute_effect_denominator"] > 0)
+        )
+        record["absolute_feature_share"] = share
+        record["absolute_feature_share_n_shoes_valid"] = int(share_valid.sum())
+        record["absolute_feature_share_ci_low"] = share_interval[0]
+        record["absolute_feature_share_ci_high"] = share_interval[1]
+        records.append(record)
+    return pd.DataFrame(records)
+
+
+def _bootstrap_ratio_interval(
+    shoe_values: pd.DataFrame,
+    numerator: str,
+    other: str,
+    *,
+    repeats: int,
+    seed: int,
+) -> tuple[float, float]:
+    values = shoe_values[[numerator, other]].to_numpy(float)
+    valid = (
+        np.isfinite(values[:, 0])
+        & np.isfinite(values[:, 1])
+        & ((values[:, 0] + values[:, 1]) > 0)
+    )
+    if repeats <= 0 or int(valid.sum()) < 2:
+        return float("nan"), float("nan")
+    rng = np.random.default_rng(seed)
+    samples: list[float] = []
+    for _ in range(repeats):
+        sample = values[rng.integers(0, len(values), size=len(values))]
+        finite = (
+            np.isfinite(sample[:, 0])
+            & np.isfinite(sample[:, 1])
+            & ((sample[:, 0] + sample[:, 1]) > 0)
+        )
+        if not finite.any():
+            continue
+        feature = float(sample[finite, 0].mean())
+        geometry = float(sample[finite, 1].mean())
+        samples.append(feature / (feature + geometry))
+    if not samples:
+        return float("nan"), float("nan")
+    low, high = np.quantile(samples, (0.025, 0.975))
+    return float(low), float(high)
 
 
 def summarize_stress(
@@ -645,20 +761,28 @@ def summarize_stress(
                     & prepared[second].fillna(False).astype(bool),
                 )
             )
-    relations: set[str] = set()
-    for column in ("first_fit_relation", "second_fit_relation"):
-        if column in prepared:
-            relations.update(
-                str(value)
-                for value in prepared[column].dropna().unique()
-                if str(value)
+    if {"first_fit_relation", "second_fit_relation"} <= set(prepared):
+        fit_labels = pd.Series(index=prepared.index, dtype="string")
+        for index, row in prepared[
+            ["first_fit_relation", "second_fit_relation"]
+        ].iterrows():
+            first = (
+                "unknown"
+                if pd.isna(row["first_fit_relation"])
+                else str(row["first_fit_relation"])
             )
-    for relation in sorted(relations):
-        relation_mask = pd.Series(False, index=prepared.index)
-        for column in ("first_fit_relation", "second_fit_relation"):
-            if column in prepared:
-                relation_mask |= prepared[column].astype("string") == relation
-        masks.append((f"fit_relation:{relation}", relation_mask))
+            second = (
+                "unknown"
+                if pd.isna(row["second_fit_relation"])
+                else str(row["second_fit_relation"])
+            )
+            fit_labels.loc[index] = (
+                f"both_fit_relation:{first}"
+                if first == second
+                else f"mixed_fit_relation:{first}|{second}"
+            )
+        for label in sorted(str(value) for value in fit_labels.unique()):
+            masks.append((label, fit_labels == label))
     records: list[pd.DataFrame] = []
     for stratum, mask in masks:
         selected = prepared[mask].copy()
@@ -725,6 +849,7 @@ def _summarize_shoe_differences(
                 *group_columns,
                 "n_shoes",
                 *value_columns,
+                *(f"{value}_n_shoes_valid" for value in value_columns),
                 *(
                     f"{value}_{bound}"
                     for value in value_columns
@@ -749,6 +874,7 @@ def _summarize_shoe_differences(
         }
         for value in value_columns:
             record[value] = _safe_mean(group[value])
+            record[f"{value}_n_shoes_valid"] = _valid_shoe_count(group, value)
             if value in intervals:
                 record[f"{value}_ci_low"], record[f"{value}_ci_high"] = intervals[
                     value
@@ -775,7 +901,7 @@ def _resolution_utility_from_raw(
     seed: int,
 ) -> pd.DataFrame:
     shoes = _controlled_shoe_values(frame)
-    endpoints = [column for column in _METRIC_COLUMNS if column != "coverage"]
+    endpoints = list(_METRIC_COLUMNS)
     keys = ["backbone", "feature_track", "corruption", "shoe_id"]
     native = shoes[shoes["feature_mode"] == "native"][
         [*keys, "resolution", *endpoints]
@@ -819,12 +945,7 @@ def _naf_ablation_from_raw(
         "corruption",
         "shoe_id",
     ]
-    endpoints = [
-        "severity_spearman",
-        "clean_corrupt_auc",
-        "pairwise_rank_accuracy",
-        "nuisance_absolute_delta",
-    ]
+    endpoints = list(_METRIC_COLUMNS)
     normal = shoes[shoes["feature_mode"] == "naf_normal_guide"][
         [*keys, *endpoints]
     ]
@@ -881,27 +1002,20 @@ def _geometry_envelope(
         "magnitude",
         "geometry_effect",
     )
-    if calibration.empty:
-        return pd.DataFrame(
-            columns=[
-                *VARIANT_COLUMNS,
-                "corruption",
-                "perturbation_kind",
-                "matched_magnitude",
-                "envelope_coverage",
-            ]
-        )
-    _require(calibration, required, "geometry calibration frame")
     observed = prepare_primary_metric(controlled_raw)
     observed = observed[observed["corruption"] != "clean"].copy()
     if "abstained" in observed:
         observed = observed[~observed["abstained"].fillna(True).astype(bool)]
     observed["absolute_feature_effect"] = observed["metric_delta"].abs()
-    calibration_valid = calibration.copy()
-    if "abstained" in calibration_valid:
-        calibration_valid = calibration_valid[
-            ~calibration_valid["abstained"].fillna(True).astype(bool)
-        ]
+    if calibration.empty:
+        calibration_valid = pd.DataFrame(columns=required)
+    else:
+        _require(calibration, required, "geometry calibration frame")
+        calibration_valid = calibration.copy()
+        if "abstained" in calibration_valid:
+            calibration_valid = calibration_valid[
+                ~calibration_valid["abstained"].fillna(True).astype(bool)
+            ]
     records: list[dict[str, object]] = []
     match_columns = [
         *VARIANT_COLUMNS,
@@ -916,21 +1030,20 @@ def _geometry_envelope(
         sort=False,
     ):
         curves[key] = curve[
-                np.isfinite(pd.to_numeric(curve["magnitude"], errors="coerce"))
-                & np.isfinite(
-                    pd.to_numeric(curve["geometry_effect"], errors="coerce")
-                )
-            ].sort_values("magnitude")
-    kinds_by_match: dict[tuple[object, ...], list[object]] = {}
-    for key in curves:
-        kinds_by_match.setdefault(key[:-1], []).append(key[-1])
+            np.isfinite(pd.to_numeric(curve["magnitude"], errors="coerce"))
+            & np.isfinite(pd.to_numeric(curve["geometry_effect"], errors="coerce"))
+        ].sort_values("magnitude")
     for _, row in observed.iterrows():
         match = tuple(row[column] for column in match_columns)
-        for kind in kinds_by_match.get(match, ()):
-            curve = curves[(*match, kind)]
-            reached = curve[
-                curve["geometry_effect"].abs() >= row["absolute_feature_effect"]
-            ]
+        for kind in CALIBRATION_KINDS:
+            curve = curves.get((*match, kind), pd.DataFrame())
+            raw_magnitude, effective_magnitude = _interpolated_crossing(
+                curve,
+                kind,
+                float(row["absolute_feature_effect"]),
+            )
+            covered = np.isfinite(raw_magnitude)
+            raw_unit, effective_unit = _calibration_units(kind)
             records.append(
                 {
                     **{column: row[column] for column in VARIANT_COLUMNS},
@@ -939,12 +1052,12 @@ def _geometry_envelope(
                     "changed_view": row["changed_view"],
                     "corruption": row["corruption"],
                     "perturbation_kind": kind,
-                    "matched_magnitude": (
-                        float(reached.iloc[0]["magnitude"])
-                        if len(reached)
-                        else float("nan")
-                    ),
-                    "envelope_coverage": float(bool(len(reached))),
+                    "matched_magnitude": raw_magnitude,
+                    "matched_magnitude_raw": raw_magnitude,
+                    "matched_magnitude_effective": effective_magnitude,
+                    "raw_magnitude_unit": raw_unit,
+                    "effective_magnitude_unit": effective_unit,
+                    "envelope_coverage": float(covered),
                 }
             )
     if not records:
@@ -954,17 +1067,116 @@ def _geometry_envelope(
                 "corruption",
                 "perturbation_kind",
                 "matched_magnitude",
+                "matched_magnitude_raw",
+                "matched_magnitude_effective",
                 "envelope_coverage",
             ]
         )
-    return _summarize_means(
-        pd.DataFrame(records),
-        [*VARIANT_COLUMNS, "corruption", "perturbation_kind"],
-        ("matched_magnitude", "envelope_coverage"),
+    record_frame = pd.DataFrame(records)
+    group_columns = [*VARIANT_COLUMNS, "corruption", "perturbation_kind"]
+    summary = _summarize_means(
+        record_frame,
+        group_columns,
+        (
+            "matched_magnitude",
+            "matched_magnitude_raw",
+            "matched_magnitude_effective",
+            "envelope_coverage",
+        ),
         placement=True,
         bootstrap_repeats=bootstrap_repeats,
         seed=seed,
     )
+    counts = (
+        record_frame.groupby(group_columns, dropna=False, sort=True)
+        .agg(
+            n_feature_cells_total=("envelope_coverage", "size"),
+            n_feature_cells_covered=("envelope_coverage", "sum"),
+        )
+        .reset_index()
+    )
+    counts["n_feature_cells_covered"] = counts[
+        "n_feature_cells_covered"
+    ].astype(int)
+    counts["n_feature_cells_censored"] = (
+        counts["n_feature_cells_total"] - counts["n_feature_cells_covered"]
+    )
+    units = record_frame[
+        [
+            "perturbation_kind",
+            "raw_magnitude_unit",
+            "effective_magnitude_unit",
+        ]
+    ].drop_duplicates()
+    return summary.merge(counts, on=group_columns, validate="one_to_one").merge(
+        units,
+        on="perturbation_kind",
+        validate="many_to_one",
+    )
+
+
+def _calibration_units(kind: str) -> tuple[str, str]:
+    if kind == "rotation":
+        return "degrees", "degrees_from_neutral"
+    if kind == "relative_translation":
+        return "camera_radius_fraction", "absolute_fraction_from_neutral"
+    if kind == "depth_scale":
+        return "scale_factor", "absolute_fraction_from_1"
+    if kind == "relative_depth_noise":
+        return "relative_depth_std", "relative_depth_std_from_neutral"
+    raise ValueError(f"unknown calibration kind: {kind}")
+
+
+def _interpolated_crossing(
+    curve: pd.DataFrame,
+    kind: str,
+    target_effect: float,
+) -> tuple[float, float]:
+    if not np.isfinite(target_effect) or target_effect < 0:
+        return float("nan"), float("nan")
+    neutral_raw = 1.0 if kind == "depth_scale" else 0.0
+    raw = (
+        pd.to_numeric(curve["magnitude"], errors="coerce").to_numpy(float)
+        if not curve.empty
+        else np.asarray([], dtype=float)
+    )
+    effects = (
+        pd.to_numeric(curve["geometry_effect"], errors="coerce")
+        .abs()
+        .to_numpy(float)
+        if not curve.empty
+        else np.asarray([], dtype=float)
+    )
+    valid = np.isfinite(raw) & np.isfinite(effects)
+    raw = raw[valid]
+    effects = effects[valid]
+    effective = np.abs(raw - neutral_raw)
+    raw = np.concatenate(([neutral_raw], raw))
+    effective = np.concatenate(([0.0], effective))
+    effects = np.concatenate(([0.0], effects))
+    order = np.argsort(effective, kind="mergesort")
+    raw = raw[order]
+    effective = effective[order]
+    effects = effects[order]
+    envelope = np.maximum.accumulate(effects)
+    crossing = np.flatnonzero(envelope >= target_effect)
+    if not len(crossing):
+        return float("nan"), float("nan")
+    upper = int(crossing[0])
+    if upper == 0:
+        return float(raw[0]), float(effective[0])
+    lower = upper - 1
+    effect_span = envelope[upper] - envelope[lower]
+    fraction = (
+        1.0
+        if effect_span <= 0
+        else float((target_effect - envelope[lower]) / effect_span)
+    )
+    raw_match = raw[lower] + fraction * (raw[upper] - raw[lower])
+    effective_match = effective[lower] + fraction * (
+        effective[upper] - effective[lower]
+    )
+    return float(raw_match), float(effective_match)
 
 
 def _leave_one_shoe_out(
@@ -995,7 +1207,11 @@ def _leave_one_shoe_out(
                 ),
                 "geometry_calibration": _geometry_envelope(
                     controlled,
-                    calibration_raw[calibration_raw["shoe_id"] != omitted],
+                    (
+                        calibration_raw[calibration_raw["shoe_id"] != omitted]
+                        if "shoe_id" in calibration_raw
+                        else calibration_raw
+                    ),
                     bootstrap_repeats=0,
                     seed=42,
                 ),
@@ -1024,17 +1240,10 @@ def _leave_one_shoe_out(
 
 
 def _backbone_comparison(controlled: pd.DataFrame) -> pd.DataFrame:
-    columns = [
-        *VARIANT_COLUMNS,
-        "corruption",
-        "n_shoes",
-        "severity_spearman",
-        "clean_corrupt_auc",
-        "pairwise_rank_accuracy",
-        "nuisance_signed_delta",
-        "nuisance_absolute_delta",
-    ]
-    return controlled[[column for column in columns if column in controlled]].copy()
+    # These are rank/normalized endpoint comparisons, never raw cross-backbone
+    # score magnitudes. Keep each endpoint's validity count and interval beside
+    # the point estimate.
+    return controlled.copy()
 
 
 def _plot(
@@ -1152,13 +1361,18 @@ def _write_report(
                 "Adaptive-depth `s11` appears only as a secondary endpoint. "
                 "Feature, adaptive-depth geometry, interaction, and the "
                 "known pose/depth perturbation envelope are reported "
-                "separately.",
+                "separately. Geometry-envelope crossings are interpolated on "
+                "a monotone absolute-effect envelope; missing, abstained, or "
+                "out-of-range curves remain explicitly censored.",
+                "Absolute feature share is the ratio of separately "
+                "hierarchically weighted absolute feature and geometry "
+                "effects, not an average of rowwise ratios.",
                 "",
                 "## Real-deformation stress track",
                 "",
                 "The real deformations are a separate stress test with all, "
                 "camera-preservation, semantic-gate, preservation-gate, and "
-                "fit-relation strata.",
+                "mutually exclusive joint two-view fit-relation strata.",
                 f"This track produced {len(stress)} stratum rows.",
                 "",
                 "## Scope",
@@ -1166,6 +1380,9 @@ def _write_report(
                 "Results do not establish calibrated-camera ground truth, "
                 "bottom-view behavior, cross-object generalization beyond "
                 "four shoes, or inferential significance.",
+                "Every endpoint reports its own finite-shoe count. A "
+                "descriptive interval is emitted only with at least two "
+                "distinct finite shoes.",
                 "",
             ]
         ),

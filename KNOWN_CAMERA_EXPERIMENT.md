@@ -342,6 +342,17 @@ remain separate tracks. The generated report uses the limitation label
 **fixed/precomputed DA3 cameras (not calibrated GT)** and treats the
 upper-only, four-shoe bootstrap intervals as descriptive.
 
+Each endpoint reports its own finite-shoe count, and a bootstrap interval is
+shown only when at least two distinct shoes have finite values for that
+endpoint. Resolution and NAF contrasts pair shoes before differencing and keep
+coverage, abstention, both directional overlaps, and signed/absolute nuisance
+effects alongside discrimination endpoints. Absolute feature share is the
+ratio of separately hierarchy-weighted absolute feature and geometry effects,
+not an average of rowwise shares. Geometry-envelope crossings use linear
+interpolation on a monotone absolute-effect envelope; missing, abstained, and
+out-of-range calibration curves remain explicit censored cells. Stress-test
+fit relations use one mutually exclusive joint two-view stratum per row.
+
 ## Decision rule for the reliability module
 
 The experiments support a learnable view-reliability module only if:
