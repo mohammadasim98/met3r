@@ -70,6 +70,15 @@ with the deformation task:
 The data loader must verify that all 16 image/mask pairs exist, share the
 expected dimensions, and map to the correct shoe and view.
 
+The deformation assets are 1080x1080, while the selected fixed-camera
+intrinsics correspond to the existing 504x504 DA3 processed-image artifacts.
+Materialize every clean, deformed, and controlled-corruption image state at
+504x504 before DA3 inference: use Lanczos for RGB, nearest-neighbor for masks,
+and force non-foreground pixels to white. Feature backbones then resize these
+staged 504x504 images independently to their registered 592, 588, or 512 input
+size. Never pass the 1080x1080 deformation asset directly with the 504x504
+intrinsics.
+
 ### 3.2 Real-deformation stress inputs
 
 Use all 16 upper-view deformation results:
