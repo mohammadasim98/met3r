@@ -10,7 +10,7 @@ from met3r.job_registry import WorkerSummary
 from met3r.upper_cli import main
 
 
-def test_help_lists_exactly_six_commands(capsys: pytest.CaptureFixture[str]) -> None:
+def test_help_lists_exactly_seven_commands(capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit) as error:
         main(["--help"])
     assert error.value.code == 0
@@ -22,6 +22,7 @@ def test_help_lists_exactly_six_commands(capsys: pytest.CaptureFixture[str]) -> 
         "aggregate",
         "validate-pilot",
         "status",
+        "analyze",
     ):
         assert command in output
 
@@ -129,3 +130,48 @@ def test_pilot_launcher_is_upper_only_gpu4_and_exact_paths() -> None:
     assert "bottom" not in text.lower()
     assert "met3r.upper_cli validate-pilot" in text
     assert "\"$RUN_ROOT\" --rerun-sentinel" in text
+
+
+def test_analyze_cli_forwards_run_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[Path] = []
+    monkeypatch.setattr(
+        "met3r.upper_cli.analyze_upper_run",
+        lambda root: calls.append(Path(root))
+        or type(
+            "Outputs",
+            (),
+            {
+                "tables": (tmp_path / "table.csv",),
+                "figures": (tmp_path / "figure.png",),
+                "report_path": tmp_path / "report.md",
+            },
+        )(),
+    )
+    assert main(["analyze", str(tmp_path)]) == 0
+    assert calls == [tmp_path.resolve()]
+
+
+def test_full_launcher_maps_exact_shoes_and_backbones_to_gpus() -> None:
+    text = Path("scripts/run_upper_full.sh").read_text(encoding="utf-8")
+    assert "PYTHON=/opt/conda/envs/pixal3d/bin/python" in text
+    assert "gpus=(4 5 6 7)" in text
+    for shoe in (
+        "air_huarache_run_ultra_111449",
+        "air_max_90_nrg_dc6083_500",
+        "air_max_90_surplus_cq7743_300",
+        "air_tuned_max_cv6984_001",
+    ):
+        assert shoe in text
+    for backbone in (
+        "dino_vitb16",
+        "dinov2_vitb14",
+        "dinov3_vitb16",
+        "dinov3_vitl16_pixal3d",
+    ):
+        assert backbone in text
+    assert text.count('test "$status" -eq 0') == 2
+    assert "met3r.upper_cli aggregate" in text
+    assert "met3r.upper_cli analyze" in text

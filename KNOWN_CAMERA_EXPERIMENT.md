@@ -316,6 +316,32 @@ The output includes `fidelity_summary.csv`, `attribution_summary.csv`, and
 `score_vs_severity.png`. Use `met3r.visualization.save_direction_diagnostics`
 to save per-pair score/support/depth/cycle maps for qualitative failure review.
 
+## Upper-view full-run workflow
+
+The dedicated upper-view surface has seven commands: `prepare`,
+`geometry-worker`, `feature-worker`, `aggregate`, `validate-pilot`, `status`,
+and `analyze`. After the pilot gates pass, the exact four-GPU launcher runs
+geometry on one shoe per physical GPU 4–7, then features on one backbone per
+GPU, aggregates one immutable metric generation, and analyzes that snapshot:
+
+```bash
+bash scripts/run_upper_full.sh
+```
+
+The analysis command may also be rerun idempotently:
+
+```bash
+/opt/conda/envs/pixal3d/bin/python -m met3r.upper_cli analyze \
+  /root/dev/ByteSize/Reconstruction/met3r_upper_experiments/20260724_upper_v1/full
+```
+
+It uses `s10` and `s10 - s00` for primary fixed-geometry fidelity. `s11` is
+retained only as the adaptive-depth secondary analysis. Controlled
+corruptions, known geometry perturbations, and real-deformation stress results
+remain separate tracks. The generated report uses the limitation label
+**fixed/precomputed DA3 cameras (not calibrated GT)** and treats the
+upper-only, four-shoe bootstrap intervals as descriptive.
+
 ## Decision rule for the reliability module
 
 The experiments support a learnable view-reliability module only if:

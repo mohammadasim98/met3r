@@ -13,6 +13,7 @@ from .pilot_gate import (
     aggregate_all_metric_parts,
     validate_pilot,
 )
+from .upper_analysis import analyze_upper_run
 from .job_registry import JobRegistry
 from .upper_geometry import run_geometry_worker
 from .upper_metric_worker import run_feature_worker
@@ -63,6 +64,11 @@ def _parser() -> argparse.ArgumentParser:
     status = commands.add_parser("status", help="show registry state counts")
     status.add_argument("run_root", type=_resolved)
     status.add_argument("--require-complete", action="store_true")
+
+    analyze = commands.add_parser(
+        "analyze", help="generate scale-safe endpoint tables, figures, and report"
+    )
+    analyze.add_argument("run_root", type=_resolved)
     return parser
 
 
@@ -149,6 +155,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps({"complete": complete, "counts": counts}, sort_keys=True))
         if args.require_complete and not complete:
             raise SystemExit(1)
+        return 0
+    if args.command == "analyze":
+        outputs = analyze_upper_run(args.run_root)
+        print(
+            json.dumps(
+                {
+                    "tables": [str(path) for path in outputs.tables],
+                    "figures": [str(path) for path in outputs.figures],
+                    "report": str(outputs.report_path),
+                },
+                sort_keys=True,
+            )
+        )
         return 0
     raise AssertionError(f"unhandled command: {args.command}")
 
