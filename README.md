@@ -153,8 +153,8 @@ evaluation path for DINO/DINOv2/DINOv3 resolution studies, NAF guide ablations,
 geometry-versus-feature attribution, controlled corruptions, blinded human
 ratings, a config-expanded experiment design, and analysis plots. Backbone,
 NAF, and DA3 revisions plus ordered-image content identities are recorded in
-artifacts. The cameras are explicitly treated as precomputed DA3 estimates
-rather than calibrated GT.
+artifacts. The cameras are explicitly labeled **fixed/precomputed DA3 cameras
+(not calibrated GT)**.
 
 See [KNOWN_CAMERA_EXPERIMENT.md](KNOWN_CAMERA_EXPERIMENT.md) for the protocol,
 camera limitations, runnable CLI commands, and interpretation rules.

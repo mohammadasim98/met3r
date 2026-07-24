@@ -44,7 +44,7 @@ remaining geometry uncertainty.
 
 ## Camera scope and the GT limitation
 
-The saved cameras are **fixed/precomputed DA3 estimates, not calibrated GT**.
+The saved cameras are **fixed/precomputed DA3 cameras (not calibrated GT)**.
 The report and metadata use exactly that wording.
 
 The ByteSize upper and bottom image sets were reconstructed separately. The
@@ -258,8 +258,9 @@ set; strict scoring refuses clean/base or changed/adaptive combinations whose
 content identities do not match. They also store runtime package fingerprints;
 local DA3 runs additionally record the checkout commit and dirty state. The
 content hash of tracked and untracked changes disambiguates dirty checkouts at
-the same commit. The verification environment is captured in
-`configs/environment_pixal3d.json`.
+the same commit. Runtime artifacts record the environment provenance observed
+at execution time; any environment manifest is a runtime artifact rather than
+a committed experiment input.
 
 Score a pair across all feature keys:
 

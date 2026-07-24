@@ -13,6 +13,7 @@ import pandas as pd
 from PIL import Image
 
 from .analysis import plot_fidelity_summary, summarize_attribution, summarize_fidelity
+from .camera_metadata import CAMERA_MODE_LABEL
 from .bytesize_data import (
     build_bytesize_manifest,
     recover_bottom_camera_alignment,
@@ -181,7 +182,7 @@ def _camera_audit(reconstruction_root: str | Path) -> dict[str, object]:
             }
         )
     return {
-        "camera_mode": "fixed/precomputed (not calibrated GT)",
+        "camera_mode": CAMERA_MODE_LABEL,
         "camera_provenance": manifest.camera_provenance,
         "primary_inference_scope": "intra_group pairs",
         "cross_group_policy": (

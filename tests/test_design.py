@@ -1,6 +1,19 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 from met3r.design import build_design_rows
+
+
+def test_known_camera_config_and_protocol_use_the_exact_camera_label() -> None:
+    root = Path(__file__).resolve().parents[1]
+    config = json.loads((root / "configs" / "known_camera_bytesize.json").read_text())
+    protocol = (root / "KNOWN_CAMERA_EXPERIMENT.md").read_text()
+
+    label = "fixed/precomputed DA3 cameras (not calibrated GT)"
+    assert config["dataset"]["camera_mode"] == label
+    assert label in protocol
 
 
 def test_design_expands_feature_corruption_and_pair_axes() -> None:

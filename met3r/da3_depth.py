@@ -10,6 +10,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from .camera_metadata import CAMERA_MODE_LABEL
 from .identity import image_set_id
 from .provenance import provenance_fingerprint, runtime_environment
 
@@ -192,7 +193,7 @@ def run_fixed_camera_depth(
         "source_state": dict(source_state) if source_state is not None else None,
         "runtime_environment": environment,
         "runtime_fingerprint": runtime_fingerprint,
-        "camera_mode": "fixed/precomputed (not calibrated GT)",
+        "camera_mode": CAMERA_MODE_LABEL,
         "camera_provenance": camera_provenance,
         "process_res": process_res,
         "process_res_method": process_res_method,

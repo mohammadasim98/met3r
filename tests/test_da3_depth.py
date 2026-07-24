@@ -100,7 +100,7 @@ def test_fixed_camera_depth_passes_poses_and_writes_provenance(tmp_path: Path) -
     assert arrays["meta__runtime_fingerprint"].item()
     assert arrays["meta__source_revision"].item() == "source-revision"
     assert metadata["camera_provenance"] == "fixed_precomputed_da3"
-    assert metadata["camera_mode"] == "fixed/precomputed (not calibrated GT)"
+    assert metadata["camera_mode"] == "fixed/precomputed DA3 cameras (not calibrated GT)"
     assert metadata["pose_max_abs_error"] == pytest.approx(0.0)
     assert metadata["mask_source"] == "provided_foreground_mask"
 

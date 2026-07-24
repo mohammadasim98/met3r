@@ -1,13 +1,30 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
 import pytest
 from PIL import Image
 
+from met3r import cli
 from met3r.cli import _apply_mask_overrides, main
+
+
+def test_camera_audit_uses_the_exact_camera_mode_label(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "build_bytesize_manifest",
+        lambda _: SimpleNamespace(shoes=(), camera_provenance="fixed_precomputed_da3"),
+    )
+
+    summary = cli._camera_audit(tmp_path)
+
+    assert summary["camera_mode"] == "fixed/precomputed DA3 cameras (not calibrated GT)"
 
 
 def test_analyze_command_writes_machine_readable_summary_and_plot(tmp_path: Path) -> None:

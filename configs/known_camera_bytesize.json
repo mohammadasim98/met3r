@@ -7,7 +7,7 @@
   },
   "dataset": {
     "reconstruction_root": "/root/dev/ByteSize/Reconstruction",
-    "camera_mode": "fixed/precomputed (not calibrated GT)",
+    "camera_mode": "fixed/precomputed DA3 cameras (not calibrated GT)",
     "primary_pair_scope": "intra_group",
     "cross_group_pair_scope": "sensitivity_only"
   },

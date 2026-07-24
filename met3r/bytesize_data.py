@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+from .camera_metadata import CAMERA_MODE_LABEL
 
 VIEW_SPECS: tuple[tuple[str, str, int], ...] = (
     ("left", "upper", 42),
@@ -347,7 +348,7 @@ def _write_selected_camera_set(
     (destination / "metadata.json").write_text(
         json.dumps(
             {
-                "camera_mode": "fixed/precomputed (not calibrated GT)",
+                "camera_mode": CAMERA_MODE_LABEL,
                 "camera_provenance": provenance,
                 "analysis_tier": analysis_tier,
                 "translation_is_proxy": translation_is_proxy,

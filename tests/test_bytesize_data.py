@@ -178,5 +178,6 @@ def test_camera_artifacts_separate_primary_groups_from_cross_group_proxy(
     metadata = json.loads(
         (tmp_path / "artifacts" / "sensitivity" / shoe / "metadata.json").read_text()
     )
+    assert metadata["camera_mode"] == "fixed/precomputed DA3 cameras (not calibrated GT)"
     assert metadata["analysis_tier"] == "sensitivity_only"
     assert metadata["translation_is_proxy"] is True
