@@ -51,7 +51,7 @@ def flatten_factorial_result(
         _scalar(result.s11.first_to_second.overlap_fraction, batch_index),
         _scalar(result.s11.second_to_first.overlap_fraction, batch_index),
     )
-    return {
+    row: dict[str, float | bool] = {
         "s00": _scalar(result.s00.score, batch_index),
         "s10": _scalar(result.s10.score, batch_index),
         "s01": _scalar(result.s01.score, batch_index),
@@ -66,3 +66,14 @@ def flatten_factorial_result(
         "cycle_error_px_median": _finite_mean(cycle_values),
         "relative_depth_error_median": _finite_mean(depth_values),
     }
+    for cell_name in ("s00", "s10", "s01", "s11"):
+        cell = getattr(result, cell_name)
+        for direction_name in ("first_to_second", "second_to_first"):
+            direction = getattr(cell, direction_name)
+            prefix = f"{cell_name}_{direction_name}"
+            row[f"{prefix}_score"] = _scalar(direction.score, batch_index)
+            row[f"{prefix}_overlap"] = _scalar(
+                direction.overlap_fraction,
+                batch_index,
+            )
+    return row

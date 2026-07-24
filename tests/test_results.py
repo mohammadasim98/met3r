@@ -34,11 +34,19 @@ def test_flatten_factorial_result_contains_scores_effects_and_diagnostics() -> N
     row = flatten_factorial_result(result)
 
     assert set(("s00", "s10", "s01", "s11", "feature_effect", "geometry_effect")) <= row.keys()
+    assert {
+        f"{cell}_{direction}_{field}"
+        for cell in ("s00", "s10", "s01", "s11")
+        for direction in ("first_to_second", "second_to_first")
+        for field in ("score", "overlap")
+    } <= row.keys()
     assert row["s00"] == pytest.approx(0.0, abs=1e-6)
     assert row["feature_effect"] > 0
     assert row["geometry_effect"] == pytest.approx(0.0, abs=1e-6)
     assert row["abstained"] is False
     assert row["overlap"] == 1.0
+    assert row["s11_first_to_second_overlap"] == 1.0
+    assert row["s11_second_to_first_overlap"] == 1.0
     assert row["cycle_error_px_median"] == 0.0
 
 
