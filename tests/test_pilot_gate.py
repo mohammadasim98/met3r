@@ -5,6 +5,7 @@ import json
 import sqlite3
 from dataclasses import asdict, replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -18,7 +19,12 @@ from met3r.pilot_gate import (
     aggregate_metric_parts,
     validate_pilot,
 )
-from met3r.upper_design import FeatureVariant, feature_variants
+from met3r.upper_data import EXPECTED_SHOES, UPPER_VIEWS
+from met3r.upper_design import (
+    FeatureVariant,
+    build_upper_design,
+    feature_variants,
+)
 
 
 BACKBONE = "dinov3_vitl16_pixal3d"
@@ -40,75 +46,30 @@ def _pilot_variants(config: dict[str, object]) -> tuple[FeatureVariant, ...]:
     return tuple(item for item in feature_variants(config) if item.backbone == BACKBONE)
 
 
-def _states_and_conditions() -> tuple[list[dict[str, object]], pd.DataFrame]:
-    states: list[dict[str, object]] = []
-    conditions: list[dict[str, object]] = []
-    design_index = 1
-    selected = {
-        "translation": (0.12, 0.20),
-        "exposure": (0.50, 0.75),
-        "identity_swap": (1.00,),
-    }
-    for shoe in SHOES:
-        clean_id = f"controlled__{shoe}__clean"
-        states.append(
-            {
-                "state_id": clean_id,
-                "track": "controlled",
-                "shoe_id": shoe,
-                "changed_view": None,
-                "corruption": "clean",
-                "severity": 0.0,
-                "direction": 1,
-                "seed": 0,
-            }
+def _design_manifest() -> SimpleNamespace:
+    return SimpleNamespace(
+        shoes=tuple(
+            SimpleNamespace(
+                shoe_id=shoe_id,
+                views=tuple(
+                    SimpleNamespace(view_id=view_id)
+                    for view_id in UPPER_VIEWS
+                ),
+            )
+            for shoe_id in EXPECTED_SHOES
         )
-        state_specs = [(clean_id, None, "clean", 0.0)]
-        for corruption, severities in selected.items():
-            for severity in severities:
-                for view in ("left", "back", "right"):
-                    state_id = (
-                        f"controlled__{shoe}__{view}__{corruption}__"
-                        f"{severity:.6f}__+1"
-                    )
-                    states.append(
-                        {
-                            "state_id": state_id,
-                            "track": "controlled",
-                            "shoe_id": shoe,
-                            "changed_view": view,
-                            "corruption": corruption,
-                            "severity": severity,
-                            "direction": 1,
-                            "seed": 42,
-                        }
-                    )
-                    state_specs.append((state_id, view, corruption, severity))
-        for state_id, changed_view, corruption, severity in state_specs:
-            pairs = []
-            if changed_view in {None, "left", "back"}:
-                pairs.append(("left", "back"))
-            if changed_view in {None, "left", "right"}:
-                pairs.append(("left", "right"))
-            for first_view, second_view in pairs:
-                conditions.append(
-                    {
-                        "design_id": f"D{design_index:08d}",
-                        "track": "controlled",
-                        "shoe_id": shoe,
-                        "pair_id": f"{first_view}__{second_view}",
-                        "first_view": first_view,
-                        "second_view": second_view,
-                        "changed_view": changed_view,
-                        "image_state_id": state_id,
-                        "corruption": corruption,
-                        "severity": severity,
-                    }
-                )
-                design_index += 1
+    )
+
+
+def _states_and_conditions(
+    config: dict[str, object],
+) -> tuple[list[dict[str, object]], pd.DataFrame]:
+    design = build_upper_design(_design_manifest(), config, scope="pilot")
+    states = [asdict(state) for state in design.image_states]
+    conditions = pd.DataFrame(asdict(row) for row in design.pair_conditions)
     assert len(states) == 32
     assert len(conditions) == 44
-    return states, pd.DataFrame(conditions)
+    return states, conditions
 
 
 def _metric_rows(
@@ -224,6 +185,7 @@ def valid_pilot_run(tmp_path: Path) -> Path:
         f"pca/{BACKBONE}",
         "reports",
         "states",
+        "pca_fit_images",
         "geometry",
         "visualizations",
     ):
@@ -236,7 +198,7 @@ def valid_pilot_run(tmp_path: Path) -> Path:
         json.dumps({"scope": "pilot", "config_sha256": config_sha}),
         encoding="utf-8",
     )
-    states, conditions = _states_and_conditions()
+    states, conditions = _states_and_conditions(config)
     variants = _pilot_variants(config)
     assert len(variants) == 30
     (root / "manifests/image_states.jsonl").write_text(
@@ -246,6 +208,24 @@ def valid_pilot_run(tmp_path: Path) -> Path:
     conditions.to_parquet(root / "manifests/pair_conditions.parquet", index=False)
     (root / "manifests/feature_variants.json").write_text(
         json.dumps([asdict(item) for item in variants]),
+        encoding="utf-8",
+    )
+    (root / "manifests/upper_manifest.json").write_text(
+        json.dumps(
+            {
+                "reconstruction_root": config["reconstruction_root"],
+                "shoes": [
+                    {
+                        "shoe_id": shoe_id,
+                        "views": [
+                            {"view_id": view_id}
+                            for view_id in UPPER_VIEWS
+                        ],
+                    }
+                    for shoe_id in EXPECTED_SHOES
+                ],
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -259,8 +239,19 @@ def valid_pilot_run(tmp_path: Path) -> Path:
     )
     basis = replace(incomplete, fingerprint=pca_fingerprint(incomplete))
     basis.save(basis_path)
-    fit_image = root / "states/input.png"
-    fit_image.write_bytes(b"input")
+    fit_images: list[dict[str, str]] = []
+    for shoe_id in EXPECTED_SHOES:
+        shoe_dir = root / "pca_fit_images" / shoe_id
+        shoe_dir.mkdir()
+        for view_id in UPPER_VIEWS:
+            fit_image = shoe_dir / f"{view_id}.png"
+            fit_image.write_bytes(f"{shoe_id}/{view_id}".encode())
+            fit_images.append(
+                {
+                    "path": str(fit_image.resolve()),
+                    "sha256": sha256_file(fit_image),
+                }
+            )
     (root / f"pca/{BACKBONE}/basis.json").write_text(
         json.dumps(
             {
@@ -268,13 +259,12 @@ def valid_pilot_run(tmp_path: Path) -> Path:
                 "backbone": BACKBONE,
                 "backbone_revision": REVISION,
                 "config_sha256": config_sha,
+                "seed": 42,
                 "fingerprint": basis.fingerprint,
-                "fit_images": [
-                    {
-                        "path": str(fit_image.resolve()),
-                        "sha256": sha256_file(fit_image),
-                    }
-                ],
+                "fit_image_count": 16,
+                "fit_sample_count": 32,
+                "input_sizes": [512, 592],
+                "fit_images": fit_images,
             }
         ),
         encoding="utf-8",
@@ -399,6 +389,127 @@ def test_gate_rejects_missing_or_tampered_design_manifest(
     report = validate_pilot(valid_pilot_run)
     assert not report.passed
     assert "design_manifests" in report.failed_checks
+
+
+@pytest.mark.parametrize(
+    ("field", "mutate"),
+    (
+        ("direction", lambda state: -int(state["direction"])),
+        ("seed", lambda state: int(state["seed"]) + 1),
+        ("donor_shoe_id", lambda state: SHOES[0]),
+        ("donor_view", lambda state: "bottom"),
+    ),
+)
+def test_gate_rejects_noncanonical_task3_state_provenance(
+    valid_pilot_run: Path,
+    field: str,
+    mutate: object,
+) -> None:
+    path = valid_pilot_run / "manifests/image_states.jsonl"
+    states = [json.loads(line) for line in path.read_text().splitlines()]
+    index = next(
+        index
+        for index, state in enumerate(states)
+        if (
+            state["corruption"] == "identity_swap"
+            if field.startswith("donor_")
+            else state["corruption"] != "clean"
+        )
+    )
+    states[index][field] = mutate(states[index])
+    path.write_text(
+        "".join(json.dumps(state) + "\n" for state in states),
+        encoding="utf-8",
+    )
+    assert "design_manifests" in validate_pilot(valid_pilot_run).failed_checks
+
+
+def _replace_design_id(root: Path, old: str, new: str) -> None:
+    conditions_path = root / "manifests/pair_conditions.parquet"
+    conditions = pd.read_parquet(conditions_path)
+    conditions.loc[conditions["design_id"] == old, "design_id"] = new
+    conditions.to_parquet(conditions_path, index=False)
+    for part in (root / "metrics/parts").rglob("*.parquet"):
+        frame = pd.read_parquet(part)
+        if bool((frame["design_id"] == old).any()):
+            frame.loc[frame["design_id"] == old, "design_id"] = new
+            frame.to_parquet(part, index=False)
+            _refresh_job_manifest(root, str(frame["job_id"].iloc[0]), part)
+    sentinel_path = root / "reports/sentinel_rerun.json"
+    sentinel = json.loads(sentinel_path.read_text())
+    sentinel_part = _part_for_job(
+        root, sentinel["job_id"], "user_37_grid_track"
+    )
+    sentinel["original_part_sha256"] = sha256_file(sentinel_part)
+    sentinel["rerun_part_sha256"] = sha256_file(sentinel_part)
+    sentinel_path.write_text(json.dumps(sentinel), encoding="utf-8")
+
+
+def test_gate_rejects_noncanonical_numeric_design_id_assignment(
+    valid_pilot_run: Path,
+) -> None:
+    _replace_design_id(valid_pilot_run, "D00000001", "D00000999")
+    assert "design_manifests" in validate_pilot(valid_pilot_run).failed_checks
+
+
+def test_gate_rejects_reordered_task3_states_and_conditions(
+    valid_pilot_run: Path,
+) -> None:
+    states_path = valid_pilot_run / "manifests/image_states.jsonl"
+    states = states_path.read_text().splitlines()
+    states_path.write_text("\n".join(reversed(states)) + "\n")
+    conditions_path = valid_pilot_run / "manifests/pair_conditions.parquet"
+    conditions = pd.read_parquet(conditions_path)
+    conditions.iloc[::-1].reset_index(drop=True).to_parquet(
+        conditions_path, index=False
+    )
+    assert "design_manifests" in validate_pilot(valid_pilot_run).failed_checks
+
+
+def test_gate_rejects_noncanonical_state_id_even_when_ownership_is_rewritten(
+    valid_pilot_run: Path,
+) -> None:
+    states_path = valid_pilot_run / "manifests/image_states.jsonl"
+    states = [json.loads(line) for line in states_path.read_text().splitlines()]
+    state = next(item for item in states if item["corruption"] != "clean")
+    old = state["state_id"]
+    new = f"{old}__invented"
+    state["state_id"] = new
+    states_path.write_text(
+        "".join(json.dumps(item) + "\n" for item in states),
+        encoding="utf-8",
+    )
+    conditions_path = valid_pilot_run / "manifests/pair_conditions.parquet"
+    conditions = pd.read_parquet(conditions_path)
+    conditions.loc[conditions["image_state_id"] == old, "image_state_id"] = new
+    conditions.to_parquet(conditions_path, index=False)
+    registry_path = valid_pilot_run / "registry/jobs.sqlite"
+    with sqlite3.connect(registry_path) as connection:
+        rows = connection.execute(
+            "SELECT job_id, payload_json FROM jobs"
+        ).fetchall()
+        for job_id, payload_json in rows:
+            payload = json.loads(payload_json)
+            if payload.get("state_id") != old:
+                continue
+            payload["state_id"] = new
+            encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            connection.execute(
+                """
+                UPDATE jobs SET payload_json = ?, payload_hash = ?
+                WHERE job_id = ?
+                """,
+                (encoded, hashlib.sha256(encoded.encode()).hexdigest(), job_id),
+            )
+    for part in (valid_pilot_run / "metrics/parts").rglob("*.parquet"):
+        frame = pd.read_parquet(part)
+        if bool((frame["image_state_id"] == old).any()):
+            frame.loc[frame["image_state_id"] == old, "image_state_id"] = new
+            frame.to_parquet(part, index=False)
+            _refresh_job_manifest(
+                valid_pilot_run, str(frame["job_id"].iloc[0]), part
+            )
+    assert "design_manifests" in validate_pilot(valid_pilot_run).failed_checks
 
 
 def test_gate_rejects_arbitrary_design_and_variant_keys(
@@ -539,6 +650,74 @@ def test_storage_projection_splits_basis_and_per_job_pca(
 
 
 @pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("artifact_type", "not-a-basis"),
+        ("seed", 7),
+        ("input_sizes", [592]),
+        ("fit_image_count", 1),
+        ("fit_sample_count", 0),
+    ),
+)
+def test_gate_rejects_wrong_task7_pca_manifest_contract(
+    valid_pilot_run: Path,
+    field: str,
+    value: object,
+) -> None:
+    path = valid_pilot_run / f"pca/{BACKBONE}/basis.json"
+    manifest = json.loads(path.read_text())
+    manifest[field] = value
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    assert "pca_fingerprint" in validate_pilot(valid_pilot_run).failed_checks
+
+
+@pytest.mark.parametrize("mode", ("empty", "arbitrary"))
+def test_gate_rejects_noncanonical_task7_pca_fit_images(
+    valid_pilot_run: Path,
+    mode: str,
+) -> None:
+    path = valid_pilot_run / f"pca/{BACKBONE}/basis.json"
+    manifest = json.loads(path.read_text())
+    if mode == "empty":
+        manifest["fit_images"] = []
+    else:
+        arbitrary = valid_pilot_run / "states/arbitrary.png"
+        arbitrary.write_bytes(b"arbitrary")
+        manifest["fit_images"] = [
+            {
+                "path": str(arbitrary.resolve()),
+                "sha256": sha256_file(arbitrary),
+            }
+        ]
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    assert "pca_fingerprint" in validate_pilot(valid_pilot_run).failed_checks
+
+
+def test_gate_rejects_metric_part_in_wrong_feature_track_directory(
+    valid_pilot_run: Path,
+) -> None:
+    sentinel = json.loads(
+        (valid_pilot_run / "reports/sentinel_rerun.json").read_text()
+    )["job_id"]
+    source = next(
+        path
+        for path in (
+            valid_pilot_run / "metrics/parts/user_37_grid_track"
+        ).glob("*.parquet")
+        if path.stem != sentinel
+    )
+    destination = (
+        valid_pilot_run
+        / "metrics/parts/current_pixal3d_code_track"
+        / source.name
+    )
+    destination.parent.mkdir(exist_ok=True)
+    source.rename(destination)
+    _refresh_job_manifest(valid_pilot_run, source.stem, destination)
+    assert "design_ownership" in validate_pilot(valid_pilot_run).failed_checks
+
+
+@pytest.mark.parametrize(
     ("track", "expected_columns"),
     (
         ("stress", {"design_id", "variant_key"}),
@@ -660,7 +839,9 @@ def test_aggregate_all_later_track_failure_preserves_entire_prior_generation(
         aggregate_all_metric_parts(valid_pilot_run)
 
     assert {path: path.read_bytes() for path in outputs} == before
-    assert not (valid_pilot_run / "metrics/.aggregate-transaction").exists()
+    assert not list(
+        (valid_pilot_run / "metrics/aggregate_generations").glob(".staging-*")
+    )
 
 
 def test_aggregate_all_recovers_interrupted_install_without_mixed_generation(
@@ -683,24 +864,29 @@ def test_aggregate_all_recovers_interrupted_install_without_mixed_generation(
     class SimulatedCrash(BaseException):
         pass
 
-    original = pilot_gate._rename_aggregate_path
-    calls = 0
-
-    def crash(source: Path, destination: Path) -> None:
-        nonlocal calls
-        calls += 1
-        if calls == 3:
-            raise SimulatedCrash()
-        original(source, destination)
-
-    monkeypatch.setattr(pilot_gate, "_rename_aggregate_path", crash)
+    old_generation = pilot_gate.resolve_aggregate_generation(valid_pilot_run)
+    old_bytes = {
+        path.name: path.read_bytes() for path in old_generation.iterdir()
+    }
+    original = pilot_gate._publish_aggregate_pointer
+    monkeypatch.setattr(
+        pilot_gate,
+        "_publish_aggregate_pointer",
+        lambda *args: (_ for _ in ()).throw(SimulatedCrash()),
+    )
     with pytest.raises(SimulatedCrash):
         aggregate_all_metric_parts(valid_pilot_run)
-    assert (valid_pilot_run / "metrics/.aggregate-transaction").is_dir()
+    assert pilot_gate.resolve_aggregate_generation(valid_pilot_run) == old_generation
+    assert {
+        path.name: path.read_bytes() for path in old_generation.iterdir()
+    } == old_bytes
 
-    monkeypatch.setattr(pilot_gate, "_rename_aggregate_path", original)
+    monkeypatch.setattr(pilot_gate, "_publish_aggregate_pointer", original)
     aggregate_all_metric_parts(valid_pilot_run)
-    assert not (valid_pilot_run / "metrics/.aggregate-transaction").exists()
+    assert pilot_gate.resolve_aggregate_generation(valid_pilot_run) != old_generation
+    assert not list(
+        (valid_pilot_run / "metrics/aggregate_generations").glob(".staging-*")
+    )
     aggregate = pd.read_parquet(
         valid_pilot_run / "metrics/controlled_fidelity.parquet"
     )
@@ -708,6 +894,86 @@ def test_aggregate_all_recovers_interrupted_install_without_mixed_generation(
         (aggregate["job_id"] == frame.loc[0, "job_id"])
         & (aggregate["design_id"] == frame.loc[0, "design_id"])
         & (aggregate["variant_key"] == frame.loc[0, "variant_key"]),
+        "score",
+    ]
+    assert changed.tolist() == [frame.loc[0, "score"]]
+
+
+def test_reader_resolves_one_atomic_aggregate_generation_at_pointer_switch(
+    valid_pilot_run: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    aggregate_all_metric_parts(valid_pilot_run)
+    old_generation = pilot_gate.resolve_aggregate_generation(valid_pilot_run)
+    old_snapshot = {
+        path.name: path.read_bytes() for path in old_generation.iterdir()
+    }
+    controlled_part = sorted(
+        (valid_pilot_run / "metrics/parts").rglob("*.parquet")
+    )[0]
+    frame = pd.read_parquet(controlled_part)
+    frame.loc[0, "score"] += 0.25
+    frame.to_parquet(controlled_part, index=False)
+    _refresh_job_manifest(
+        valid_pilot_run,
+        str(frame.loc[0, "job_id"]),
+        controlled_part,
+    )
+
+    observed: list[Path] = []
+    original = pilot_gate._publish_aggregate_pointer
+
+    def observe(metrics_root: Path, generation: Path) -> None:
+        observed.append(pilot_gate.resolve_aggregate_generation(valid_pilot_run))
+        original(metrics_root, generation)
+        observed.append(pilot_gate.resolve_aggregate_generation(valid_pilot_run))
+
+    monkeypatch.setattr(pilot_gate, "_publish_aggregate_pointer", observe)
+    aggregate_all_metric_parts(valid_pilot_run)
+
+    assert observed[0] == old_generation
+    assert observed[1] != old_generation
+    assert {
+        path.name: path.read_bytes() for path in observed[0].iterdir()
+    } == old_snapshot
+    assert set(path.name for path in observed[1].iterdir()) == set(old_snapshot)
+    assert all(
+        (valid_pilot_run / "metrics" / name).is_symlink()
+        for name in old_snapshot
+    )
+
+
+def test_single_track_aggregation_preserves_published_generation_aliases(
+    valid_pilot_run: Path,
+) -> None:
+    aggregate_all_metric_parts(valid_pilot_run)
+    old_generation = pilot_gate.resolve_aggregate_generation(valid_pilot_run)
+    controlled_part = sorted(
+        (valid_pilot_run / "metrics/parts").rglob("*.parquet")
+    )[0]
+    frame = pd.read_parquet(controlled_part)
+    frame.loc[0, "score"] += 0.275
+    frame.to_parquet(controlled_part, index=False)
+    _refresh_job_manifest(
+        valid_pilot_run,
+        str(frame.loc[0, "job_id"]),
+        controlled_part,
+    )
+
+    output = aggregate_metric_parts(valid_pilot_run, "controlled")
+
+    assert output == valid_pilot_run / "metrics/controlled_fidelity.parquet"
+    assert pilot_gate.resolve_aggregate_generation(valid_pilot_run) != old_generation
+    assert all(
+        (valid_pilot_run / "metrics" / name).is_symlink()
+        for name in pilot_gate._aggregate_output_names()
+    )
+    changed = pd.read_parquet(output).loc[
+        lambda rows: (
+            (rows["job_id"] == frame.loc[0, "job_id"])
+            & (rows["design_id"] == frame.loc[0, "design_id"])
+            & (rows["variant_key"] == frame.loc[0, "variant_key"])
+        ),
         "score",
     ]
     assert changed.tolist() == [frame.loc[0, "score"]]
@@ -746,4 +1012,6 @@ def test_aggregate_all_preview_failure_preserves_entire_prior_generation(
         aggregate_all_metric_parts(valid_pilot_run)
 
     assert {path: path.read_bytes() for path in outputs} == before
-    assert not (valid_pilot_run / "metrics/.aggregate-transaction").exists()
+    assert not list(
+        (valid_pilot_run / "metrics/aggregate_generations").glob(".staging-*")
+    )

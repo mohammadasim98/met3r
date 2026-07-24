@@ -10,8 +10,10 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable, Mapping, Sequence
 
 import numpy as np
@@ -25,8 +27,8 @@ from .da3_depth import DEFAULT_DA3_MODEL_ID, DEFAULT_DA3_REVISION
 from .features import BACKBONE_SPECS, NAF_REVISION
 from .job_registry import JobRegistry, sha256_file
 from .pca_features import PCABasis
-from .upper_data import UPPER_VIEWS
-from .upper_design import FeatureVariant, feature_variants
+from .upper_data import EXPECTED_SHOES, UPPER_VIEWS
+from .upper_design import FeatureVariant, build_upper_design
 
 
 EXPECTED_PILOT_METRIC_ROWS = 1_320
@@ -159,6 +161,45 @@ def _load_pilot_design(
     root: Path,
     config: Mapping[str, object],
 ) -> _PilotDesign:
+    upper_manifest = _json_object(root / "manifests" / "upper_manifest.json")
+    if upper_manifest.get("reconstruction_root") != config.get(
+        "reconstruction_root"
+    ):
+        raise ValueError("prepared upper manifest reconstruction root differs")
+    raw_shoes = upper_manifest.get("shoes")
+    if not isinstance(raw_shoes, list):
+        raise ValueError("prepared upper manifest requires shoes")
+    shoes: list[SimpleNamespace] = []
+    for expected_shoe, raw_shoe in zip(EXPECTED_SHOES, raw_shoes, strict=False):
+        if (
+            not isinstance(raw_shoe, Mapping)
+            or raw_shoe.get("shoe_id") != expected_shoe
+            or not isinstance(raw_shoe.get("views"), list)
+        ):
+            raise ValueError("prepared upper manifest shoe order differs")
+        view_ids = tuple(
+            raw.get("view_id") if isinstance(raw, Mapping) else None
+            for raw in raw_shoe["views"]
+        )
+        if view_ids != UPPER_VIEWS:
+            raise ValueError("prepared upper manifest view order differs")
+        shoes.append(
+            SimpleNamespace(
+                shoe_id=expected_shoe,
+                views=tuple(
+                    SimpleNamespace(view_id=view_id)
+                    for view_id in UPPER_VIEWS
+                ),
+            )
+        )
+    if len(raw_shoes) != len(EXPECTED_SHOES) or len(shoes) != len(EXPECTED_SHOES):
+        raise ValueError("prepared upper manifest must contain exactly four shoes")
+    canonical = build_upper_design(
+        SimpleNamespace(shoes=tuple(shoes)),
+        config,
+        scope="pilot",
+    )
+
     raw_variants = json.loads(
         (root / "manifests" / "feature_variants.json").read_text(
             encoding="utf-8"
@@ -177,17 +218,7 @@ def _load_pilot_design(
         for item in raw_variants
         if isinstance(item, Mapping)
     )
-    pilot = config.get("pilot")
-    if not isinstance(pilot, Mapping):
-        raise ValueError("frozen config requires a pilot object")
-    selected_backbones = pilot.get("backbones")
-    if not isinstance(selected_backbones, list):
-        raise ValueError("pilot backbones must be a list")
-    expected_variants = tuple(
-        item
-        for item in feature_variants(config)
-        if item.backbone in set(str(value) for value in selected_backbones)
-    )
+    expected_variants = canonical.feature_variants
     if variants != expected_variants or len(variants) != 30:
         raise ValueError("feature variant manifest differs from the frozen pilot")
     variants_by_key = {item.key: item for item in variants}
@@ -195,64 +226,19 @@ def _load_pilot_design(
         raise ValueError("feature variant keys must be unique")
 
     state_path = root / "manifests" / "image_states.jsonl"
-    states: dict[str, Mapping[str, object]] = {}
+    raw_states: list[Mapping[str, object]] = []
     for line in state_path.read_text(encoding="utf-8").splitlines():
         raw = json.loads(line)
         if not isinstance(raw, Mapping) or not isinstance(raw.get("state_id"), str):
             raise ValueError("image state manifest row is malformed")
-        state_id = str(raw["state_id"])
-        if state_id in states:
-            raise ValueError("image state IDs must be unique")
-        states[state_id] = raw
-    if len(states) != EXPECTED_PILOT_GEOMETRY_JOBS:
-        raise ValueError("pilot image state manifest must contain exactly 32 states")
-    pilot_shoes = tuple(str(value) for value in pilot.get("shoes", ()))
-    pilot_pairs = tuple(str(value) for value in pilot.get("pairs", ()))
-    pilot_corruptions = pilot.get("corruptions")
-    if (
-        pilot_shoes != EXPECTED_PILOT_SHOES
-        or pilot_pairs != EXPECTED_PILOT_PAIRS
-        or not isinstance(pilot_corruptions, Mapping)
-    ):
-        raise ValueError("frozen pilot selections differ from the approved design")
-    active_views = {
-        view for pair in pilot_pairs for view in pair.split("__")
+        raw_states.append(raw)
+    expected_states = [asdict(state) for state in canonical.image_states]
+    if raw_states != expected_states:
+        raise ValueError("image state manifest differs from Task 3 enumeration")
+    states = {
+        str(state["state_id"]): state
+        for state in raw_states
     }
-    expected_state_coordinates = {
-        (shoe, None, "clean", 0.0)
-        for shoe in pilot_shoes
-    }
-    for shoe in pilot_shoes:
-        for corruption, severities in pilot_corruptions.items():
-            if not isinstance(corruption, str) or not isinstance(severities, list):
-                raise ValueError("pilot corruption selection is malformed")
-            for severity in severities:
-                for view in active_views:
-                    expected_state_coordinates.add(
-                        (shoe, view, corruption, float(severity))
-                    )
-    actual_state_coordinates: set[tuple[str, object, str, float]] = set()
-    for state in states.values():
-        if (
-            state.get("track") != "controlled"
-            or state.get("shoe_id") not in pilot_shoes
-            or _normalized_optional(state.get("changed_view")) not in {
-                None,
-                *active_views,
-            }
-        ):
-            raise ValueError("image state falls outside the controlled pilot")
-        coordinate = (
-            str(state["shoe_id"]),
-            _normalized_optional(state.get("changed_view")),
-            str(state.get("corruption")),
-            float(state.get("severity")),
-        )
-        if coordinate in actual_state_coordinates:
-            raise ValueError("pilot image-state coordinates must be unique")
-        actual_state_coordinates.add(coordinate)
-    if actual_state_coordinates != expected_state_coordinates:
-        raise ValueError("image state manifest differs from the frozen pilot design")
 
     frame = pd.read_parquet(root / "manifests" / "pair_conditions.parquet")
     required = {
@@ -267,61 +253,22 @@ def _load_pilot_design(
         "corruption",
         "severity",
     }
-    if not required <= set(frame) or len(frame) != 44:
+    if set(frame) != required or len(frame) != 44:
         raise ValueError("pilot pair-condition manifest is malformed")
-    conditions: dict[str, Mapping[str, object]] = {}
-    actual_cells: set[tuple[str, str]] = set()
-    for raw in frame.to_dict("records"):
-        design_id = raw.get("design_id")
-        state_id = raw.get("image_state_id")
-        if (
-            not isinstance(design_id, str)
-            or not design_id.startswith("D")
-            or not design_id[1:].isdigit()
-            or design_id in conditions
-            or not isinstance(state_id, str)
-            or state_id not in states
-        ):
-            raise ValueError("pilot condition identity is malformed")
-        state = states[state_id]
-        pair_id = raw.get("pair_id")
-        first = raw.get("first_view")
-        second = raw.get("second_view")
-        changed = _normalized_optional(raw.get("changed_view"))
-        expected_changed = _normalized_optional(state.get("changed_view"))
-        if (
-            pair_id not in pilot_pairs
-            or pair_id != f"{first}__{second}"
-            or first not in UPPER_VIEWS
-            or second not in UPPER_VIEWS
-            or (
-                expected_changed is not None
-                and expected_changed not in {first, second}
-            )
-            or changed != expected_changed
-            or raw.get("track") != state.get("track")
-            or raw.get("shoe_id") != state.get("shoe_id")
-            or raw.get("corruption") != state.get("corruption")
-            or float(raw.get("severity")) != float(state.get("severity"))
-        ):
-            raise ValueError("pair condition differs from its image state")
-        cell = (state_id, str(pair_id))
-        if cell in actual_cells:
-            raise ValueError("pair-condition state/pair cells must be unique")
-        actual_cells.add(cell)
-        conditions[design_id] = {
-            **raw,
-            "changed_view": changed,
+    actual_conditions = [
+        {
+            key: _normalized_optional(value)
+            for key, value in raw.items()
         }
-    expected_cells = {
-        (state_id, pair)
-        for state_id, state in states.items()
-        for pair in pilot_pairs
-        if state.get("changed_view") is None
-        or state.get("changed_view") in pair.split("__")
+        for raw in frame.to_dict("records")
+    ]
+    expected_conditions = [asdict(row) for row in canonical.pair_conditions]
+    if actual_conditions != expected_conditions:
+        raise ValueError("pair conditions differ from Task 3 enumeration")
+    conditions = {
+        str(row["design_id"]): row
+        for row in actual_conditions
     }
-    if actual_cells != expected_cells:
-        raise ValueError("pair-condition manifest differs from the frozen pilot")
     expected_keys = frozenset(
         (design_id, variant.key)
         for design_id in conditions
@@ -568,9 +515,17 @@ def _read_controlled_parts_with_ownership(
             if path.suffix == ".parquet"
             and path.is_relative_to((root / "metrics" / "parts").resolve())
         ]
+        feature_track = registry_row.payload.get("feature_track")
+        expected_part = (
+            root
+            / "metrics"
+            / "parts"
+            / str(feature_track)
+            / f"{registry_row.job_id}.parquet"
+        ).resolve()
         if (
             len(parts) != 1
-            or parts[0].name != f"{registry_row.job_id}.parquet"
+            or parts[0] != expected_part
         ):
             ownership_valid = False
             continue
@@ -673,13 +628,15 @@ def aggregate_metric_parts(run_root: str | Path, track: str) -> Path:
     """Validate registered parts and atomically aggregate one analysis track."""
 
     root = Path(run_root).expanduser().resolve()
+    if track not in _TRACK_FILENAMES:
+        raise ValueError(f"unknown metric track: {track}")
+    current = root / "metrics" / "current"
+    if current.exists() or current.is_symlink():
+        aggregate_all_metric_parts(root)
+        return root / "metrics" / _TRACK_FILENAMES[track]
     frame = _aggregate_frame(root, track)
     destination = root / "metrics" / _TRACK_FILENAMES[track]
     return _atomic_parquet(frame, destination)
-
-
-def _rename_aggregate_path(source: Path, destination: Path) -> None:
-    source.rename(destination)
 
 
 def _write_aggregate_preview(frame: pd.DataFrame, destination: Path) -> None:
@@ -688,40 +645,81 @@ def _write_aggregate_preview(frame: pd.DataFrame, destination: Path) -> None:
         os.fsync(handle.fileno())
 
 
-def _recover_aggregate_transaction(metrics_root: Path) -> None:
-    transaction = metrics_root / ".aggregate-transaction"
-    if not transaction.exists():
-        return
-    journal_path = transaction / "journal.json"
-    if not journal_path.is_file():
-        shutil.rmtree(transaction)
-        return
-    journal = _json_object(journal_path)
-    phase = journal.get("phase")
-    targets = journal.get("targets")
-    if phase == "committed":
-        shutil.rmtree(transaction)
-        return
-    if phase != "installing" or not isinstance(targets, list):
-        raise ValueError("aggregate transaction journal is malformed")
-    for raw in reversed(targets):
-        if (
-            not isinstance(raw, Mapping)
-            or not isinstance(raw.get("name"), str)
-            or not isinstance(raw.get("had_original"), bool)
+def _aggregate_output_names() -> tuple[str, ...]:
+    return (*_TRACK_FILENAMES.values(), "summary_preview.csv")
+
+
+def resolve_aggregate_generation(run_root: str | Path) -> Path:
+    """Resolve the aggregate pointer once for a consistent multi-file snapshot."""
+
+    root = Path(run_root).expanduser().resolve()
+    generations = (root / "metrics" / "aggregate_generations").resolve()
+    current = root / "metrics" / "current"
+    generation = current.resolve(strict=True)
+    try:
+        generation.relative_to(generations)
+    except ValueError as error:
+        raise ValueError("aggregate current pointer escapes generation root") from error
+    if not generation.is_dir() or any(
+        not (generation / name).is_file()
+        for name in _aggregate_output_names()
+    ):
+        raise ValueError("aggregate generation is incomplete")
+    return generation
+
+
+def _publish_aggregate_pointer(metrics_root: Path, generation: Path) -> None:
+    temporary = metrics_root / f".current.{uuid.uuid4().hex}"
+    relative_target = Path("aggregate_generations") / generation.name
+    temporary.symlink_to(relative_target, target_is_directory=True)
+    try:
+        os.replace(temporary, metrics_root / "current")
+    finally:
+        if temporary.exists() or temporary.is_symlink():
+            temporary.unlink()
+    directory_fd = os.open(metrics_root, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    marker = generation / ".unpublished"
+    if marker.exists():
+        marker.unlink()
+
+
+def _ensure_aggregate_aliases(metrics_root: Path) -> None:
+    for name in _aggregate_output_names():
+        alias = metrics_root / name
+        temporary = metrics_root / f".{name}.alias.{uuid.uuid4().hex}"
+        temporary.symlink_to(Path("current") / name)
+        try:
+            os.replace(temporary, alias)
+        finally:
+            if temporary.exists() or temporary.is_symlink():
+                temporary.unlink()
+
+
+def _cleanup_unpublished_generations(metrics_root: Path) -> None:
+    generations = metrics_root / "aggregate_generations"
+    generations.mkdir(parents=True, exist_ok=True)
+    current: Path | None = None
+    try:
+        current = resolve_aggregate_generation(metrics_root.parent)
+    except (OSError, ValueError):
+        pass
+    for path in generations.iterdir():
+        if path.name.startswith(".staging-"):
+            shutil.rmtree(path)
+        elif (
+            path.is_dir()
+            and (path / ".unpublished").exists()
+            and path.resolve() != current
         ):
-            raise ValueError("aggregate transaction target is malformed")
-        name = str(raw["name"])
-        destination = metrics_root / name
-        backup = transaction / "backups" / name
-        if raw["had_original"]:
-            if backup.exists():
-                if destination.exists():
-                    destination.unlink()
-                _rename_aggregate_path(backup, destination)
-        elif destination.exists():
-            destination.unlink()
-    shutil.rmtree(transaction)
+            shutil.rmtree(path)
+    if current is not None:
+        marker = current / ".unpublished"
+        if marker.exists():
+            marker.unlink()
 
 
 def aggregate_all_metric_parts(run_root: str | Path) -> tuple[Path, ...]:
@@ -730,7 +728,7 @@ def aggregate_all_metric_parts(run_root: str | Path) -> tuple[Path, ...]:
     root = Path(run_root).expanduser().resolve()
     metrics_root = root / "metrics"
     metrics_root.mkdir(parents=True, exist_ok=True)
-    _recover_aggregate_transaction(metrics_root)
+    _cleanup_unpublished_generations(metrics_root)
     frames = {
         track: _aggregate_frame(root, track)
         for track in _TRACK_FILENAMES
@@ -744,19 +742,10 @@ def aggregate_all_metric_parts(run_root: str | Path) -> tuple[Path, ...]:
         if previews
         else pd.DataFrame(columns=["analysis_track"])
     )
-    transaction = metrics_root / ".aggregate-transaction"
-    transaction.mkdir()
-    staging = transaction / "staging"
-    backups = transaction / "backups"
-    staging.mkdir()
-    backups.mkdir()
-    destinations = {
-        **{
-            _TRACK_FILENAMES[track]: metrics_root / _TRACK_FILENAMES[track]
-            for track in _TRACK_FILENAMES
-        },
-        "summary_preview.csv": metrics_root / "summary_preview.csv",
-    }
+    generations = metrics_root / "aggregate_generations"
+    staging = Path(
+        tempfile.mkdtemp(prefix=".staging-", dir=generations)
+    )
     try:
         for track, frame in frames.items():
             _write_validated_parquet(
@@ -764,26 +753,22 @@ def aggregate_all_metric_parts(run_root: str | Path) -> tuple[Path, ...]:
                 staging / _TRACK_FILENAMES[track],
             )
         _write_aggregate_preview(preview, staging / "summary_preview.csv")
-        targets = [
-            {"name": name, "had_original": destination.exists()}
-            for name, destination in destinations.items()
-        ]
-        _atomic_json(
-            {"phase": "installing", "targets": targets},
-            transaction / "journal.json",
-        )
-        for name, destination in destinations.items():
-            if destination.exists():
-                _rename_aggregate_path(destination, backups / name)
-            _rename_aggregate_path(staging / name, destination)
-        _atomic_json(
-            {"phase": "committed", "targets": targets},
-            transaction / "journal.json",
-        )
+        (staging / ".unpublished").write_text("unpublished\n", encoding="utf-8")
+        digest = hashlib.sha256()
+        for name in _aggregate_output_names():
+            digest.update(name.encode("utf-8"))
+            digest.update(bytes.fromhex(sha256_file(staging / name)))
+        generation = generations / digest.hexdigest()
+        if generation.exists():
+            shutil.rmtree(staging)
+        else:
+            staging.rename(generation)
+        _publish_aggregate_pointer(metrics_root, generation)
+        _ensure_aggregate_aliases(metrics_root)
     except Exception:
-        _recover_aggregate_transaction(metrics_root)
+        if staging.exists():
+            shutil.rmtree(staging)
         raise
-    shutil.rmtree(transaction)
     return tuple(
         metrics_root / _TRACK_FILENAMES[track]
         for track in _TRACK_FILENAMES
@@ -1042,6 +1027,24 @@ def _validate_pca(
     backbones = pilot.get("backbones")
     if not isinstance(backbones, list) or len(backbones) != 1:
         return False
+    fit_root = root / "pca_fit_images"
+    if not fit_root.is_dir():
+        return False
+    shoe_dirs = tuple(
+        path.name for path in sorted(path for path in fit_root.iterdir() if path.is_dir())
+    )
+    if shoe_dirs != EXPECTED_SHOES:
+        return False
+    fit_paths: list[Path] = []
+    for shoe_id in EXPECTED_SHOES:
+        shoe_dir = fit_root / shoe_id
+        files = tuple(sorted(path.name for path in shoe_dir.iterdir() if path.is_file()))
+        if files != tuple(sorted(f"{view_id}.png" for view_id in UPPER_VIEWS)):
+            return False
+        fit_paths.extend(shoe_dir / f"{view_id}.png" for view_id in UPPER_VIEWS)
+    if len(fit_paths) != 16 or not all(path.is_file() for path in fit_paths):
+        return False
+
     manifests = sorted((root / "pca").glob("*/basis.json"))
     if len(manifests) != len(backbones):
         return False
@@ -1050,24 +1053,36 @@ def _validate_pca(
         manifest = _json_object(path)
         backbone = str(manifest.get("backbone"))
         model = models.get(backbone)
-        fit_images = manifest.get("fit_images")
         if (
             backbone not in backbones
             or not isinstance(model, Mapping)
             or manifest.get("backbone_revision") != model.get("revision")
             or manifest.get("config_sha256") != config_sha256
-            or not isinstance(fit_images, list)
         ):
             return False
-        for item in fit_images:
-            if not isinstance(item, Mapping) or not isinstance(item.get("path"), str):
-                return False
-            image = _path_within(str(item["path"]), root, "PCA fit image")
-            if not image.is_file() or sha256_file(image) != item.get("sha256"):
-                return False
         basis = PCABasis.load(path.with_name("basis.npz"))
         fingerprint = str(manifest.get("fingerprint"))
         if basis.fingerprint != fingerprint:
+            return False
+        expected = {
+            "artifact_type": "fixed_pca_basis",
+            "backbone": backbone,
+            "backbone_revision": model.get("revision"),
+            "config_sha256": config_sha256,
+            "seed": 42,
+            "fit_image_count": 16,
+            "fit_sample_count": 32,
+            "input_sizes": [512, 592],
+            "fit_images": [
+                {
+                    "path": str(image.resolve()),
+                    "sha256": sha256_file(image),
+                }
+                for image in fit_paths
+            ],
+            "fingerprint": fingerprint,
+        }
+        if dict(manifest) != expected:
             return False
         fingerprints.setdefault(backbone, set()).add(fingerprint)
     return all(len(values) == 1 for values in fingerprints.values())

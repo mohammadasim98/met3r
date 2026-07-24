@@ -372,3 +372,144 @@ Fresh full suite:
 The remediation remains limited to Task 8 production, tests, and this report.
 No Task 9 analysis, full launcher, raw DINO feature persistence, bottom view,
 or protected environment-config change was introduced.
+
+---
+
+## Second review remediation: canonical provenance and atomic visibility
+
+The second Task 8 review rejected commit `a61286e` because the gate still
+accepted noncanonical-but-self-consistent Task 3 identifiers and an
+insufficiently pinned Task 7 basis manifest. It also found that the prior
+multi-file transaction could expose mixed root files to readers during
+installation.
+
+### Second review RED evidence
+
+The Task 3, Task 7, and exact part-path mutation suite initially produced:
+
+```text
+15 failed, 1 passed in 21.12s
+```
+
+The failures independently changed a state direction, seed, donor shoe,
+bottom donor view, state ID, numeric design-ID assignment, state/condition
+order, PCA artifact type, PCA seed, input-size order, fit-image count, sample
+count, fit-image membership, and controlled part directory. Each mutation had
+previously remained internally consistent enough to pass.
+
+The immutable-generation tests were specified before implementation:
+
+```text
+2 failed in 3.48s
+AttributeError: module 'met3r.pilot_gate' has no attribute
+'resolve_aggregate_generation'
+```
+
+They model a reader resolving the aggregate during publication and a process
+death before the pointer switch. A final single-track regression exposed one
+remaining alias escape:
+
+```text
+FAILED test_single_track_aggregation_preserves_published_generation_aliases
+assert resolve_aggregate_generation(run_root) != old_generation
+1 failed in 3.24s
+```
+
+### Canonical Task 3 provenance
+
+- Reconstructs the exact prepared four-shoe/four-view input expected by Task 3
+  from `manifests/upper_manifest.json`.
+- Calls Task 3's existing `build_upper_design(..., scope="pilot")` with the
+  frozen config.
+- Requires `feature_variants.json` to equal the canonical ordered
+  `FeatureVariant` objects.
+- Requires the ordered JSONL state objects to equal the canonical
+  `ImageState` objects field-for-field, including IDs, direction, seed,
+  donor shoe/view, corruption, severity, and provenance fields.
+- Requires the pair-condition Parquet to have exactly the Task 3 columns and
+  its ordered records to equal the canonical `PairCondition` objects. Numeric
+  design IDs cannot be reassigned or reordered even when registry rows,
+  metric rows, and sentinel metadata are rewritten consistently.
+
+### Exact Task 7 PCA provenance
+
+- Requires exactly the 16 canonical upper-view fit paths under the four
+  expected shoe directories, with no missing or additional files.
+- Recomputes every fit-image SHA-256 and requires the basis manifest to equal
+  Task 7's complete schema: artifact type, backbone/revision, frozen config
+  hash, seed 42, fit count 16, sample count 32, sorted combined Pixal input
+  sizes `[512, 592]`, ordered path/hash records, and basis fingerprint.
+- Continues to load the basis NPZ and compare its computed fingerprint with
+  the manifest.
+
+### Generation-atomic aggregate publication
+
+- Writes and validates all three Parquets plus the preview in a private
+  staging directory.
+- Renames the completed staging directory to an immutable, content-addressed
+  generation under `metrics/aggregate_generations/`.
+- Publishes the entire set with one atomic replacement of the
+  `metrics/current` symlink. Canonical multi-file readers call
+  `resolve_aggregate_generation()` once and read all four files from that
+  resolved directory.
+- Maintains the documented root filenames as symlink aliases through
+  `metrics/current`.
+- Cleans unpublished crash debris while retaining published immutable
+  generations so readers that resolved an old generation remain valid.
+- Routes a single-track aggregate request through a complete new generation
+  after publication, preventing that API from replacing one stable alias.
+- Requires every registered feature part to be exactly
+  `metrics/parts/<feature_track>/<job_id>.parquet`.
+
+### Second review GREEN evidence
+
+Incremental focused results:
+
+```text
+exact Task 3 provenance mutations: 8 passed in 8.20s
+exact Task 7 PCA provenance mutations: 8 passed in 9.83s
+exact feature-track part path: 1 passed in 3.66s
+atomic visibility, crash, and failure injection: 4 passed in 5.24s
+single-track alias regression plus pointer/crash checks: 3 passed in 4.38s
+```
+
+Final Task 8 module and CLI:
+
+```text
+/opt/conda/envs/pixal3d/bin/python -m pytest -q \
+  tests/test_pilot_gate.py tests/test_upper_cli.py
+
+40 passed in 30.12s
+```
+
+Cumulative Task 4–8 boundary:
+
+```text
+/opt/conda/envs/pixal3d/bin/python -m pytest -q \
+  tests/test_job_registry.py tests/test_upper_prepare.py \
+  tests/test_upper_geometry.py tests/test_pca_features.py \
+  tests/test_streaming_features.py tests/test_upper_metric_worker.py \
+  tests/test_pipeline_integration.py tests/test_pilot_gate.py \
+  tests/test_upper_cli.py
+
+102 passed in 120.71s (0:02:00)
+```
+
+Fresh full-suite and static surface verification:
+
+```text
+/opt/conda/envs/pixal3d/bin/python -m pytest -q
+210 passed in 153.83s (0:02:33)
+
+/opt/conda/envs/pixal3d/bin/python -m compileall -q met3r tests
+exit 0
+
+bash -n scripts/run_upper_pilot.sh
+exit 0
+
+met3r.upper_cli top-level help and all six command help invocations
+exit 0
+
+git diff --check
+exit 0
+```
