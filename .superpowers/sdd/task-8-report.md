@@ -201,3 +201,174 @@ exit 0
   pilot is explicitly Task 10.
 - The protected `configs/environment_pixal3d.json` remains untouched and
   untracked.
+
+---
+
+## Review remediation: exact ownership and generation-atomic aggregation
+
+The first Task 8 review rejected commit `217c68d` for one critical pilot-gate
+ownership loophole and four important operational gaps.
+
+### Root causes
+
+- The gate checked 1,320 rows and coarse 44-by-30 cardinality without parsing
+  the prepared state, pair-condition, or feature-variant manifests. A single
+  feature job could therefore own every row, including invented design and
+  variant keys.
+- PCA storage was one category scaled by backbone count, even though fixed
+  basis files and per-job render/manifests have different full-run units.
+- Empty pilot tracks produced zero-column Parquet files.
+- `aggregate_all_metric_parts` published each output independently, so a
+  later-track or preview failure could expose a mixed aggregate generation.
+- `status --require-complete` treated every `abstained` row as terminal even
+  when its reason was empty or whitespace.
+
+### Review RED evidence
+
+The fixture was rebuilt to match the real Task 4/7 distribution: 32 image
+states, 44 pair conditions, 30 exact variants, 64 completed feature jobs, one
+Parquet part per `(state, feature_track)` owner, and exactly 1,320 rows.
+
+Initial review-regression command:
+
+```text
+/opt/conda/envs/pixal3d/bin/python -m pytest \
+  tests/test_pilot_gate.py tests/test_upper_cli.py -q
+
+9 failed, 9 passed in 7.83s
+```
+
+The nine expected failures demonstrated:
+
+- a missing `feature_variants.json` still passed;
+- invented design/variant keys lacked ownership failure;
+- swapping exact-key rows across two job parts still passed;
+- fixed basis and per-job PCA bytes were not separated;
+- stress and geometry-calibration empty aggregates had no columns;
+- a later calibration duplicate replaced the controlled aggregate before
+  failing;
+- empty and whitespace abstention reasons both made
+  `status --require-complete` succeed.
+
+The explicit preview boundary was also specified before its injectable writer:
+
+```text
+FAILED test_aggregate_all_preview_failure_preserves_entire_prior_generation
+AttributeError: module 'met3r.pilot_gate' has no attribute
+'_write_aggregate_preview'
+1 failed in 3.01s
+```
+
+The exact Task 7 nullable-string boundary was specified separately:
+
+```text
+FAILED test_optional_normalization_handles_pandas_na
+assert <NA> is None
+1 failed in 2.30s
+```
+
+The final explicit-abstention audit also reproduced the same whitespace
+loophole in the pilot gate itself:
+
+```text
+FAILED test_gate_rejects_whitespace_only_abstention_reason
+assert 'job_completion' in ()
+1 failed in 3.35s
+```
+
+### Review GREEN evidence
+
+Incremental review fixes:
+
+```text
+exact manifest/ownership subset: 4 passed in 5.65s
+storage category split: 1 passed in 3.01s
+typed empty schemas: 2 passed in 3.43s
+explicit abstention status: 2 passed in 2.52s
+aggregate rollback/crash recovery: 2 passed in 4.13s
+preview-stage rollback: 1 passed in 3.35s
+Task 7 nullable string handling: 2 passed in 4.13s
+pilot-gate whitespace abstention: 1 passed in 3.61s
+```
+
+Final review-hardening focused command:
+
+```text
+/opt/conda/envs/pixal3d/bin/python -m pytest \
+  tests/test_pilot_gate.py tests/test_upper_cli.py -q
+
+23 passed in 13.84s
+```
+
+### Critical ownership correction
+
+- Parses Task 4's actual `image_states.jsonl`,
+  `pair_conditions.parquet`, and `feature_variants.json` formats.
+- Derives the exact frozen pilot state coordinates, state/pair cells, ordered
+  config-selected `FeatureVariant` records, and 1,320
+  `(design_id, variant_key)` primary-key set.
+- Requires 32 unique controlled states, 44 unique condition cells, and the
+  exact 30 Pixal3D variants from the frozen config.
+- Validates every condition's shoe, pair, upper views, changed view, state,
+  corruption, severity, and track against its state manifest.
+- Validates every row's condition and variant metadata against those
+  manifests.
+- Requires every completed part basename and row `job_id` to match its
+  registry owner. The payload's state, feature track, backbone, analysis
+  track, shoe, and config define the exact rows allowed in that part.
+- Compares each part's exact key set with its owned
+  `state × feature-track variants` set, then compares the global exact set.
+  A job cannot own another state's row even when the global row count and keys
+  remain unchanged.
+- Normalizes Task 7 nullable Pandas string values, including `pd.NA`, before
+  manifest comparison.
+
+### Important corrections
+
+- Storage projection now separates:
+  - fixed `basis.npz`/`basis.json` bytes scaled from one pilot backbone to four
+    full backbones;
+  - per-job PCA renders/manifests scaled from 64 pilot feature jobs to 1,740
+    full feature jobs.
+- Empty controlled/stress aggregates retain typed string
+  `design_id`/`variant_key` columns. Empty geometry calibration also retains
+  typed string `changed_view`/`perturbation_kind` and float64 `magnitude`.
+- All three aggregate Parquets and `summary_preview.csv` are staged and
+  readback-validated before installation. One journal records the complete
+  target generation.
+- Existing outputs move to transaction-local backups and remain recoverable
+  through the whole set installation. Any normal later-track, readback, or
+  preview error restores all prior files byte-for-byte.
+- A process death during installation leaves the journal/backups intact. The
+  next aggregate invocation rolls the partial generation back before staging
+  a new one. A committed journal keeps the complete new generation and only
+  removes debris.
+- `status --require-complete` now requires every abstained row to have a
+  nonempty, non-whitespace reason.
+
+### Review integration and full-suite evidence
+
+Cumulative Task 4–8 boundary:
+
+```text
+/opt/conda/envs/pixal3d/bin/python -m pytest \
+  tests/test_job_registry.py tests/test_upper_prepare.py \
+  tests/test_upper_geometry.py tests/test_pca_features.py \
+  tests/test_streaming_features.py tests/test_upper_metric_worker.py \
+  tests/test_pipeline_integration.py tests/test_pilot_gate.py \
+  tests/test_upper_cli.py -q
+
+85 passed in 113.92s (0:01:53)
+```
+
+Fresh full suite:
+
+```text
+/opt/conda/envs/pixal3d/bin/python -m pytest -q
+
+193 passed in 140.91s (0:02:20)
+```
+
+The remediation remains limited to Task 8 production, tests, and this report.
+No Task 9 analysis, full launcher, raw DINO feature persistence, bottom view,
+or protected environment-config change was introduced.

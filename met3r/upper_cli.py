@@ -79,6 +79,15 @@ def _status(run_root: Path) -> tuple[dict[str, dict[str, int]], bool]:
     for job_id in completed_ids:
         registry.validated_state(job_id)
     with sqlite3.connect(registry_path, timeout=60) as connection:
+        unexplained_abstentions = int(
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM jobs
+                WHERE state = 'abstained'
+                  AND (error IS NULL OR TRIM(error) = '')
+                """
+            ).fetchone()[0]
+        )
         rows = connection.execute(
             """
             SELECT phase, state, COUNT(*)
@@ -90,7 +99,7 @@ def _status(run_root: Path) -> tuple[dict[str, dict[str, int]], bool]:
     counts: dict[str, dict[str, int]] = {}
     for phase, state, count in rows:
         counts.setdefault(str(phase), {})[str(state)] = int(count)
-    complete = bool(rows) and all(
+    complete = unexplained_abstentions == 0 and bool(rows) and all(
         state in {"completed", "abstained"} for _, state, _ in rows
     )
     return counts, complete

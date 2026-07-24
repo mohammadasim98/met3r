@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -90,6 +91,25 @@ def test_status_require_complete_revalidates_completed_output_hashes(
     with pytest.raises(SystemExit) as error:
         main(["status", str(tmp_path), "--require-complete"])
 
+    assert error.value.code == 1
+
+
+@pytest.mark.parametrize("reason", ("", "   "))
+def test_status_require_complete_rejects_unexplained_abstention(
+    tmp_path: Path,
+    reason: str,
+) -> None:
+    from met3r.job_registry import JobDefinition, JobRegistry
+
+    registry = JobRegistry(tmp_path / "registry/jobs.sqlite")
+    registry.register(JobDefinition("job", "feature", {"x": 1}))
+    with sqlite3.connect(registry.path) as connection:
+        connection.execute(
+            "UPDATE jobs SET state = 'abstained', error = ? WHERE job_id = 'job'",
+            (reason,),
+        )
+    with pytest.raises(SystemExit) as error:
+        main(["status", str(tmp_path), "--require-complete"])
     assert error.value.code == 1
 
 
