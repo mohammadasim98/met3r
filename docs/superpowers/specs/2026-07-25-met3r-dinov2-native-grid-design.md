@@ -1,10 +1,10 @@
-# MEt3R DINOv2 Native-Grid Design
+# MEt3R DINOv2 37-Grid Downsampling Design
 
 ## Goal
 
-Remove the invalid DINOv2 `42→37` NAF condition from the full upper-view
-experiment. DINOv2 uses its native `42×42` feature grid as its lowest
-resolution; it is not forced onto the `37×37` grid.
+Retain `37×37` as the lowest common evaluation resolution while removing the
+invalid DINOv2 `42→37` NAF conditions. DINOv2 keeps both its native `42×42`
+feature and a bilinearly downsampled `37×37` feature.
 
 ## Root Cause
 
@@ -19,16 +19,14 @@ runtime failure.
 
 ## Resolution Policy
 
-Generated feature targets must not be smaller than the backbone's native
-feature grid:
+NAF targets must not be smaller than the backbone's native feature grid:
 
 ```text
-retain target iff target_resolution >= native_grid
+retain NAF target iff target_resolution >= native_grid
 ```
 
-This rule removes all four generated DINOv2 `37×37` variants:
+This rule removes only the three DINOv2 NAF `37×37` variants:
 
-- `bilinear__37`;
 - `naf_normal_guide__37`;
 - `naf_blurred_guide__37`;
 - `naf_shuffled_guide__37`.
@@ -36,16 +34,19 @@ This rule removes all four generated DINOv2 `37×37` variants:
 DINOv2 retains:
 
 - native `42×42`;
+- bilinear `37×37`;
 - bilinear and three NAF modes at `74,148,296,592`.
 
-The other backbone tracks are unchanged because their common `37×37` target
-is equal to, not smaller than, their native `37×37` grid. The Pixal3D current
-track is unchanged.
+The other backbone tracks are unchanged because their common `37×37` NAF
+target is equal to, not smaller than, their native `37×37` grid. The Pixal3D
+current track is unchanged.
 
 ## Scientific Interpretation
 
-- Lowest-resolution semantic evidence is compared at each model's native
-  grid: `37×37` for DINO/DINOv3 and `42×42` for DINOv2.
+- The lowest common-resolution backbone comparison uses bilinear `37×37`
+  features for every backbone.
+- Native semantic evidence is also retained separately at `37×37` for
+  DINO/DINOv3 and `42×42` for DINOv2.
 - Direct cross-backbone comparisons of generated modes use only the shared
   valid targets `74,148,296,592`.
 - NAF comparisons never claim a DINOv2 `37×37` result.
@@ -57,7 +58,7 @@ track is unchanged.
 
 ## Revised Counts
 
-The full design changes from 93 to 89 feature variants. Job counts remain
+The full design changes from 93 to 90 feature variants. Job counts remain
 unchanged because a feature job owns all variants for one state/backbone
 track:
 
@@ -66,9 +67,9 @@ track:
 
 Expected metric rows become:
 
-- controlled fidelity: `89 × 1,032 = 91,848`;
-- geometry calibration: `89 × 816 = 72,624`;
-- real-deformation stress: `89 × 24 = 2,136`.
+- controlled fidelity: `90 × 1,032 = 92,880`;
+- geometry calibration: `90 × 816 = 73,440`;
+- real-deformation stress: `90 × 24 = 2,160`.
 
 The GPU-1 pilot is unchanged because it contains only DINOv3-L tracks whose
 targets are not below their native grids.
@@ -86,10 +87,10 @@ commit and the already-approved physical GPU runtime mapping `0,1,2,3`.
 
 Use test-driven development:
 
-1. Feature enumeration must contain 89 full variants.
-2. No DINOv2 generated variant may have resolution below 42.
-3. DINOv2 must contain native 42 and generated targets
-   `74,148,296,592` for all four modes.
+1. Feature enumeration must contain 90 full variants.
+2. DINOv2 must contain native 42 and bilinear targets
+   `37,74,148,296,592`.
+3. DINOv2 NAF modes must contain only targets `74,148,296,592`.
 4. Pilot design and its 30 variants must remain unchanged.
 5. Streaming feature generation must reject a below-native NAF variant
    defensively if an invalid external manifest bypasses design enumeration.
