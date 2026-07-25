@@ -722,6 +722,29 @@ def test_persistent_feature_guard_rejects_raw_dino_artifacts(
         _assert_no_persistent_features(tmp_path)
 
 
+def test_persistent_feature_guard_tolerates_concurrent_directory_removal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    disappearing = tmp_path / "concurrently-published-output"
+    disappearing.mkdir()
+    real_scandir = os.scandir
+    removed = False
+
+    def remove_before_scandir(path: os.PathLike[str] | str) -> os.ScandirIterator:
+        nonlocal removed
+        if Path(path) == disappearing:
+            disappearing.rmdir()
+            removed = True
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", remove_before_scandir)
+
+    _assert_no_persistent_features(tmp_path)
+
+    assert removed is True
+
+
 def test_worker_revalidates_completed_part_and_recomputes_corruption(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -7,6 +7,7 @@ import gc
 import hashlib
 import json
 import math
+import os
 import shutil
 import sqlite3
 import tempfile
@@ -1675,21 +1676,30 @@ def _assert_no_persistent_features(run_root: str | Path) -> None:
     """Reject persistent raw DINO tensors regardless of their filename."""
 
     root = Path(run_root)
-    for path in root.rglob("*"):
-        if not path.is_file():
-            continue
-        if path.name == "features.npz":
-            raise ValueError(f"persistent DINO feature artifact found: {path}")
-        if path.suffix != ".npz":
-            continue
-        with np.load(path, allow_pickle=False) as artifact:
-            for key in ("meta__artifact_type", "artifact_type"):
-                if key in artifact.files:
-                    value = str(np.asarray(artifact[key]).item())
-                    if value == "dino_features":
-                        raise ValueError(
-                            f"persistent DINO feature artifact found: {path}"
-                        )
+
+    def handle_walk_error(error: OSError) -> None:
+        if error.errno != errno.ENOENT:
+            raise error
+
+    for directory, _, filenames in os.walk(root, onerror=handle_walk_error):
+        for filename in filenames:
+            path = Path(directory) / filename
+            if path.name == "features.npz":
+                raise ValueError(f"persistent DINO feature artifact found: {path}")
+            if path.suffix != ".npz":
+                continue
+            try:
+                with np.load(path, allow_pickle=False) as artifact:
+                    for key in ("meta__artifact_type", "artifact_type"):
+                        if key in artifact.files:
+                            value = str(np.asarray(artifact[key]).item())
+                            if value == "dino_features":
+                                raise ValueError(
+                                    "persistent DINO feature artifact found: "
+                                    f"{path}"
+                                )
+            except FileNotFoundError:
+                continue
 
 
 def _is_transient(error: BaseException) -> bool:
