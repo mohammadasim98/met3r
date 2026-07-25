@@ -97,26 +97,48 @@ def _package_versions() -> dict[str, str]:
     return versions
 
 
-def _physical_gpu_policy(config: Mapping[str, object]) -> dict[str, object]:
-    raw_gpus = config.get("physical_gpus")
+_FEATURE_BACKBONES = (
+    "dino_vitb16",
+    "dinov2_vitb14",
+    "dinov3_vitb16",
+    "dinov3_vitl16_pixal3d",
+)
+
+
+def _validated_physical_gpus(value: object) -> tuple[int, ...]:
     if (
-        not isinstance(raw_gpus, Sequence)
-        or isinstance(raw_gpus, (str, bytes))
-        or not all(isinstance(gpu, int) for gpu in raw_gpus)
-        or list(raw_gpus) != [4, 5, 6, 7]
+        not isinstance(value, Sequence)
+        or isinstance(value, (str, bytes))
+        or len(value) != 4
+        or not all(
+            isinstance(gpu, int) and not isinstance(gpu, bool) and gpu >= 0
+            for gpu in value
+        )
+        or len(set(value)) != 4
     ):
-        raise ValueError("physical_gpus must be exactly [4, 5, 6, 7]")
+        raise ValueError(
+            "physical_gpus must contain exactly four unique non-negative integers"
+        )
+    return tuple(value)
+
+
+def _physical_gpu_policy(
+    config: Mapping[str, object],
+    physical_gpus: Sequence[int] | None = None,
+) -> dict[str, object]:
+    source = "runtime_override" if physical_gpus is not None else "frozen_config"
+    resolved = _validated_physical_gpus(
+        config.get("physical_gpus") if physical_gpus is None else physical_gpus
+    )
     return {
-        "physical_gpus": list(raw_gpus),
+        "source": source,
+        "physical_gpus": list(resolved),
         "pilot_gpu": 1,
         "geometry_assignments": {
-            shoe_id: gpu for shoe_id, gpu in zip(EXPECTED_SHOES, raw_gpus)
+            shoe_id: gpu for shoe_id, gpu in zip(EXPECTED_SHOES, resolved)
         },
         "feature_assignments": {
-            "dino_vitb16": 4,
-            "dinov2_vitb14": 5,
-            "dinov3_vitb16": 6,
-            "dinov3_vitl16_pixal3d": 7,
+            backbone: gpu for backbone, gpu in zip(_FEATURE_BACKBONES, resolved)
         },
         "phase_order": ["geometry", "feature"],
         "allow_phase_overlap": False,
@@ -128,7 +150,7 @@ def _write_run_manifest(
     *,
     scope: str,
     config_sha256: str,
-    config: Mapping[str, object],
+    physical_gpu_policy: Mapping[str, object],
 ) -> None:
     path = run_root / "run_manifest.json"
     if path.is_file():
@@ -137,6 +159,7 @@ def _write_run_manifest(
             not isinstance(payload, Mapping)
             or payload.get("scope") != scope
             or payload.get("config_sha256") != config_sha256
+            or payload.get("physical_gpu_policy") != physical_gpu_policy
         ):
             raise ValueError(f"existing run manifest is incompatible: {path}")
         return
@@ -152,7 +175,7 @@ def _write_run_manifest(
                 "dirty_tree_fingerprint": dirty,
                 "python_version": platform.python_version(),
                 "package_versions": _package_versions(),
-                "physical_gpu_policy": _physical_gpu_policy(config),
+                "physical_gpu_policy": physical_gpu_policy,
             }
         ),
     )
@@ -351,6 +374,7 @@ def prepare_run(
     scope: Literal["pilot", "full"],
     *,
     output_root: str | Path | None = None,
+    physical_gpus: Sequence[int] | None = None,
 ) -> PreparedRun:
     """Prepare immutable manifests, staged inputs, and idempotent job rows."""
 
@@ -362,6 +386,7 @@ def prepare_run(
     raw_config = json.loads(content)
     if not isinstance(raw_config, Mapping):
         raise ValueError("upper experiment config must be a JSON object")
+    physical_gpu_policy = _physical_gpu_policy(raw_config, physical_gpus)
     raw_root = output_root if output_root is not None else raw_config.get("output_root")
     if not isinstance(raw_root, (str, Path)):
         raise ValueError("config requires output_root when no override is supplied")
@@ -373,7 +398,7 @@ def prepare_run(
         run_root,
         scope=scope,
         config_sha256=config_sha256,
-        config=raw_config,
+        physical_gpu_policy=physical_gpu_policy,
     )
 
     reconstruction_root = raw_config.get("reconstruction_root")

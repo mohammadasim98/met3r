@@ -6,6 +6,7 @@ import sqlite3
 from pathlib import Path
 
 import pandas as pd
+import pytest
 from PIL import Image
 
 from met3r.job_registry import JobRegistry
@@ -109,6 +110,7 @@ def test_prepare_records_provenance_and_exact_gpu_policy(tmp_path: Path) -> None
     assert payload["python_version"]
     assert payload["package_versions"]
     assert payload["physical_gpu_policy"]["physical_gpus"] == [4, 5, 6, 7]
+    assert payload["physical_gpu_policy"]["source"] == "frozen_config"
     assert payload["physical_gpu_policy"]["pilot_gpu"] == 1
     assert payload["physical_gpu_policy"]["feature_assignments"] == {
         "dino_vitb16": 4,
@@ -116,6 +118,72 @@ def test_prepare_records_provenance_and_exact_gpu_policy(tmp_path: Path) -> None
         "dinov3_vitb16": 6,
         "dinov3_vitl16_pixal3d": 7,
     }
+
+
+def test_prepare_records_runtime_physical_gpu_override(tmp_path: Path) -> None:
+    prepared = prepare_run(
+        CONFIG,
+        scope="pilot",
+        output_root=tmp_path,
+        physical_gpus=(0, 1, 2, 3),
+    )
+
+    policy = json.loads(
+        (prepared.root / "run_manifest.json").read_text()
+    )["physical_gpu_policy"]
+
+    assert policy["source"] == "runtime_override"
+    assert policy["physical_gpus"] == [0, 1, 2, 3]
+    assert list(policy["geometry_assignments"].values()) == [0, 1, 2, 3]
+    assert policy["feature_assignments"] == {
+        "dino_vitb16": 0,
+        "dinov2_vitb14": 1,
+        "dinov3_vitb16": 2,
+        "dinov3_vitl16_pixal3d": 3,
+    }
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        (0, 1, 2),
+        (0, 1, 2, 3, 4),
+        (0, 1, 1, 3),
+        (-1, 0, 1, 2),
+        (0, 1, 2, "3"),
+        (0, 1, 2, True),
+    ],
+)
+def test_prepare_rejects_invalid_physical_gpu_override(
+    tmp_path: Path,
+    value: tuple[object, ...],
+) -> None:
+    with pytest.raises(ValueError, match="physical_gpus"):
+        prepare_run(
+            CONFIG,
+            scope="pilot",
+            output_root=tmp_path,
+            physical_gpus=value,
+        )
+
+
+def test_prepare_rejects_conflicting_physical_gpu_override(
+    tmp_path: Path,
+) -> None:
+    prepare_run(
+        CONFIG,
+        scope="pilot",
+        output_root=tmp_path,
+        physical_gpus=(0, 1, 2, 3),
+    )
+
+    with pytest.raises(ValueError, match="existing run manifest is incompatible"):
+        prepare_run(
+            CONFIG,
+            scope="pilot",
+            output_root=tmp_path,
+            physical_gpus=(4, 5, 6, 7),
+        )
 
 
 def test_pilot_feature_jobs_are_one_per_state_and_pixal3d_track(tmp_path: Path) -> None:
