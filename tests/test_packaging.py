@@ -23,11 +23,11 @@ def test_known_camera_packaging_includes_parquet_dependency() -> None:
 def test_frozen_upper_configuration_binds_every_experiment_value() -> None:
     config = json.loads((REPOSITORY / "configs/upper_dino_fidelity.json").read_text())
 
-    assert config["experiment_id"] == "20260724_upper_v1"
+    assert config["experiment_id"] == "20260724_upper_v2"
     assert config["reconstruction_root"] == "/root/dev/ByteSize/Reconstruction"
     assert (
         config["output_root"]
-        == "/root/dev/ByteSize/Reconstruction/met3r_upper_experiments/20260724_upper_v1"
+        == "/root/dev/ByteSize/Reconstruction/met3r_upper_experiments/20260724_upper_v2"
     )
     assert config["da3_repository"] == "/root/dev/ByteSize/Reconstruction/third_party/Depth-Anything-3"
     assert config["camera_label"] == "fixed/precomputed DA3 cameras (not calibrated GT)"
@@ -36,7 +36,7 @@ def test_frozen_upper_configuration_binds_every_experiment_value() -> None:
     assert config["stage_size"] == 504
     assert config["metric"] == {
         "relative_depth_tolerance": 0.03,
-        "min_overlap_fraction": 0.1,
+        "min_overlap_fraction": 0.08,
         "confidence_percentile": 10.0,
     }
     assert config["persistent_storage_limit_gb"] == 300
@@ -54,7 +54,7 @@ def test_frozen_upper_configuration_binds_every_experiment_value() -> None:
             "air_huarache_run_ultra_111449",
             "air_max_90_surplus_cq7743_300",
         ],
-        "pairs": ["left__back", "left__right"],
+        "pairs": ["right__front", "left__right"],
         "corruptions": {
             "translation": [0.12, 0.20],
             "exposure": [0.50, 0.75],

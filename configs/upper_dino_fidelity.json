@@ -1,7 +1,7 @@
 {
-  "experiment_id": "20260724_upper_v1",
+  "experiment_id": "20260724_upper_v2",
   "reconstruction_root": "/root/dev/ByteSize/Reconstruction",
-  "output_root": "/root/dev/ByteSize/Reconstruction/met3r_upper_experiments/20260724_upper_v1",
+  "output_root": "/root/dev/ByteSize/Reconstruction/met3r_upper_experiments/20260724_upper_v2",
   "da3_repository": "/root/dev/ByteSize/Reconstruction/third_party/Depth-Anything-3",
   "camera_label": "fixed/precomputed DA3 cameras (not calibrated GT)",
   "views": ["left", "back", "right", "front"],
@@ -9,7 +9,7 @@
   "stage_size": 504,
   "metric": {
     "relative_depth_tolerance": 0.03,
-    "min_overlap_fraction": 0.1,
+    "min_overlap_fraction": 0.08,
     "confidence_percentile": 10.0
   },
   "persistent_storage_limit_gb": 300,
@@ -27,7 +27,7 @@
       "air_huarache_run_ultra_111449",
       "air_max_90_surplus_cq7743_300"
     ],
-    "pairs": ["left__back", "left__right"],
+    "pairs": ["right__front", "left__right"],
     "corruptions": {
       "translation": [0.12, 0.20],
       "exposure": [0.50, 0.75],

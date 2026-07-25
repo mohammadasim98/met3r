@@ -3,7 +3,7 @@ set -euo pipefail
 
 PYTHON=/opt/conda/envs/pixal3d/bin/python
 CONFIG=/root/dev/met3r-worktrees/known-camera-met3r/configs/upper_dino_fidelity.json
-RUN_ROOT=/root/dev/ByteSize/Reconstruction/met3r_upper_experiments/20260724_upper_v1/full
+RUN_ROOT=/root/dev/ByteSize/Reconstruction/met3r_upper_experiments/20260724_upper_v2/full
 DA3_REPO=/root/dev/ByteSize/Reconstruction/third_party/Depth-Anything-3
 
 "$PYTHON" -m met3r.upper_cli prepare "$CONFIG" --scope full

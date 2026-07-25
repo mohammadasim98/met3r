@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -114,22 +116,52 @@ def test_status_require_complete_rejects_unexplained_abstention(
     assert error.value.code == 1
 
 
-def test_pilot_launcher_is_upper_only_gpu4_and_exact_paths() -> None:
+def test_pilot_launcher_defaults_to_gpu1_and_v2_root(
+    tmp_path: Path,
+) -> None:
     path = Path("scripts/run_upper_pilot.sh")
     text = path.read_text(encoding="utf-8")
-    assert "PYTHON=/opt/conda/envs/pixal3d/bin/python" in text
-    assert (
-        "CONFIG=/root/dev/met3r-worktrees/known-camera-met3r/"
-        "configs/upper_dino_fidelity.json"
-    ) in text
-    # The geometry prefix appears once in a loop that executes for two shoes.
-    assert text.count("CUDA_VISIBLE_DEVICES=4") == 3
-    assert text.count("--device cuda:0") == 2
-    assert "air_huarache_run_ultra_111449" in text
-    assert "air_max_90_surplus_cq7743_300" in text
-    assert "bottom" not in text.lower()
-    assert "met3r.upper_cli validate-pilot" in text
-    assert "\"$RUN_ROOT\" --rerun-sentinel" in text
+    fake_python = tmp_path / "python"
+    call_log = tmp_path / "calls.log"
+    fake_python.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s|%s\\n' \"${CUDA_VISIBLE_DEVICES-}\" \"$*\" >> \"$CALL_LOG\"\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    safe_copy = tmp_path / "run_upper_pilot.sh"
+    safe_copy.write_text(
+        text.replace(
+            "PYTHON=/opt/conda/envs/pixal3d/bin/python",
+            f"PYTHON={fake_python}",
+        ),
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    environment.update(PYTHON=str(fake_python), CALL_LOG=str(call_log))
+
+    subprocess.run(
+        ["bash", str(safe_copy)],
+        cwd=Path.cwd(),
+        env=environment,
+        check=True,
+    )
+
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    assert len(calls) == 6
+    gpu_calls = [line for line in calls if line.split("|", 1)[0]]
+    assert [line.split("|", 1)[0] for line in gpu_calls] == ["1"] * 4
+    assert sum("geometry-worker" in line for line in calls) == 2
+    assert sum("feature-worker" in line for line in calls) == 1
+    assert sum("validate-pilot" in line and "--rerun-sentinel" in line for line in calls) == 1
+    assert all(
+        "20260724_upper_v2/pilot" in line
+        for line in calls
+        if " prepare " not in f" {line} "
+    )
+    assert any("--shoe-id air_huarache_run_ultra_111449" in line for line in calls)
+    assert any("--shoe-id air_max_90_surplus_cq7743_300" in line for line in calls)
+    assert not any("bottom" in line.lower() for line in calls)
 
 
 def test_analyze_cli_forwards_run_root(

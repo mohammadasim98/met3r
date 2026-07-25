@@ -47,7 +47,10 @@ def test_pilot_design_is_exact(real_upper_manifest, frozen_config) -> None:
     design = build_upper_design(real_upper_manifest, frozen_config, scope="pilot")
 
     assert len(design.pair_conditions) == 44
-    assert {row.pair_id for row in design.pair_conditions} == {"left__back", "left__right"}
+    assert {row.pair_id for row in design.pair_conditions} == {
+        "right__front",
+        "left__right",
+    }
     assert {row.backbone for row in design.feature_variants} == {"dinov3_vitl16_pixal3d"}
     assert len(design.feature_variants) == 30
 
