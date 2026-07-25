@@ -41,7 +41,10 @@ EXPECTED_PILOT_SHOES = (
     "air_huarache_run_ultra_111449",
     "air_max_90_surplus_cq7743_300",
 )
-EXPECTED_PILOT_PAIRS = ("left__back", "left__right")
+EXPECTED_PILOT_PAIRS = ("right__front", "left__right")
+PRIMARY_PILOT_PAIR = "right__front"
+NEGATIVE_CONTROL_PILOT_PAIR = "left__right"
+MIN_OVERLAP_FRACTION = 0.08
 FULL_DESIGN_COUNTS = {
     "states": 344,
     "geometry_jobs": 344,
@@ -67,6 +70,9 @@ class PilotGateReport:
     expected_metric_rows: int
     actual_metric_rows: int
     clean_directional_coverage: float
+    clean_primary_directional_coverage: float
+    clean_primary_pair_coverage: float
+    clean_negative_control_abstention: float
     raw_feature_artifacts: tuple[str, ...]
     projected_total_bytes: int
 
@@ -1300,9 +1306,18 @@ def _finite_metrics(frame: pd.DataFrame) -> bool:
     return bool(np.isfinite(active.to_numpy(dtype=np.float64)).all())
 
 
-def _clean_directional_coverage(frame: pd.DataFrame) -> float:
+def _clean_pair_rows(frame: pd.DataFrame, pair_id: str) -> pd.DataFrame:
+    if not {"corruption", "pair_id"} <= set(frame):
+        return pd.DataFrame()
+    return frame.loc[
+        (frame["corruption"] == "clean") & (frame["pair_id"] == pair_id)
+    ]
+
+
+def _clean_primary_directional_coverage(frame: pd.DataFrame) -> float:
     required = {
         "corruption",
+        "pair_id",
         "s11_first_to_second_score",
         "s11_second_to_first_score",
         "s11_first_to_second_overlap",
@@ -1310,15 +1325,59 @@ def _clean_directional_coverage(frame: pd.DataFrame) -> float:
     }
     if not required <= set(frame):
         return 0.0
-    clean = frame.loc[frame["corruption"] == "clean"]
+    clean = _clean_pair_rows(frame, PRIMARY_PILOT_PAIR)
     if clean.empty:
         return 0.0
     covered = 0
     for prefix in ("s11_first_to_second", "s11_second_to_first"):
         score = pd.to_numeric(clean[f"{prefix}_score"], errors="coerce")
         overlap = pd.to_numeric(clean[f"{prefix}_overlap"], errors="coerce")
-        covered += int((np.isfinite(score) & np.isfinite(overlap) & (overlap >= 0.10)).sum())
+        covered += int(
+            (
+                np.isfinite(score)
+                & np.isfinite(overlap)
+                & (overlap >= MIN_OVERLAP_FRACTION)
+            ).sum()
+        )
     return covered / (2 * len(clean))
+
+
+def _clean_primary_pair_coverage(frame: pd.DataFrame) -> float:
+    if not {"corruption", "pair_id", "s11", "abstained"} <= set(frame):
+        return 0.0
+    clean = _clean_pair_rows(frame, PRIMARY_PILOT_PAIR)
+    if clean.empty:
+        return 0.0
+    score = pd.to_numeric(clean["s11"], errors="coerce")
+    abstained = clean["abstained"].fillna(True).astype(bool)
+    return float((np.isfinite(score) & ~abstained).mean())
+
+
+def _clean_negative_control_abstention(frame: pd.DataFrame) -> float:
+    required = {
+        "corruption",
+        "pair_id",
+        "s11_first_to_second_score",
+        "s11_second_to_first_score",
+        "s11_first_to_second_overlap",
+        "s11_second_to_first_overlap",
+    }
+    if not required <= set(frame):
+        return 0.0
+    clean = _clean_pair_rows(frame, NEGATIVE_CONTROL_PILOT_PAIR)
+    if clean.empty:
+        return 0.0
+    rejected = 0
+    for prefix in ("s11_first_to_second", "s11_second_to_first"):
+        score = pd.to_numeric(clean[f"{prefix}_score"], errors="coerce")
+        overlap = pd.to_numeric(clean[f"{prefix}_overlap"], errors="coerce")
+        rejected += int(
+            (
+                ~np.isfinite(score)
+                | (np.isfinite(overlap) & (overlap < MIN_OVERLAP_FRACTION))
+            ).sum()
+        )
+    return rejected / (2 * len(clean))
 
 
 def _sentinel_metric_columns(frame: pd.DataFrame) -> list[str]:
@@ -1530,7 +1589,7 @@ def validate_pilot(
     if (
         not isinstance(metric, Mapping)
         or metric.get("relative_depth_tolerance") != 0.03
-        or metric.get("min_overlap_fraction") != 0.10
+        or metric.get("min_overlap_fraction") != MIN_OVERLAP_FRACTION
         or metric.get("confidence_percentile") != 10.0
         or not isinstance(models, Mapping)
         or models.get("naf_revision") != NAF_REVISION
@@ -1609,9 +1668,15 @@ def validate_pilot(
         failures.add("model_provenance")
     if not _finite_metrics(frame):
         failures.add("finite_metrics")
-    coverage = _clean_directional_coverage(frame)
-    if coverage < 0.90:
-        failures.add("clean_directional_coverage")
+    primary_directional_coverage = _clean_primary_directional_coverage(frame)
+    primary_pair_coverage = _clean_primary_pair_coverage(frame)
+    negative_control_abstention = _clean_negative_control_abstention(frame)
+    if primary_directional_coverage < 0.90:
+        failures.add("clean_primary_directional_coverage")
+    if primary_pair_coverage < 0.90:
+        failures.add("clean_primary_pair_coverage")
+    if negative_control_abstention < 0.90:
+        failures.add("clean_negative_control_abstention")
     if not _validate_pca(root, config, config_sha256):
         failures.add("pca_fingerprint")
 
@@ -1639,7 +1704,10 @@ def validate_pilot(
         failed_checks=tuple(sorted(failures)),
         expected_metric_rows=EXPECTED_PILOT_METRIC_ROWS,
         actual_metric_rows=actual_rows,
-        clean_directional_coverage=coverage,
+        clean_directional_coverage=primary_directional_coverage,
+        clean_primary_directional_coverage=primary_directional_coverage,
+        clean_primary_pair_coverage=primary_pair_coverage,
+        clean_negative_control_abstention=negative_control_abstention,
         raw_feature_artifacts=raw_features,
         projected_total_bytes=projected_total,
     )

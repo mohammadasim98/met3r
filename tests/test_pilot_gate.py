@@ -87,6 +87,13 @@ def _metric_rows(
     for condition in attached.to_dict("records"):
         for variant in track_variants:
             ordinal = len(rows) + 1
+            negative_control = (
+                condition["corruption"] == "clean"
+                and condition["pair_id"] == "left__right"
+            )
+            metric_value = np.nan if negative_control else 0.5 + ordinal / 10_000
+            factorial_value = np.nan if negative_control else 0.53
+            directional_overlap = 0.01 if negative_control else 0.20
             rows.append(
                 {
                     **condition,
@@ -104,22 +111,24 @@ def _metric_rows(
                     "camera_label": (
                         "fixed/precomputed DA3 cameras (not calibrated GT)"
                     ),
-                    "abstained": False,
-                    "score": 0.5 + ordinal / 10_000,
-                    "s00": 0.50,
-                    "s10": 0.51,
-                    "s01": 0.52,
-                    "s11": 0.53,
+                    "abstained": negative_control,
+                    "score": metric_value,
+                    "s00": np.nan if negative_control else 0.50,
+                    "s10": np.nan if negative_control else 0.51,
+                    "s01": np.nan if negative_control else 0.52,
+                    "s11": factorial_value,
                     "feature_effect": 0.01,
                     "geometry_effect": 0.02,
                     "interaction": 0.0,
-                    "s11_first_to_second_score": 0.53,
-                    "s11_second_to_first_score": 0.53,
-                    "s11_first_to_second_overlap": 1.0,
-                    "s11_second_to_first_overlap": 1.0,
+                    "s11_first_to_second_score": factorial_value,
+                    "s11_second_to_first_score": factorial_value,
+                    "s11_first_to_second_overlap": directional_overlap,
+                    "s11_second_to_first_overlap": directional_overlap,
                 }
             )
-    return pd.DataFrame(rows)
+    frame = pd.DataFrame(rows)
+    frame["changed_view"] = frame["changed_view"].astype("string")
+    return frame
 
 
 def _set_job_state(
@@ -169,6 +178,49 @@ def _set_job_state(
 def _refresh_job_manifest(root: Path, job_id: str, part: Path) -> None:
     registry = JobRegistry(root / "registry/jobs.sqlite")
     _set_job_state(registry, job_id, "completed", files=(part,))
+
+
+def _first_finite_score_index(frame: pd.DataFrame) -> object:
+    indices = pd.to_numeric(frame["score"], errors="coerce").dropna().index
+    assert len(indices) > 0
+    return indices[0]
+
+
+def _rewrite_clean_pair_metrics(
+    root: Path,
+    pair_id: str,
+    *,
+    eligible: bool,
+) -> None:
+    sentinel_path = root / "reports/sentinel_rerun.json"
+    sentinel = json.loads(sentinel_path.read_text(encoding="utf-8"))
+    for part in (root / "metrics/parts").rglob("*.parquet"):
+        frame = pd.read_parquet(part)
+        selected = (frame["corruption"] == "clean") & (
+            frame["pair_id"] == pair_id
+        )
+        if not selected.any():
+            continue
+        score_columns = [
+            column
+            for column in frame
+            if column in {"score", "s00", "s10", "s01", "s11"}
+            or column.endswith("_score")
+        ]
+        overlap_columns = [
+            column for column in frame if column.endswith("_overlap")
+        ]
+        frame.loc[selected, score_columns] = 0.50 if eligible else np.nan
+        frame.loc[selected, overlap_columns] = 0.20 if eligible else 0.01
+        frame.loc[selected, "abstained"] = not eligible
+        frame.to_parquet(part, index=False)
+        job_id = str(frame["job_id"].iloc[0])
+        _refresh_job_manifest(root, job_id, part)
+        if job_id == sentinel["job_id"]:
+            digest = sha256_file(part)
+            sentinel["original_part_sha256"] = digest
+            sentinel["rerun_part_sha256"] = digest
+    sentinel_path.write_text(json.dumps(sentinel), encoding="utf-8")
 
 
 def _part_for_job(root: Path, job_id: str, feature_track: str) -> Path:
@@ -350,8 +402,40 @@ def test_gate_passes_complete_operational_pilot(valid_pilot_run: Path) -> None:
     assert report.passed
     assert report.expected_metric_rows == 1320
     assert report.actual_metric_rows == 1320
+    assert report.clean_primary_directional_coverage == 1.0
+    assert report.clean_primary_pair_coverage == 1.0
+    assert report.clean_negative_control_abstention == 1.0
     assert report.clean_directional_coverage >= 0.90
     assert report.raw_feature_artifacts == ()
+
+
+def test_clean_gate_rejects_primary_abstention(
+    valid_pilot_run: Path,
+) -> None:
+    _rewrite_clean_pair_metrics(
+        valid_pilot_run,
+        "right__front",
+        eligible=False,
+    )
+
+    report = validate_pilot(valid_pilot_run)
+
+    assert "clean_primary_directional_coverage" in report.failed_checks
+    assert "clean_primary_pair_coverage" in report.failed_checks
+
+
+def test_clean_gate_rejects_finite_negative_control(
+    valid_pilot_run: Path,
+) -> None:
+    _rewrite_clean_pair_metrics(
+        valid_pilot_run,
+        "left__right",
+        eligible=True,
+    )
+
+    report = validate_pilot(valid_pilot_run)
+
+    assert "clean_negative_control_abstention" in report.failed_checks
 
 
 def test_gate_accepts_task7_nullable_string_condition_columns(
@@ -1044,7 +1128,8 @@ def test_aggregate_all_later_track_failure_preserves_entire_prior_generation(
         (valid_pilot_run / "metrics/parts").rglob("*.parquet")
     )[0]
     frame = pd.read_parquet(controlled_part)
-    frame.loc[0, "score"] += 0.1
+    score_index = _first_finite_score_index(frame)
+    frame.loc[score_index, "score"] += 0.1
     frame.to_parquet(controlled_part, index=False)
     _refresh_job_manifest(
         valid_pilot_run,
@@ -1071,7 +1156,8 @@ def test_aggregate_all_recovers_interrupted_install_without_mixed_generation(
         (valid_pilot_run / "metrics/parts").rglob("*.parquet")
     )[0]
     frame = pd.read_parquet(controlled_part)
-    frame.loc[0, "score"] += 0.2
+    score_index = _first_finite_score_index(frame)
+    frame.loc[score_index, "score"] += 0.2
     frame.to_parquet(controlled_part, index=False)
     _refresh_job_manifest(
         valid_pilot_run,
@@ -1109,12 +1195,15 @@ def test_aggregate_all_recovers_interrupted_install_without_mixed_generation(
         valid_pilot_run / "metrics/controlled_fidelity.parquet"
     )
     changed = aggregate.loc[
-        (aggregate["job_id"] == frame.loc[0, "job_id"])
-        & (aggregate["design_id"] == frame.loc[0, "design_id"])
-        & (aggregate["variant_key"] == frame.loc[0, "variant_key"]),
+        (aggregate["job_id"] == frame.loc[score_index, "job_id"])
+        & (aggregate["design_id"] == frame.loc[score_index, "design_id"])
+        & (
+            aggregate["variant_key"]
+            == frame.loc[score_index, "variant_key"]
+        ),
         "score",
     ]
-    assert changed.tolist() == [frame.loc[0, "score"]]
+    assert changed.tolist() == [frame.loc[score_index, "score"]]
 
 
 def test_reader_resolves_one_atomic_aggregate_generation_at_pointer_switch(
@@ -1130,7 +1219,8 @@ def test_reader_resolves_one_atomic_aggregate_generation_at_pointer_switch(
         (valid_pilot_run / "metrics/parts").rglob("*.parquet")
     )[0]
     frame = pd.read_parquet(controlled_part)
-    frame.loc[0, "score"] += 0.25
+    score_index = _first_finite_score_index(frame)
+    frame.loc[score_index, "score"] += 0.25
     frame.to_parquet(controlled_part, index=False)
     _refresh_job_manifest(
         valid_pilot_run,
@@ -1170,8 +1260,9 @@ def test_aggregate_publication_retains_only_current_and_previous_generation(
         (valid_pilot_run / "metrics/parts").rglob("*.parquet")
     )[0]
     frame = pd.read_parquet(controlled_part)
+    score_index = _first_finite_score_index(frame)
     for delta in (0.31, 0.32):
-        frame.loc[0, "score"] += delta
+        frame.loc[score_index, "score"] += delta
         frame.to_parquet(controlled_part, index=False)
         _refresh_job_manifest(
             valid_pilot_run,
@@ -1276,7 +1367,8 @@ def test_single_track_aggregation_preserves_published_generation_aliases(
         (valid_pilot_run / "metrics/parts").rglob("*.parquet")
     )[0]
     frame = pd.read_parquet(controlled_part)
-    frame.loc[0, "score"] += 0.275
+    score_index = _first_finite_score_index(frame)
+    frame.loc[score_index, "score"] += 0.275
     frame.to_parquet(controlled_part, index=False)
     _refresh_job_manifest(
         valid_pilot_run,
@@ -1294,13 +1386,16 @@ def test_single_track_aggregation_preserves_published_generation_aliases(
     )
     changed = pd.read_parquet(output).loc[
         lambda rows: (
-            (rows["job_id"] == frame.loc[0, "job_id"])
-            & (rows["design_id"] == frame.loc[0, "design_id"])
-            & (rows["variant_key"] == frame.loc[0, "variant_key"])
+            (rows["job_id"] == frame.loc[score_index, "job_id"])
+            & (rows["design_id"] == frame.loc[score_index, "design_id"])
+            & (
+                rows["variant_key"]
+                == frame.loc[score_index, "variant_key"]
+            )
         ),
         "score",
     ]
-    assert changed.tolist() == [frame.loc[0, "score"]]
+    assert changed.tolist() == [frame.loc[score_index, "score"]]
 
 
 def test_aggregate_all_preview_failure_preserves_entire_prior_generation(
@@ -1319,7 +1414,8 @@ def test_aggregate_all_preview_failure_preserves_entire_prior_generation(
         (valid_pilot_run / "metrics/parts").rglob("*.parquet")
     )[0]
     frame = pd.read_parquet(controlled_part)
-    frame.loc[0, "score"] += 0.3
+    score_index = _first_finite_score_index(frame)
+    frame.loc[score_index, "score"] += 0.3
     frame.to_parquet(controlled_part, index=False)
     _refresh_job_manifest(
         valid_pilot_run,
