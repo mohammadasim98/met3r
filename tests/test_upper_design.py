@@ -31,7 +31,7 @@ def test_full_design_counts_and_clean_dedup(real_upper_manifest, frozen_config) 
     assert len(design.pair_conditions) == 1032
     assert len(design.stress_states) == 4
     assert len(design.stress_pair_conditions) == 24
-    assert len(design.feature_variants) == 93
+    assert len(design.feature_variants) == 90
     assert len({row.design_id for row in design.pair_conditions}) == 1032
     assert sum(row.corruption == "clean" for row in design.pair_conditions) == 24
 
@@ -39,8 +39,39 @@ def test_full_design_counts_and_clean_dedup(real_upper_manifest, frozen_config) 
 def test_feature_variants_adapt_the_public_legacy_enumeration(frozen_config) -> None:
     variants = feature_variants(frozen_config)
 
-    assert len(variants) == 93
+    assert len(variants) == 90
     assert variants[0].key == "user_37_grid_track__dino_vitb16__592__native__37"
+
+
+def test_dinov2_retains_bilinear_37_but_excludes_naf_37(
+    frozen_config,
+) -> None:
+    variants = [
+        item
+        for item in feature_variants(frozen_config)
+        if item.backbone == "dinov2_vitb14"
+    ]
+
+    assert [(item.feature_mode, item.resolution) for item in variants] == [
+        ("native", 42),
+        ("bilinear", 37),
+        ("bilinear", 74),
+        ("bilinear", 148),
+        ("bilinear", 296),
+        ("bilinear", 592),
+        ("naf_normal_guide", 74),
+        ("naf_normal_guide", 148),
+        ("naf_normal_guide", 296),
+        ("naf_normal_guide", 592),
+        ("naf_blurred_guide", 74),
+        ("naf_blurred_guide", 148),
+        ("naf_blurred_guide", 296),
+        ("naf_blurred_guide", 592),
+        ("naf_shuffled_guide", 74),
+        ("naf_shuffled_guide", 148),
+        ("naf_shuffled_guide", 296),
+        ("naf_shuffled_guide", 592),
+    ]
 
 
 def test_pilot_design_is_exact(real_upper_manifest, frozen_config) -> None:

@@ -53,6 +53,8 @@ def feature_variants(
                 for resolution in raw_targets:
                     if not isinstance(resolution, int):
                         raise ValueError("feature resolutions must be integers")
+                    if mode.startswith("naf_") and resolution < native_grid:
+                        continue
                     variants.append(
                         {
                             "feature_track": track_name,
