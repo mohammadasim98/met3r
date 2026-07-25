@@ -59,6 +59,10 @@ def iter_feature_variants(
                     raise ValueError(
                         f"unsupported feature mode {variant.feature_mode!r}"
                     ) from error
+                if variant.resolution < max(native.shape[-2:]):
+                    raise ValueError(
+                        "NAF target resolution must be at least the native grid"
+                    )
                 if naf is None:
                     raise ValueError("NAF feature modes require a NAF upsampler")
                 if guides is None:

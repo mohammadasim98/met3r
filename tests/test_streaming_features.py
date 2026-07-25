@@ -218,6 +218,23 @@ def test_unknown_feature_mode_is_rejected() -> None:
         )
 
 
+def test_naf_target_below_native_grid_is_rejected() -> None:
+    variant = FeatureVariant("t", "b", 8, "naf_normal_guide", 1)
+
+    with pytest.raises(
+        ValueError,
+        match="NAF target resolution must be at least the native grid",
+    ):
+        list(
+            iter_feature_variants(
+                torch.ones(4, 8, 2, 2),
+                torch.ones(4, 3, 8, 8),
+                (variant,),
+                FakeNAF(),
+            )
+        )
+
+
 def test_extract_native_preserves_existing_extractor_api() -> None:
     images = torch.rand(2, 3, 8, 8)
     extractor = MultiScaleFeatureExtractor(FakeBackbone(), naf_upsampler=FakeNAF())
