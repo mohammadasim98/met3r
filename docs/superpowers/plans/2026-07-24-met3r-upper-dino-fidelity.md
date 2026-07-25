@@ -6,7 +6,7 @@
 
 **Architecture:** A deterministic upper-view manifest expands into reusable four-view image states and pair-condition rows. GPU geometry workers persist fixed-camera DA3 depth artifacts, while one long-lived feature worker per backbone streams one feature variant at a time into the known-camera factorial metric, fixed-basis PCA renderer, and atomic Parquet result parts. A SQLite registry owns resumability; pilot gates precede the four-GPU full run; a separate analysis layer produces scale-safe backbone comparisons, geometry calibration, stress-test summaries, and the final report.
 
-**Tech Stack:** Python 3.11, PyTorch 2.8, torchvision, transformers, NAF/NATTEN, Depth Anything 3, NumPy, SciPy, Pillow, OpenCV, pandas, PyArrow, SQLite, matplotlib, pytest, Bash, NVIDIA GPUs 4–7.
+**Tech Stack:** Python 3.11, PyTorch 2.8, torchvision, transformers, NAF/NATTEN, Depth Anything 3, NumPy, SciPy, Pillow, OpenCV, pandas, PyArrow, SQLite, matplotlib, pytest, Bash, NVIDIA GPU 1 for the pilot and GPUs 4–7 for the full run.
 
 ## Global Constraints
 
@@ -15,16 +15,16 @@
 - Use only the four upper views `left`, `back`, `right`, and `front`; exclude bottom and cross-group pairs.
 - Label cameras exactly `fixed/precomputed DA3 cameras (not calibrated GT)` in generated reports.
 - Stage all 1080x1080 source/deformed RGB images and masks at 504x504 before DA3 inference; never pair 1080x1080 images with 504x504 intrinsics.
-- Use GPUs 4, 5, 6, and 7 only. Pilot uses physical GPU 4.
+- Use physical GPU 1 for the pilot. Use physical GPUs 4, 5, 6, and 7 for the full run.
 - Pin the backbone, NAF, and DA3 revisions recorded in the approved design.
 - Compute metrics at all 93 feature variants.
 - Persist PCA PNGs only at native/lowest and highest resolutions; never persist raw DINO feature arrays.
-- Use seed 42, a minimum overlap fraction of 0.10, relative depth tolerance 0.03, and confidence percentile 10.
+- Use seed 42, a minimum overlap fraction of 0.08, relative depth tolerance 0.03, and confidence percentile 10.
 - Keep controlled corruption, geometry calibration, and real-deformation stress results in separate analysis tracks.
 - Do not interpret raw metric magnitudes across backbones; compare rank endpoints or robust clean-normalized values.
 - Treat identity swap as a single full-foreground replacement condition, not a severity curve.
 - Hard-stop before the full run if projected persistent storage exceeds 300 GB.
-- The approved design is `docs/superpowers/specs/2026-07-24-met3r-upper-dino-fidelity-design.md`.
+- The base design is `docs/superpowers/specs/2026-07-24-met3r-upper-dino-fidelity-design.md`; the approved pilot revision is `docs/superpowers/specs/2026-07-24-met3r-upper-pilot-v2-design.md`.
 
 ---
 
@@ -315,9 +315,9 @@ Create `configs/upper_dino_fidelity.json` with these exact top-level values:
 
 ```json
 {
-  "experiment_id": "20260724_upper_v1",
+  "experiment_id": "20260724_upper_v2",
   "reconstruction_root": "/root/dev/ByteSize/Reconstruction",
-  "output_root": "/root/dev/ByteSize/Reconstruction/met3r_upper_experiments/20260724_upper_v1",
+  "output_root": "/root/dev/ByteSize/Reconstruction/met3r_upper_experiments/20260724_upper_v2",
   "da3_repository": "/root/dev/ByteSize/Reconstruction/third_party/Depth-Anything-3",
   "camera_label": "fixed/precomputed DA3 cameras (not calibrated GT)",
   "views": ["left", "back", "right", "front"],
@@ -325,7 +325,7 @@ Create `configs/upper_dino_fidelity.json` with these exact top-level values:
   "stage_size": 504,
   "metric": {
     "relative_depth_tolerance": 0.03,
-    "min_overlap_fraction": 0.1,
+    "min_overlap_fraction": 0.08,
     "confidence_percentile": 10.0
   },
   "persistent_storage_limit_gb": 300,
@@ -343,7 +343,7 @@ Create `configs/upper_dino_fidelity.json` with these exact top-level values:
       "air_huarache_run_ultra_111449",
       "air_max_90_surplus_cq7743_300"
     ],
-    "pairs": ["left__back", "left__right"],
+    "pairs": ["right__front", "left__right"],
     "corruptions": {
       "translation": [0.12, 0.20],
       "exposure": [0.50, 0.75],
@@ -1310,7 +1310,7 @@ result = score_multiscale_factorial(
     select_geometry(adaptive_geometry, second),
     config=KnownCameraConfig(
         relative_depth_tolerance=0.03,
-        min_overlap_fraction=0.10,
+        min_overlap_fraction=0.08,
     ),
     confidence_percentile=10.0,
 )[variant.key]
@@ -1388,7 +1388,9 @@ def test_gate_passes_complete_operational_pilot(valid_pilot_run: Path) -> None:
     report = validate_pilot(valid_pilot_run)
     assert report.passed
     assert report.expected_metric_rows == 1320
-    assert report.clean_directional_coverage >= 0.90
+    assert report.clean_primary_directional_coverage >= 0.90
+    assert report.clean_primary_pair_coverage >= 0.90
+    assert report.clean_negative_control_abstention >= 0.90
     assert report.raw_feature_artifacts == []
 
 
@@ -1421,6 +1423,9 @@ class PilotGateReport:
     expected_metric_rows: int
     actual_metric_rows: int
     clean_directional_coverage: float
+    clean_primary_directional_coverage: float
+    clean_primary_pair_coverage: float
+    clean_negative_control_abstention: float
     raw_feature_artifacts: tuple[str, ...]
     projected_total_bytes: int
 ```
@@ -1431,7 +1436,8 @@ The report must check:
 - exactly 1,320 metric rows
 - no mismatched config/input/model/provenance hashes
 - finite scores for all non-abstained rows
-- clean directional coverage at least 0.90
+- clean `right__front` directional and symmetric-pair coverage at least 0.90
+- clean `left__right` expected-abstention rate at least 0.90
 - one PCA basis fingerprint per backbone
 - a forced sentinel rerun matches design ID and metrics within
   `rtol=1e-5, atol=1e-6`
@@ -1481,7 +1487,7 @@ set -euo pipefail
 
 PYTHON=/opt/conda/envs/pixal3d/bin/python
 CONFIG=/root/dev/met3r-worktrees/known-camera-met3r/configs/upper_dino_fidelity.json
-RUN_ROOT=/root/dev/ByteSize/Reconstruction/met3r_upper_experiments/20260724_upper_v1/pilot
+RUN_ROOT=/root/dev/ByteSize/Reconstruction/met3r_upper_experiments/20260724_upper_v2/pilot
 DA3_REPO=/root/dev/ByteSize/Reconstruction/third_party/Depth-Anything-3
 
 "$PYTHON" -m met3r.upper_cli prepare "$CONFIG" --scope pilot
@@ -1490,11 +1496,11 @@ for shoe in \
   air_huarache_run_ultra_111449 \
   air_max_90_surplus_cq7743_300
 do
-  CUDA_VISIBLE_DEVICES=4 "$PYTHON" -m met3r.upper_cli geometry-worker \
+  CUDA_VISIBLE_DEVICES=1 "$PYTHON" -m met3r.upper_cli geometry-worker \
     "$RUN_ROOT" --shoe-id "$shoe" --device cuda:0 --da3-repository "$DA3_REPO"
 done
 
-CUDA_VISIBLE_DEVICES=4 "$PYTHON" -m met3r.upper_cli feature-worker \
+CUDA_VISIBLE_DEVICES=1 "$PYTHON" -m met3r.upper_cli feature-worker \
   "$RUN_ROOT" --backbone dinov3_vitl16_pixal3d --device cuda:0
 
 "$PYTHON" -m met3r.upper_cli aggregate "$RUN_ROOT"
@@ -1665,7 +1671,7 @@ set -euo pipefail
 
 PYTHON=/opt/conda/envs/pixal3d/bin/python
 CONFIG=/root/dev/met3r-worktrees/known-camera-met3r/configs/upper_dino_fidelity.json
-RUN_ROOT=/root/dev/ByteSize/Reconstruction/met3r_upper_experiments/20260724_upper_v1/full
+RUN_ROOT=/root/dev/ByteSize/Reconstruction/met3r_upper_experiments/20260724_upper_v2/full
 DA3_REPO=/root/dev/ByteSize/Reconstruction/third_party/Depth-Anything-3
 
 "$PYTHON" -m met3r.upper_cli prepare "$CONFIG" --scope full
@@ -1727,17 +1733,22 @@ run produces every named table, figure, and report.
 
 ---
 
-### Task 10: Run Full Verification and the Real GPU-4 Pilot
+### Task 10: Run Full Verification and the Real GPU-1 Pilot
 
 **Files:**
 - Verify: all source and tests
 - Produce outside git:
-  `/root/dev/ByteSize/Reconstruction/met3r_upper_experiments/20260724_upper_v1/pilot`
+  `/root/dev/ByteSize/Reconstruction/met3r_upper_experiments/20260724_upper_v2/pilot`
 
 **Interfaces:**
 - Consumes: Tasks 1–9 and cached/downloadable pinned model weights.
 - Produces: a complete real-model pilot, `pilot_gate.json`, storage projection,
   timings, PCA images, diagnostics, and 1,320 metric rows.
+
+V1 is retained at
+`/root/dev/ByteSize/Reconstruction/met3r_upper_experiments/20260724_upper_v1/pilot`
+as a failed protocol: all 1,320 rows were produced, but mixed primary/opposite
+clean directional coverage was `0.22916666666666666`. V2 never overwrites it.
 
 - [ ] **Step 1: Run the full software test suite**
 
@@ -1752,18 +1763,18 @@ Expected: all tests pass and `git diff --check` exits 0.
 - [ ] **Step 2: Verify GPUs and disk**
 
 ```bash
-nvidia-smi -i 4,5,6,7 --query-gpu=index,name,memory.total,memory.used,utilization.gpu \
+nvidia-smi -i 1 --query-gpu=index,name,memory.total,memory.used,utilization.gpu \
   --format=csv,noheader
 df -h /root/dev/ByteSize/Reconstruction
 ```
 
-Expected: GPUs 4–7 are addressable and the target filesystem has more than
+Expected: GPU 1 is addressable and the target filesystem has more than
 300 GB free.
 
 - [ ] **Step 3: Run the pilot**
 
 ```bash
-bash scripts/run_upper_pilot.sh
+PILOT_GPU=1 bash scripts/run_upper_pilot.sh
 ```
 
 Expected: exit 0. Long-running processes are monitored by polling their logs;
@@ -1776,12 +1787,14 @@ do not leave the user without a progress update for more than 60 seconds.
 import json
 from pathlib import Path
 
-root = Path("/root/dev/ByteSize/Reconstruction/met3r_upper_experiments/20260724_upper_v1/pilot")
+root = Path("/root/dev/ByteSize/Reconstruction/met3r_upper_experiments/20260724_upper_v2/pilot")
 gate = json.loads((root / "reports/pilot_gate.json").read_text())
 projection = json.loads((root / "reports/pilot_storage_projection.json").read_text())
 assert gate["passed"], gate
 assert gate["expected_metric_rows"] == 1320
-assert gate["clean_directional_coverage"] >= 0.90
+assert gate["clean_primary_directional_coverage"] >= 0.90
+assert gate["clean_primary_pair_coverage"] >= 0.90
+assert gate["clean_negative_control_abstention"] >= 0.90
 assert not gate["raw_feature_artifacts"]
 assert projection["projected_total_bytes"] <= 300 * 1024**3
 print(json.dumps({"gate": gate, "projection": projection}, indent=2))
@@ -1809,8 +1822,8 @@ pilot under the new config hash.
 
 ```bash
 git status --short
-git tag -a upper-dino-fidelity-v1-pilot-passed \
-  -m "Pilot passed for 20260724_upper_v1"
+git tag -a upper-dino-fidelity-v2-pilot-passed \
+  -m "Pilot passed for 20260724_upper_v2 on physical GPU 1"
 ```
 
 Expected: source files are clean; experiment artifacts remain outside git.
@@ -1821,7 +1834,7 @@ Expected: source files are clean; experiment artifacts remain outside git.
 
 **Files:**
 - Produce outside git:
-  `/root/dev/ByteSize/Reconstruction/met3r_upper_experiments/20260724_upper_v1/full`
+  `/root/dev/ByteSize/Reconstruction/met3r_upper_experiments/20260724_upper_v2/full`
 - Read: `scripts/run_upper_full.sh`
 
 **Interfaces:**
@@ -1837,12 +1850,12 @@ git describe --exact-match --tags HEAD
 /opt/conda/envs/pixal3d/bin/python - <<'PY'
 import json
 from pathlib import Path
-path = Path("/root/dev/ByteSize/Reconstruction/met3r_upper_experiments/20260724_upper_v1/pilot/reports/pilot_gate.json")
+path = Path("/root/dev/ByteSize/Reconstruction/met3r_upper_experiments/20260724_upper_v2/pilot/reports/pilot_gate.json")
 assert json.loads(path.read_text())["passed"]
 PY
 ```
 
-Expected: tag `upper-dino-fidelity-v1-pilot-passed` and a passing gate.
+Expected: tag `upper-dino-fidelity-v2-pilot-passed` and a passing gate.
 
 - [ ] **Step 2: Run all full phases**
 
@@ -1857,7 +1870,7 @@ one shoe per GPU; features are sharded one backbone per GPU.
 
 ```bash
 /opt/conda/envs/pixal3d/bin/python -m met3r.upper_cli status \
-  /root/dev/ByteSize/Reconstruction/met3r_upper_experiments/20260724_upper_v1/full \
+  /root/dev/ByteSize/Reconstruction/met3r_upper_experiments/20260724_upper_v2/full \
   --require-complete
 ```
 
@@ -1873,7 +1886,7 @@ Expected:
 - [ ] **Step 4: Run final aggregation and analysis idempotently**
 
 ```bash
-RUN_ROOT=/root/dev/ByteSize/Reconstruction/met3r_upper_experiments/20260724_upper_v1/full
+RUN_ROOT=/root/dev/ByteSize/Reconstruction/met3r_upper_experiments/20260724_upper_v2/full
 /opt/conda/envs/pixal3d/bin/python -m met3r.upper_cli aggregate "$RUN_ROOT"
 /opt/conda/envs/pixal3d/bin/python -m met3r.upper_cli analyze "$RUN_ROOT"
 ```
@@ -1885,7 +1898,7 @@ Expected: rerunning either command produces the same content hashes.
 ```bash
 /opt/conda/envs/pixal3d/bin/python - <<'PY'
 from pathlib import Path
-root = Path("/root/dev/ByteSize/Reconstruction/met3r_upper_experiments/20260724_upper_v1/full")
+root = Path("/root/dev/ByteSize/Reconstruction/met3r_upper_experiments/20260724_upper_v2/full")
 required = [
     "metrics/controlled_fidelity.parquet",
     "metrics/geometry_calibration.parquet",
@@ -1941,7 +1954,7 @@ tagged source commit unchanged.
 | All 16 real deformations as a separate stress test | Tasks 2–4, 7, 9 |
 | No persistent raw DINO features | Tasks 6–8, 10–11 |
 | Fixed PCA basis; lowest/highest PNG only | Tasks 6–7 |
-| GPU 4 pilot and GPU 4–7 full sharding | Tasks 8, 10–11 |
+| GPU 1 pilot and GPU 4–7 full sharding | Tasks 8, 10–11 |
 | SQLite resumability and atomic outputs | Tasks 4, 7 |
 | Pilot hard gates and 300 GB cap | Tasks 8, 10 |
 | Shoe-equal weighting, bootstrap, leave-one-out | Task 9 |
