@@ -84,7 +84,7 @@ The experiment identifier and output root become:
 - relative depth tolerance: `0.03`;
 - minimum overlap fraction: `0.08`;
 - confidence percentile: `10.0`;
-- physical pilot GPU: GPU 4;
+- physical pilot GPU: GPU 1;
 - physical full-run GPUs: GPUs 4–7.
 
 All other shoes, corruptions, backbones, feature tracks, NAF variants,
