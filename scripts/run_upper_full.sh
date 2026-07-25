@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PYTHON=/opt/conda/envs/pixal3d/bin/python
-CONFIG=/root/dev/met3r-worktrees/known-camera-met3r/configs/upper_dino_fidelity.json
-RUN_ROOT=/root/dev/ByteSize/Reconstruction/met3r_upper_experiments/20260724_upper_v2/full
-DA3_REPO=/root/dev/ByteSize/Reconstruction/third_party/Depth-Anything-3
+PYTHON=${PYTHON:-/opt/conda/envs/pixal3d/bin/python}
+CONFIG=${CONFIG:-/root/dev/met3r-worktrees/known-camera-met3r/configs/upper_dino_fidelity.json}
+RUN_ROOT=${RUN_ROOT:-/root/dev/ByteSize/Reconstruction/met3r_upper_experiments/20260724_upper_v2/full}
+DA3_REPO=${DA3_REPO:-/root/dev/ByteSize/Reconstruction/third_party/Depth-Anything-3}
+FULL_GPUS=${FULL_GPUS:-0,1,2,3}
+IFS=',' read -r -a gpus <<<"$FULL_GPUS"
 
-"$PYTHON" -m met3r.upper_cli prepare "$CONFIG" --scope full
+"$PYTHON" -m met3r.upper_cli prepare "$CONFIG" --scope full \
+  --physical-gpus "$FULL_GPUS"
 
 shoes=(
   air_huarache_run_ultra_111449
@@ -14,7 +17,6 @@ shoes=(
   air_max_90_surplus_cq7743_300
   air_tuned_max_cv6984_001
 )
-gpus=(4 5 6 7)
 pids=()
 for index in 0 1 2 3; do
   CUDA_VISIBLE_DEVICES="${gpus[$index]}" "$PYTHON" -m met3r.upper_cli geometry-worker \

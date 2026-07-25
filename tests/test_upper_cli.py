@@ -5,11 +5,50 @@ import os
 import sqlite3
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from met3r.job_registry import WorkerSummary
 from met3r.upper_cli import main
+
+
+def test_prepare_forwards_physical_gpus(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[Path, str, tuple[int, ...] | None]] = []
+
+    def fake_prepare(
+        config: Path,
+        scope: str,
+        *,
+        physical_gpus: tuple[int, ...] | None = None,
+    ) -> SimpleNamespace:
+        calls.append((config, scope, physical_gpus))
+        return SimpleNamespace(
+            root=tmp_path / scope,
+            scope=scope,
+            config_sha256="f" * 64,
+        )
+
+    monkeypatch.setattr("met3r.upper_cli.prepare_run", fake_prepare)
+    config = tmp_path / "config.json"
+
+    assert (
+        main(
+            [
+                "prepare",
+                str(config),
+                "--scope",
+                "full",
+                "--physical-gpus",
+                "0,1,2,3",
+            ]
+        )
+        == 0
+    )
+    assert calls == [(config.resolve(), "full", (0, 1, 2, 3))]
 
 
 def test_help_lists_exactly_seven_commands(capsys: pytest.CaptureFixture[str]) -> None:
@@ -186,24 +225,96 @@ def test_analyze_cli_forwards_run_root(
     assert calls == [tmp_path.resolve()]
 
 
-def test_full_launcher_maps_exact_shoes_and_backbones_to_gpus() -> None:
+def test_full_launcher_maps_exact_shoes_and_backbones_to_gpus(
+    tmp_path: Path,
+) -> None:
     text = Path("scripts/run_upper_full.sh").read_text(encoding="utf-8")
-    assert "PYTHON=/opt/conda/envs/pixal3d/bin/python" in text
-    assert "gpus=(4 5 6 7)" in text
-    for shoe in (
-        "air_huarache_run_ultra_111449",
-        "air_max_90_nrg_dc6083_500",
-        "air_max_90_surplus_cq7743_300",
-        "air_tuned_max_cv6984_001",
+    fake_python = tmp_path / "python"
+    call_log = tmp_path / "calls.log"
+    fake_python.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s|%s\\n' \"${CUDA_VISIBLE_DEVICES-}\" \"$*\" >> \"$CALL_LOG\"\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    run_root = tmp_path / "full"
+    (run_root / "logs").mkdir(parents=True)
+    config = tmp_path / "config.json"
+    da3_repository = tmp_path / "da3"
+    safe_copy = tmp_path / "run_upper_full.sh"
+    for old, new in (
+        (
+            "PYTHON=/opt/conda/envs/pixal3d/bin/python",
+            "PYTHON=${PYTHON:-/opt/conda/envs/pixal3d/bin/python}",
+        ),
+        (
+            "CONFIG=/root/dev/met3r-worktrees/known-camera-met3r/"
+            "configs/upper_dino_fidelity.json",
+            "CONFIG=${CONFIG:-/root/dev/met3r-worktrees/known-camera-met3r/"
+            "configs/upper_dino_fidelity.json}",
+        ),
+        (
+            "RUN_ROOT=/root/dev/ByteSize/Reconstruction/"
+            "met3r_upper_experiments/20260724_upper_v2/full",
+            "RUN_ROOT=${RUN_ROOT:-/root/dev/ByteSize/Reconstruction/"
+            "met3r_upper_experiments/20260724_upper_v2/full}",
+        ),
+        (
+            "DA3_REPO=/root/dev/ByteSize/Reconstruction/third_party/"
+            "Depth-Anything-3",
+            "DA3_REPO=${DA3_REPO:-/root/dev/ByteSize/Reconstruction/"
+            "third_party/Depth-Anything-3}",
+        ),
     ):
-        assert shoe in text
-    for backbone in (
-        "dino_vitb16",
-        "dinov2_vitb14",
-        "dinov3_vitb16",
-        "dinov3_vitl16_pixal3d",
-    ):
-        assert backbone in text
-    assert text.count('test "$status" -eq 0') == 2
-    assert "met3r.upper_cli aggregate" in text
-    assert "met3r.upper_cli analyze" in text
+        text = text.replace(old, new)
+    safe_copy.write_text(text, encoding="utf-8")
+    environment = os.environ.copy()
+    environment.update(
+        PYTHON=str(fake_python),
+        CONFIG=str(config),
+        RUN_ROOT=str(run_root),
+        DA3_REPO=str(da3_repository),
+        FULL_GPUS="0,1,2,3",
+        CALL_LOG=str(call_log),
+    )
+
+    subprocess.run(
+        ["bash", str(safe_copy)],
+        cwd=Path.cwd(),
+        env=environment,
+        check=True,
+    )
+
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    prepare_calls = [
+        line for line in calls if " met3r.upper_cli prepare " in f" {line} "
+    ]
+    assert len(prepare_calls) == 1
+    assert (
+        f"prepare {config} --scope full --physical-gpus 0,1,2,3"
+        in prepare_calls[0]
+    )
+    geometry = {}
+    features = {}
+    for line in calls:
+        gpu, arguments = line.split("|", 1)
+        tokens = arguments.split()
+        if "geometry-worker" in tokens:
+            geometry[tokens[tokens.index("--shoe-id") + 1]] = gpu
+        if "feature-worker" in tokens:
+            features[tokens[tokens.index("--backbone") + 1]] = gpu
+    assert geometry == {
+        "air_huarache_run_ultra_111449": "0",
+        "air_max_90_nrg_dc6083_500": "1",
+        "air_max_90_surplus_cq7743_300": "2",
+        "air_tuned_max_cv6984_001": "3",
+    }
+    assert features == {
+        "dino_vitb16": "0",
+        "dinov2_vitb14": "1",
+        "dinov3_vitb16": "2",
+        "dinov3_vitl16_pixal3d": "3",
+    }
+    assert sum(" met3r.upper_cli aggregate " in f" {line} " for line in calls) == 1
+    assert sum(" met3r.upper_cli analyze " in f" {line} " for line in calls) == 1
+    assert not any("bottom" in line.lower() for line in calls)

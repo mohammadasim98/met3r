@@ -24,6 +24,15 @@ def _resolved(value: str) -> Path:
     return Path(value).expanduser().resolve()
 
 
+def _gpu_indices(value: str) -> tuple[int, ...]:
+    try:
+        return tuple(int(item) for item in value.split(","))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "physical GPUs must be comma-separated integers"
+        ) from error
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="met3r-upper-experiment",
@@ -34,6 +43,7 @@ def _parser() -> argparse.ArgumentParser:
     prepare = commands.add_parser("prepare", help="prepare an immutable run tree")
     prepare.add_argument("config", type=_resolved)
     prepare.add_argument("--scope", choices=("pilot", "full"), required=True)
+    prepare.add_argument("--physical-gpus", type=_gpu_indices)
 
     geometry = commands.add_parser(
         "geometry-worker", help="run one shoe's long-lived DA3 worker"
@@ -114,7 +124,11 @@ def _status(run_root: Path) -> tuple[dict[str, dict[str, int]], bool]:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "prepare":
-        prepared = prepare_run(args.config, args.scope)
+        prepared = prepare_run(
+            args.config,
+            args.scope,
+            physical_gpus=args.physical_gpus,
+        )
         print(
             json.dumps(
                 {
