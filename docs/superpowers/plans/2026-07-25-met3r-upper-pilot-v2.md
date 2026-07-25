@@ -349,7 +349,7 @@ aggregation succeeds, and analysis exits 0.
 
 - [ ] **Step 3: Verify counts and deliverables**
 
-Require 95,976 controlled rows, 75,888 geometry-calibration rows, 2,232
+Require 92,880 controlled rows, 73,440 geometry-calibration rows, 2,160
 stress rows, zero failed jobs, zero invalid output hashes, and zero raw
 feature artifacts. Rerun aggregate/analyze and require identical content
 hashes.
@@ -360,4 +360,3 @@ Confirm that the report separates visibility, feature, adaptive geometry,
 interaction, and known perturbation evidence; compares backbone
 discrimination rather than raw magnitudes; and states upper-only,
 four-shoe, and non-GT-camera limitations.
-

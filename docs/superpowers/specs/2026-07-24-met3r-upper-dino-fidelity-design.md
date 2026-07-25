@@ -270,14 +270,16 @@ Two resolution tracks remain separate:
    - Pixal3D DINOv3-L: 512-pixel input, 32x32 native grid
    - explicit targets: 128 and 512
 
-For each explicit target, compute:
+For each explicit target, compute bilinear interpolation, including DINOv2
+native `42x42` downsampled to the common lowest `37x37` grid. Compute NAF
+variants only when the target is at least the backbone's native grid, so the
+three DINOv2 NAF modes start at `74x74`:
 
-- bilinear interpolation
 - NAF with the normal RGB guide
 - NAF with a blurred guide
 - NAF with a spatially shuffled guide
 
-Never label an interpolated or NAF output as native. The design contains 93
+Never label an interpolated or NAF output as native. The design contains 90
 feature variants in total.
 
 ## 6. Metric and Data Contracts
@@ -407,7 +409,7 @@ Expected controlled-fidelity scale:
 - 48 directed corruption placements
 - 21 non-clean changed conditions per placement
 - 1,032 pair-condition cells after clean deduplication
-- 95,976 metric rows across 93 feature variants
+- 92,880 metric rows across 90 feature variants
 
 Adaptive DA3 artifacts are deduplicated by shoe, changed view, corruption, and
 strength. The expected controlled set is four clean four-view geometries plus
@@ -513,7 +515,7 @@ Before the pilot:
 - Unit-test identity-swap donor mapping, foreground replacement, and mask
   propagation.
 - Unit-test four-cell common-support attribution.
-- Unit-test feature-variant enumeration and exact count 93.
+- Unit-test feature-variant enumeration and exact count 90.
 - Unit-test shared fixed PCA basis and global display bounds.
 - Unit-test raw-feature cleanup and persistent-output allowlist.
 - Unit-test SQLite claiming, atomic completion, resume, and failed-job behavior.

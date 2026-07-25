@@ -17,7 +17,7 @@
 - Stage all 1080x1080 source/deformed RGB images and masks at 504x504 before DA3 inference; never pair 1080x1080 images with 504x504 intrinsics.
 - Use physical GPU 1 for the pilot. Use physical GPUs 4, 5, 6, and 7 for the full run.
 - Pin the backbone, NAF, and DA3 revisions recorded in the approved design.
-- Compute metrics at all 93 feature variants.
+- Compute metrics at all 90 valid feature variants.
 - Persist PCA PNGs only at native/lowest and highest resolutions; never persist raw DINO feature arrays.
 - Use seed 42, a minimum overlap fraction of 0.08, relative depth tolerance 0.03, and confidence percentile 10.
 - Keep controlled corruption, geometry calibration, and real-deformation stress results in separate analysis tracks.
@@ -448,7 +448,7 @@ git commit -m "feat: define upper-view experiment inputs"
   - `feature_variants(config) -> tuple[FeatureVariant, ...]`
   - `build_upper_design(manifest, config, scope: Literal["pilot", "full"]) -> UpperDesign`
   - `materialize_image_state(state, manifest, output_dir, stage_size=504) -> MaterializedState`
-  - exactly 336 changed full states, 1,032 full pair cells, 44 pilot pair cells, and 93 full feature variants.
+  - exactly 336 changed full states, 1,032 full pair cells, 44 pilot pair cells, and 90 full feature variants.
 
 - [ ] **Step 1: Write failing count, balance, donor, and materialization tests**
 
@@ -665,7 +665,7 @@ transform, seed, donor, and stage size.
   tests/test_upper_design.py tests/test_upper_materialize.py -q
 ```
 
-Expected: all tests pass; the exact counts are 336, 1,032, 44, and 93.
+Expected: all tests pass; the exact counts are 336, 1,032, 44, and 90.
 
 - [ ] **Step 8: Commit**
 
@@ -1876,7 +1876,9 @@ one shoe per GPU; features are sharded one backbone per GPU.
 
 Expected:
 
-- controlled fidelity: 95,976 rows
+- controlled fidelity: 92,880 rows
+- geometry calibration: 73,440 rows
+- real-deformation stress: 2,160 rows
 - failed jobs: 0
 - invalid completed output hashes: 0
 - raw DINO feature artifacts: 0
@@ -1947,7 +1949,7 @@ tagged source commit unchanged.
 | --- | --- |
 | Four shoes, upper four views, no bottom | Tasks 2–3 |
 | 1,032 pair conditions and both changed-view placements | Task 3 |
-| DINO/DINOv2/DINOv3/Pixal3D-L and 93 variants | Tasks 2–3, 6–7 |
+| DINO/DINOv2/DINOv3/Pixal3D-L and 90 variants | Tasks 2–3, 6–7 |
 | Fixed/precomputed DA3 camera wording and camera contract | Tasks 2, 5, 9 |
 | Four-cell feature/depth attribution | Task 7 |
 | Controlled pose/depth calibration | Tasks 5, 7, 9 |

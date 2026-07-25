@@ -325,8 +325,8 @@ assert policy["allow_phase_overlap"] is False
 
 - [ ] **Step 5: Verify experiment deliverables**
 
-Run status with `--require-complete`. Require 95,976 controlled rows, 75,888
-geometry-calibration rows, 2,232 stress rows, zero failed jobs, zero invalid
+Run status with `--require-complete`. Require 92,880 controlled rows, 73,440
+geometry-calibration rows, 2,160 stress rows, zero failed jobs, zero invalid
 output hashes, and zero raw feature artifacts. Rerun aggregate and analysis
 and require identical content hashes.
 
