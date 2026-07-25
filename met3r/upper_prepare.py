@@ -108,7 +108,7 @@ def _physical_gpu_policy(config: Mapping[str, object]) -> dict[str, object]:
         raise ValueError("physical_gpus must be exactly [4, 5, 6, 7]")
     return {
         "physical_gpus": list(raw_gpus),
-        "pilot_gpu": 4,
+        "pilot_gpu": 1,
         "geometry_assignments": {
             shoe_id: gpu for shoe_id, gpu in zip(EXPECTED_SHOES, raw_gpus)
         },

@@ -109,7 +109,7 @@ def test_prepare_records_provenance_and_exact_gpu_policy(tmp_path: Path) -> None
     assert payload["python_version"]
     assert payload["package_versions"]
     assert payload["physical_gpu_policy"]["physical_gpus"] == [4, 5, 6, 7]
-    assert payload["physical_gpu_policy"]["pilot_gpu"] == 4
+    assert payload["physical_gpu_policy"]["pilot_gpu"] == 1
     assert payload["physical_gpu_policy"]["feature_assignments"] == {
         "dino_vitb16": 4,
         "dinov2_vitb14": 5,
