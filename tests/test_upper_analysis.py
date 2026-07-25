@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import met3r.upper_analysis as upper_analysis
 from met3r.upper_analysis import (
     FIGURE_FILENAMES,
     TABLE_FILENAMES,
@@ -335,6 +336,95 @@ def test_resolution_and_all_naf_contrasts_include_validity_endpoints() -> None:
     }
 
 
+def test_severity_curve_weights_placements_pairs_and_shoes_equally() -> None:
+    clean = pd.DataFrame(
+        [
+            {
+                **VARIANT,
+                "shoe_id": f"clean-{index}",
+                "pair_id": "left__back",
+                "changed_view": None,
+                "corruption": "clean",
+                "severity": 0.0,
+                "s00": value,
+                "s10": value,
+                "s01": value,
+                "s11": value,
+                "abstained": False,
+            }
+            for index, value in enumerate((-1.0, 0.0, 1.0))
+        ]
+    )
+    corrupt = pd.DataFrame(
+        [
+            {
+                **VARIANT,
+                "shoe_id": shoe,
+                "pair_id": pair,
+                "changed_view": "left",
+                "corruption": "blur",
+                "severity": 0.2,
+                "s00": 0.0,
+                "s10": effect,
+                "s01": 0.0,
+                "s11": effect,
+                "abstained": False,
+            }
+            for shoe, pair, effect, repeats in (
+                ("a", "left__back", 0.0, 10),
+                ("a", "left__right", 2.0, 1),
+                ("b", "left__back", 10.0, 1),
+            )
+            for _ in range(repeats)
+        ]
+    )
+
+    curve = upper_analysis._severity_curve_rows(
+        pd.concat([clean, corrupt], ignore_index=True)
+    )
+    row = curve.query("corruption == 'blur' and severity == 0.2").iloc[0]
+
+    assert row["n_shoes"] == 2
+    assert row["normalized_delta"] == pytest.approx(5.5 / 1.4826)
+
+
+def test_semantic_plot_groups_never_connect_distinct_variants() -> None:
+    frame = pd.DataFrame(
+        [
+            {
+                **VARIANT,
+                "corruption": "blur",
+                "severity": severity,
+                "normalized_delta": severity,
+            }
+            for severity in (0.0, 0.5)
+        ]
+        + [
+            {
+                **VARIANT,
+                "feature_mode": "bilinear",
+                "resolution": 74,
+                "corruption": "blur",
+                "severity": severity,
+                "normalized_delta": severity + 1,
+            }
+            for severity in (0.0, 0.5)
+        ]
+    )
+
+    groups = upper_analysis._semantic_plot_groups(
+        frame,
+        x="severity",
+        group_columns=(*upper_analysis.VARIANT_COLUMNS, "corruption"),
+    )
+
+    assert len(groups) == 2
+    for label, rows in groups:
+        assert rows[list(VARIANT)].drop_duplicates().shape[0] == 1
+        assert "feature_mode=" in label
+        assert "resolution=" in label
+
+
 def test_analyze_upper_run_writes_complete_named_snapshot(tmp_path: Path) -> None:
     generation = tmp_path / "metrics" / "aggregate_generations" / "generation"
     generation.mkdir(parents=True)
@@ -379,6 +469,7 @@ def test_analyze_upper_run_writes_complete_named_snapshot(tmp_path: Path) -> Non
     assert "clean_corrupt_auc_normal_minus_comparator_ci_low" in naf
     expected_valid_counts = {
         "controlled_fidelity.csv": "severity_spearman_n_shoes_valid",
+        "severity_curves.csv": "normalized_delta_n_shoes_valid",
         "backbone_comparison.csv": "severity_spearman_n_shoes_valid",
         "resolution_utility.csv": (
             "coverage_difference_from_native_n_shoes_valid"

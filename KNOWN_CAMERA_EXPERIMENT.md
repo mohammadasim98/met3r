@@ -352,6 +352,10 @@ not an average of rowwise shares. Geometry-envelope crossings use linear
 interpolation on a monotone absolute-effect envelope; missing, abstained, and
 out-of-range calibration curves remain explicit censored cells. Stress-test
 fit relations use one mutually exclusive joint two-view stratum per row.
+The explicit `severity_curves.csv`/Parquet table uses the same
+placement-to-pair-to-shoe hierarchy. Every primary figure partitions lines by
+the complete compatible backbone/track/mode/resolution/corruption identity, so
+unrelated variants are never connected by one plotted line.
 
 ## Decision rule for the reliability module
 

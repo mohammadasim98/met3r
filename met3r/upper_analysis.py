@@ -47,6 +47,7 @@ CALIBRATION_KINDS = (
 )
 TABLE_FILENAMES = (
     "controlled_fidelity.csv",
+    "severity_curves.csv",
     "backbone_comparison.csv",
     "resolution_utility.csv",
     "naf_guide_ablation.csv",
@@ -1252,7 +1253,7 @@ def _plot(
     *,
     x: str | None,
     y: str | None,
-    group: str | None,
+    group: str | Sequence[str] | None,
     title: str,
 ) -> None:
     import matplotlib
@@ -1271,21 +1272,55 @@ def _plot(
         if x is None or x not in plotted:
             plotted["_x"] = np.arange(len(plotted))
             x = "_x"
-        iterator = (
-            plotted.groupby(group, dropna=False, sort=True)
-            if group and group in plotted
-            else [("estimate", plotted)]
+        raw_x = plotted[x]
+        numeric_x = pd.to_numeric(raw_x, errors="coerce")
+        categorical = bool(raw_x.notna().any() and numeric_x.isna().any())
+        category_labels: list[str] = []
+        if categorical:
+            category_labels = sorted(str(value) for value in raw_x.dropna().unique())
+            category_positions = {
+                label: index for index, label in enumerate(category_labels)
+            }
+            plotted["_plot_x"] = raw_x.astype(str).map(category_positions)
+        else:
+            plotted["_plot_x"] = numeric_x
+        group_columns = (
+            (group,)
+            if isinstance(group, str)
+            else tuple(group)
+            if group
+            else ()
         )
+        iterator = _semantic_plot_groups(
+            plotted,
+            x=x,
+            group_columns=group_columns,
+        )
+        line_count = 0
         for label, rows in iterator:
-            rows = rows.sort_values(x)
+            rows = rows.sort_values("_plot_x")
             axis.plot(
-                pd.to_numeric(rows[x], errors="coerce"),
+                rows["_plot_x"],
                 pd.to_numeric(rows[y], errors="coerce"),
                 marker="o",
                 label=str(label),
+                alpha=0.8,
             )
-        if group and group in plotted:
+            line_count += 1
+        if categorical:
+            axis.set_xticks(range(len(category_labels)), category_labels, rotation=20)
+        if group_columns and line_count <= 20:
             axis.legend(fontsize=7)
+        elif line_count > 20:
+            axis.text(
+                0.99,
+                0.01,
+                f"{line_count} separate semantic groups",
+                ha="right",
+                va="bottom",
+                fontsize=7,
+                transform=axis.transAxes,
+            )
     else:
         axis.text(
             0.5,
@@ -1306,6 +1341,29 @@ def _plot(
     plt.close(figure)
 
 
+def _semantic_plot_groups(
+    frame: pd.DataFrame,
+    *,
+    x: str,
+    group_columns: Sequence[str],
+) -> tuple[tuple[str, pd.DataFrame], ...]:
+    columns = [
+        column
+        for column in group_columns
+        if column != x and column in frame.columns
+    ]
+    if not columns:
+        return (("estimate", frame),)
+    groups: list[tuple[str, pd.DataFrame]] = []
+    for key, rows in frame.groupby(columns, dropna=False, sort=True):
+        values = key if isinstance(key, tuple) else (key,)
+        label = " / ".join(
+            f"{column}={value}" for column, value in zip(columns, values)
+        )
+        groups.append((label, rows))
+    return tuple(groups)
+
+
 def _severity_curve_rows(frame: pd.DataFrame) -> pd.DataFrame:
     prepared = _controlled_with_zero(frame)
     valid = prepared[
@@ -1313,15 +1371,44 @@ def _severity_curve_rows(frame: pd.DataFrame) -> pd.DataFrame:
         .fillna(True)
         .astype(bool)
     ]
-    return (
+    groups = [*VARIANT_COLUMNS, "corruption", "severity"]
+    placement = (
         valid.groupby(
-            [*VARIANT_COLUMNS, "corruption", "severity"],
+            [*groups, "shoe_id", "pair_id", "changed_view"],
             dropna=False,
             sort=True,
         )["normalized_delta"]
         .mean()
         .reset_index()
     )
+    pairs = (
+        placement.groupby(
+            [*groups, "shoe_id", "pair_id"],
+            dropna=False,
+            sort=True,
+        )["normalized_delta"]
+        .mean()
+        .reset_index()
+    )
+    shoes = (
+        pairs.groupby(
+            [*groups, "shoe_id"],
+            dropna=False,
+            sort=True,
+        )["normalized_delta"]
+        .mean()
+        .reset_index()
+    )
+    summary = (
+        shoes.groupby(groups, dropna=False, sort=True)
+        .agg(
+            normalized_delta=("normalized_delta", "mean"),
+            normalized_delta_n_shoes_valid=("normalized_delta", "count"),
+        )
+        .reset_index()
+    )
+    summary["n_shoes"] = summary["normalized_delta_n_shoes_valid"]
+    return summary
 
 
 def _write_tables(tables_dir: Path, frames: Mapping[str, pd.DataFrame]) -> None:
@@ -1354,6 +1441,10 @@ def _write_report(
                 "accuracy without a severity Spearman endpoint. Continuous "
                 "corruptions use within-pair severity ranks. Exposure, blur, "
                 "and JPEG retain signed and absolute clean-normalized effects.",
+                "Severity-curve points first average changed-view placements "
+                "within pair, then pairs within shoe, then shoes equally. "
+                "Every plotted line keeps the complete compatible semantic "
+                "variant identity.",
                 f"This track produced {len(controlled)} endpoint rows.",
                 "",
                 "## Geometry calibration track",
@@ -1456,9 +1547,11 @@ def analyze_upper_run(
         bootstrap_repeats=bootstrap_repeats,
         seed=seed,
     )
+    severity = _severity_curve_rows(controlled_raw)
     loso = _leave_one_shoe_out(controlled_raw, calibration_raw, stress_raw)
     frames = {
         "controlled_fidelity.csv": controlled,
+        "severity_curves.csv": severity,
         "backbone_comparison.csv": _backbone_comparison(controlled),
         "resolution_utility.csv": resolution,
         "naf_guide_ablation.csv": naf,
@@ -1478,9 +1571,15 @@ def analyze_upper_run(
         tables_dir.mkdir(parents=True, exist_ok=True)
         figures_dir.mkdir(parents=True, exist_ok=True)
         _write_tables(tables_dir, frames)
-        severity = _severity_curve_rows(controlled_raw)
         plot_specs: tuple[
-            tuple[str, pd.DataFrame, str | None, str | None, str | None, str],
+            tuple[
+                str,
+                pd.DataFrame,
+                str | None,
+                str | None,
+                tuple[str, ...] | None,
+                str,
+            ],
             ...,
         ] = (
             (
@@ -1488,7 +1587,13 @@ def analyze_upper_run(
                 resolution,
                 "resolution",
                 "severity_spearman_difference_from_native",
-                "backbone",
+                (
+                    "backbone",
+                    "feature_track",
+                    "feature_mode",
+                    "corruption",
+                    "native_resolution",
+                ),
                 "Resolution utility",
             ),
             (
@@ -1496,23 +1601,23 @@ def analyze_upper_run(
                 severity,
                 "severity",
                 "normalized_delta",
-                "corruption",
+                (*VARIANT_COLUMNS, "corruption"),
                 "Controlled severity curves",
             ),
             (
                 "backbone_discrimination.png",
                 controlled,
-                "resolution",
-                "clean_corrupt_auc",
                 "backbone",
+                "clean_corrupt_auc",
+                ("feature_track", "feature_mode", "resolution", "corruption"),
                 "Backbone discrimination",
             ),
             (
                 "naf_guide_ablation.png",
                 naf,
-                "resolution",
-                "pairwise_rank_accuracy_normal_minus_comparator",
                 "comparator",
+                "pairwise_rank_accuracy_normal_minus_comparator",
+                ("backbone", "feature_track", "resolution", "corruption"),
                 "NAF guide ablation",
             ),
             (
@@ -1520,15 +1625,21 @@ def analyze_upper_run(
                 attribution,
                 "resolution",
                 "absolute_feature_share",
-                "backbone",
+                ("backbone", "feature_track", "feature_mode", "corruption"),
                 "Feature and geometry attribution",
             ),
             (
                 "geometry_calibration.png",
                 geometry,
-                "matched_magnitude",
-                "envelope_coverage",
-                "perturbation_kind",
+                "resolution",
+                "matched_magnitude_effective",
+                (
+                    "backbone",
+                    "feature_track",
+                    "feature_mode",
+                    "corruption",
+                    "perturbation_kind",
+                ),
                 "Geometry perturbation envelope",
             ),
             (
@@ -1536,7 +1647,7 @@ def analyze_upper_run(
                 stress,
                 "resolution",
                 "metric_delta",
-                "stratum",
+                ("backbone", "feature_track", "feature_mode", "stratum"),
                 "Real-deformation stress",
             ),
             (
@@ -1544,7 +1655,7 @@ def analyze_upper_run(
                 controlled,
                 "resolution",
                 "coverage",
-                "backbone",
+                ("backbone", "feature_track", "feature_mode", "corruption"),
                 "Directional coverage and abstention",
             ),
         )

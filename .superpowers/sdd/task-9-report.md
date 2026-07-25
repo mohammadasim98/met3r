@@ -83,9 +83,9 @@ intervals:
 - Resolution and NAF contrasts are paired within shoe before aggregation and
   bootstrap. The NAF normal guide is compared separately with bilinear,
   blurred-guide, and shuffled-guide endpoints.
-- Geometry calibration finds the minimum known perturbation magnitude whose
-  absolute geometry effect reaches each observed absolute feature effect and
-  reports envelope coverage.
+- Geometry calibration reports the interpolated first crossing of the
+  monotone absolute-effect envelope, with raw/effective units and explicit
+  coverage and censoring.
 - Real deformations remain a separate track with `all`,
   `both_camera_preserved`, `both_semantic_gate`,
   `both_preservation_gate`, and fit-relation strata.
@@ -108,6 +108,7 @@ The synthetic output audit generated all named deliverables:
 
 ```text
 reports/tables/controlled_fidelity.csv
+reports/tables/severity_curves.csv
 reports/tables/backbone_comparison.csv
 reports/tables/resolution_utility.csv
 reports/tables/naf_guide_ablation.csv
@@ -316,3 +317,79 @@ The remediation preserves the exact limitation label
 `fixed/precomputed DA3 cameras (not calibrated GT)`, upper-only/four-shoe
 scope, descriptive-interval wording, and separate controlled, calibration,
 and stress tracks.
+
+---
+
+## Figure review remediation: hierarchical curves and semantic grouping
+
+The next cumulative review found that the severity figure still averaged raw
+rows and that every line grouping was too coarse to prevent unrelated feature
+variants from being connected. It also requested removal of the obsolete
+grid-snapping description.
+
+### Figure review RED and GREEN
+
+Two focused regressions were written first. One constructs unequal numbers of
+rows per pair and shoe; the other constructs two feature variants at the same
+severities and inspects the semantic plot partitions.
+
+```text
+/opt/conda/envs/pixal3d/bin/python -m pytest \
+  tests/test_upper_analysis.py::test_severity_curve_weights_placements_pairs_and_shoes_equally \
+  tests/test_upper_analysis.py::test_semantic_plot_groups_never_connect_distinct_variants -q
+
+2 failed in 3.14s
+```
+
+The failures showed that the old severity table lacked `n_shoes` and that no
+full-identity semantic grouping boundary existed.
+
+After implementation:
+
+```text
+2 passed in 3.21s
+all Task 9 analysis tests: 13 passed in 12.92s
+```
+
+### Figure corrections
+
+- Added an explicit `severity_curves.csv` and matching Parquet table. It is
+  keyed by full backbone/track/mode/resolution identity, corruption, and
+  severity. Values average changed-view placements within pair, pairs within
+  shoe, then shoes equally, and retain the valid-shoe count.
+- Severity curves use the complete feature identity plus corruption.
+- Resolution utility holds backbone, track, mode, corruption, and native
+  resolution fixed while resolution is the x axis.
+- NAF compares the categorical normal-guide comparator at fixed backbone,
+  track, resolution, and corruption.
+- Backbone discrimination compares categorical backbones only at fixed track,
+  mode, resolution, and corruption.
+- Attribution holds backbone, track, mode, and corruption fixed across
+  resolution.
+- Geometry calibration holds backbone, track, mode, corruption, and
+  perturbation kind fixed across resolution, preventing mixed-unit lines.
+- Stress and coverage likewise retain their complete compatible semantic
+  identities.
+- Figures with at most 20 semantic groups show the complete labels. Denser
+  figures omit the unreadable legend and annotate the number of separately
+  plotted groups.
+- Report wording now describes an interpolated first crossing on the monotone
+  absolute-effect envelope, with raw/effective units and censoring.
+
+### Figure review cumulative verification
+
+```text
+focused legacy analysis, Task 9, and CLI:
+  26 passed in 20.43s
+relevant Task 7-9 integration:
+  81 passed in 84.55s (0:01:24)
+fresh full suite:
+  239 passed in 170.96s (0:02:50)
+bash syntax, all seven command helps, compileall, and git diff check:
+  exit 0
+```
+
+All figures remained nonempty in the atomic synthetic-output audit. The camera
+limitation, upper-only/four-shoe scope, descriptive intervals, primary
+`s10 - s00`, adaptive `s11` secondary, and separate analysis tracks are
+unchanged.
