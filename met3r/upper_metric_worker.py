@@ -175,9 +175,9 @@ def _load_run_contract(root: Path, backbone: str) -> _RunContract:
     if (
         not isinstance(overlap, (int, float))
         or isinstance(overlap, bool)
-        or float(overlap) != 0.10
+        or float(overlap) != 0.08
     ):
-        raise ValueError("min_overlap_fraction must be exactly 0.10")
+        raise ValueError("min_overlap_fraction must be exactly 0.08")
     if (
         not isinstance(percentile, (int, float))
         or isinstance(percentile, bool)

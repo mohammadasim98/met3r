@@ -226,7 +226,7 @@ def _make_run(
         "stage_size": 504,
         "metric": {
             "relative_depth_tolerance": 0.03,
-            "min_overlap_fraction": 0.10,
+            "min_overlap_fraction": 0.08,
             "confidence_percentile": 10.0,
         },
         "models": {
