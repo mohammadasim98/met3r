@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import shutil
 import tempfile
@@ -1341,6 +1342,117 @@ def _plot(
     plt.close(figure)
 
 
+def _build_panel_figure(
+    frame: pd.DataFrame,
+    *,
+    panel_column: str,
+    panel_order: Sequence[str],
+    x: str,
+    y: str,
+    group_columns: Sequence[str],
+    title: str,
+    y_labels: Mapping[str, str],
+):
+    import matplotlib.pyplot as plt
+
+    panels = tuple(str(value) for value in panel_order)
+    if not panels:
+        raise ValueError("panel_order must not be empty")
+    columns = 1 if len(panels) == 1 else 2
+    rows_count = int(math.ceil(len(panels) / columns))
+    figure, axes_grid = plt.subplots(
+        rows_count,
+        columns,
+        figsize=(7 * columns, 4.5 * rows_count),
+        sharey=False,
+        squeeze=False,
+    )
+    axes = list(axes_grid.flat)
+    for axis, panel in zip(axes, panels):
+        selected = (
+            frame[frame[panel_column].astype("string") == panel].copy()
+            if panel_column in frame
+            else pd.DataFrame()
+        )
+        line_count = 0
+        if not selected.empty and y in selected:
+            for label, values in _semantic_plot_groups(
+                selected,
+                x=x,
+                group_columns=group_columns,
+            ):
+                values = values.sort_values(x)
+                axis.plot(
+                    pd.to_numeric(values[x], errors="coerce"),
+                    pd.to_numeric(values[y], errors="coerce"),
+                    marker="o",
+                    alpha=0.8,
+                    label=label,
+                )
+                line_count += 1
+        else:
+            axis.text(
+                0.5,
+                0.5,
+                "No estimable observations",
+                ha="center",
+                va="center",
+                transform=axis.transAxes,
+            )
+        axis.set_title(panel)
+        axis.set_xlabel(x)
+        axis.set_ylabel(y_labels[panel])
+        axis.grid(alpha=0.25)
+        if 0 < line_count <= 12:
+            axis.legend(fontsize=6)
+        elif line_count > 12:
+            axis.text(
+                0.99,
+                0.01,
+                f"{line_count} separate semantic groups",
+                ha="right",
+                va="bottom",
+                fontsize=6,
+                transform=axis.transAxes,
+            )
+    for axis in axes[len(panels) :]:
+        figure.delaxes(axis)
+    figure.suptitle(title)
+    figure.tight_layout(rect=(0, 0, 1, 0.97))
+    return figure
+
+
+def _plot_panels(
+    frame: pd.DataFrame,
+    destination: Path,
+    *,
+    panel_column: str,
+    panel_order: Sequence[str],
+    x: str,
+    y: str,
+    group_columns: Sequence[str],
+    title: str,
+    y_labels: Mapping[str, str],
+) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    figure = _build_panel_figure(
+        frame,
+        panel_column=panel_column,
+        panel_order=panel_order,
+        x=x,
+        y=y,
+        group_columns=group_columns,
+        title=title,
+        y_labels=y_labels,
+    )
+    figure.savefig(destination, dpi=180)
+    plt.close(figure)
+
+
 def _semantic_plot_groups(
     frame: pd.DataFrame,
     *,
@@ -1455,6 +1567,8 @@ def _write_report(
                 "separately. Geometry-envelope crossings are interpolated on "
                 "a monotone absolute-effect envelope; missing, abstained, or "
                 "out-of-range curves remain explicitly censored.",
+                "The geometry figure uses one independent panel and explicit "
+                "effective unit for each perturbation kind.",
                 "Absolute feature share is the ratio of separately "
                 "hierarchically weighted absolute feature and geometry "
                 "effects, not an average of rowwise ratios.",
@@ -1464,6 +1578,9 @@ def _write_report(
                 "The real deformations are a separate stress test with all, "
                 "camera-preservation, semantic-gate, preservation-gate, and "
                 "mutually exclusive joint two-view fit-relation strata.",
+                "The stress figure uses independent backbone panels. Raw "
+                "metric deltas are interpretable only within a backbone and "
+                "must not be compared across panel y scales.",
                 f"This track produced {len(stress)} stratum rows.",
                 "",
                 "## Scope",
@@ -1629,28 +1746,6 @@ def analyze_upper_run(
                 "Feature and geometry attribution",
             ),
             (
-                "geometry_calibration.png",
-                geometry,
-                "resolution",
-                "matched_magnitude_effective",
-                (
-                    "backbone",
-                    "feature_track",
-                    "feature_mode",
-                    "corruption",
-                    "perturbation_kind",
-                ),
-                "Geometry perturbation envelope",
-            ),
-            (
-                "real_deformation_stress.png",
-                stress,
-                "resolution",
-                "metric_delta",
-                ("backbone", "feature_track", "feature_mode", "stratum"),
-                "Real-deformation stress",
-            ),
-            (
                 "coverage.png",
                 controlled,
                 "resolution",
@@ -1668,6 +1763,48 @@ def analyze_upper_run(
                 group=group,
                 title=title,
             )
+        _plot_panels(
+            geometry,
+            figures_dir / "geometry_calibration.png",
+            panel_column="perturbation_kind",
+            panel_order=CALIBRATION_KINDS,
+            x="resolution",
+            y="matched_magnitude_effective",
+            group_columns=(
+                "backbone",
+                "feature_track",
+                "feature_mode",
+                "corruption",
+            ),
+            title="Geometry perturbation envelope",
+            y_labels={
+                "rotation": "Effective rotation (degrees)",
+                "relative_translation": (
+                    "Effective translation (camera-radius fraction)"
+                ),
+                "depth_scale": "Effective depth-scale delta |scale - 1|",
+                "relative_depth_noise": "Effective relative-depth std",
+            },
+        )
+        stress_backbones = tuple(
+            sorted(str(value) for value in stress["backbone"].dropna().unique())
+        )
+        if not stress_backbones:
+            stress_backbones = ("no_backbone",)
+        _plot_panels(
+            stress,
+            figures_dir / "real_deformation_stress.png",
+            panel_column="backbone",
+            panel_order=stress_backbones,
+            x="resolution",
+            y="metric_delta",
+            group_columns=("feature_track", "feature_mode", "stratum"),
+            title="Real-deformation stress by backbone",
+            y_labels={
+                backbone: "Raw metric delta (within-backbone only)"
+                for backbone in stress_backbones
+            },
+        )
         _write_report(staging / "final_report.md", frames)
         expected = [
             *(tables_dir / name for name in TABLE_FILENAMES),

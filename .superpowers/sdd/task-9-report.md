@@ -393,3 +393,70 @@ All figures remained nonempty in the atomic synthetic-output audit. The camera
 limitation, upper-only/four-shoe scope, descriptive intervals, primary
 `s10 - s00`, adaptive `s11` secondary, and separate analysis tracks are
 unchanged.
+
+---
+
+## Panel review remediation: incomparable geometry and backbone scales
+
+The next cumulative review found that one geometry axis mixed four
+perturbation units and that the stress figure displayed raw metric deltas from
+different backbones on one axis.
+
+### Panel review RED and GREEN
+
+Two tests were written first against the actual Matplotlib figure object. They
+inspect panel titles, y-axis labels, line labels, y-axis sharing, and scale
+limits.
+
+```text
+/opt/conda/envs/pixal3d/bin/python -m pytest \
+  tests/test_upper_analysis.py::test_geometry_panel_figure_separates_kinds_and_effective_units \
+  tests/test_upper_analysis.py::test_stress_panel_figure_separates_backbone_raw_scales -q
+
+2 failed in 3.43s
+```
+
+Both failed because the panel-figure boundary did not yet exist.
+
+After implementation:
+
+```text
+isolated panel tests: 2 passed in 3.60s
+all Task 9 analysis tests: 15 passed in 13.70s
+```
+
+### Panel implementation
+
+- `geometry_calibration.png` has four perturbation-kind panels:
+  rotation, relative translation, depth scale, and relative depth noise.
+  Panels never share y axes. Their effective y-axis units are respectively
+  degrees, camera-radius fraction, absolute scale delta from 1, and relative
+  depth standard deviation.
+- Geometry lines retain backbone, feature track, feature mode, and corruption
+  identity within each fixed-kind panel while resolution remains the x axis.
+- `real_deformation_stress.png` has one independent-y panel per backbone.
+  Lines retain feature track, feature mode, and quality stratum identity while
+  resolution remains the x axis.
+- The stress y label and report explicitly state that raw metric deltas are
+  interpretable only within backbone. Cross-panel raw magnitudes must not be
+  compared.
+- Empty panels retain an explicit no-estimable-observations message. The
+  synthetic output audit still requires both PNGs and every other primary
+  figure to be nonempty.
+
+### Panel review cumulative verification
+
+```text
+focused legacy analysis, Task 9, and CLI:
+  28 passed in 20.18s
+relevant Task 7-9 integration:
+  83 passed in 79.24s (0:01:19)
+fresh full suite:
+  241 passed in 171.47s (0:02:51)
+bash syntax, all seven command helps, compileall, and git diff check:
+  exit 0
+```
+
+The exact camera limitation, upper-only/four-shoe scope, descriptive
+intervals, primary/secondary distinction, and separate analysis tracks remain
+unchanged.

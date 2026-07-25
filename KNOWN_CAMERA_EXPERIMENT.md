@@ -356,6 +356,10 @@ The explicit `severity_curves.csv`/Parquet table uses the same
 placement-to-pair-to-shoe hierarchy. Every primary figure partitions lines by
 the complete compatible backbone/track/mode/resolution/corruption identity, so
 unrelated variants are never connected by one plotted line.
+Geometry calibration uses four perturbation-kind panels with independent
+effective-unit y axes. Real-deformation stress uses independent
+backbone-specific y axes; raw stress `metric_delta` magnitudes must be
+interpreted only within backbone and never compared across backbone panels.
 
 ## Decision rule for the reliability module
 

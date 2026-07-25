@@ -425,6 +425,98 @@ def test_semantic_plot_groups_never_connect_distinct_variants() -> None:
         assert "resolution=" in label
 
 
+def test_geometry_panel_figure_separates_kinds_and_effective_units() -> None:
+    import matplotlib.pyplot as plt
+
+    kinds = {
+        "rotation": "Effective rotation (degrees)",
+        "relative_translation": (
+            "Effective translation (camera-radius fraction)"
+        ),
+        "depth_scale": "Effective depth-scale delta |scale - 1|",
+        "relative_depth_noise": "Effective relative-depth std",
+    }
+    frame = pd.DataFrame(
+        [
+            {
+                **VARIANT,
+                "resolution": resolution,
+                "corruption": "translation",
+                "perturbation_kind": kind,
+                "matched_magnitude_effective": 0.1 + resolution / 1000,
+            }
+            for kind in kinds
+            for resolution in (37, 74)
+        ]
+    )
+
+    figure = upper_analysis._build_panel_figure(
+        frame,
+        panel_column="perturbation_kind",
+        panel_order=tuple(kinds),
+        x="resolution",
+        y="matched_magnitude_effective",
+        group_columns=(
+            "backbone",
+            "feature_track",
+            "feature_mode",
+            "corruption",
+        ),
+        title="Geometry perturbation envelope",
+        y_labels=kinds,
+    )
+    axes = figure.axes
+
+    assert [axis.get_title() for axis in axes] == list(kinds)
+    assert [axis.get_ylabel() for axis in axes] == list(kinds.values())
+    for first_index, first in enumerate(axes):
+        assert len(first.lines) == 1
+        assert "feature_mode=native" in first.lines[0].get_label()
+        for second in axes[first_index + 1 :]:
+            assert not first.get_shared_y_axes().joined(first, second)
+    plt.close(figure)
+
+
+def test_stress_panel_figure_separates_backbone_raw_scales() -> None:
+    import matplotlib.pyplot as plt
+
+    frame = pd.DataFrame(
+        [
+            {
+                **VARIANT,
+                "backbone": backbone,
+                "resolution": resolution,
+                "stratum": "all",
+                "metric_delta": scale * resolution,
+            }
+            for backbone, scale in (("dino", 0.01), ("dinov3", 10.0))
+            for resolution in (37, 74)
+        ]
+    )
+
+    figure = upper_analysis._build_panel_figure(
+        frame,
+        panel_column="backbone",
+        panel_order=("dino", "dinov3"),
+        x="resolution",
+        y="metric_delta",
+        group_columns=("feature_track", "feature_mode", "stratum"),
+        title="Real-deformation stress",
+        y_labels={
+            "dino": "Raw metric delta (within-backbone only)",
+            "dinov3": "Raw metric delta (within-backbone only)",
+        },
+    )
+    axes = figure.axes
+
+    assert [axis.get_title() for axis in axes] == ["dino", "dinov3"]
+    assert all(len(axis.lines) == 1 for axis in axes)
+    assert all("stratum=all" in axis.lines[0].get_label() for axis in axes)
+    assert not axes[0].get_shared_y_axes().joined(axes[0], axes[1])
+    assert axes[0].get_ylim() != axes[1].get_ylim()
+    plt.close(figure)
+
+
 def test_analyze_upper_run_writes_complete_named_snapshot(tmp_path: Path) -> None:
     generation = tmp_path / "metrics" / "aggregate_generations" / "generation"
     generation.mkdir(parents=True)
