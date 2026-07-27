@@ -137,9 +137,7 @@ def test_independent_metric_fixture_has_all_frozen_rows_and_unique_keys(tmp_path
     assert set(calibration.perturbation_kind) == {"rotation", "relative_translation", "depth_scale", "relative_depth_noise"}
 
 
-def test_independent_frozen_fixture_passes_the_real_final_gate(tmp_path: Path) -> None:
-    """Catch divergence between compact fixture data and final-gate production contracts."""
-
+def _final_gate_fixture(tmp_path: Path) -> dict[str, object]:
     root = tmp_path / "run"
     config = Path("configs/adjacent16_core.json").read_bytes()
     (root / "config").mkdir(parents=True)
@@ -155,7 +153,16 @@ def test_independent_frozen_fixture_passes_the_real_final_gate(tmp_path: Path) -
     marker_hash = __import__("hashlib").sha256(marker.read_bytes()).hexdigest()
     with sqlite3.connect(registry.path) as connection:
         connection.execute("UPDATE jobs SET state='completed', attempts=1, output_manifest_json=?", (json.dumps({"files": [{"path": str(marker.resolve()), "sha256": marker_hash}]}),))
-    _write_frozen_metric_tables(root, contract, design, digest)
+    metrics = _write_frozen_metric_tables(root, contract, design, digest)
+    return {"root": root, "contract": contract, "design": design, "registry": registry, "metrics": metrics}
+
+
+def test_independent_frozen_fixture_passes_the_real_final_gate(tmp_path: Path) -> None:
+    """Catch divergence between compact fixture data and final-gate production contracts."""
+
+    fixture = _final_gate_fixture(tmp_path)
+    root = fixture["root"]
+    assert isinstance(root, Path)
 
     report = validate_adjacent16_final_gate(root)
 
@@ -170,7 +177,7 @@ def test_independent_frozen_fixture_passes_the_real_final_gate(tmp_path: Path) -
     assert all(provenance[name] for name in ("config_sha256", "registry_sha256", "manifest_sha256", "metric_input_sha256", "output_sha256"))
     assert validate_adjacent16_final_gate(root) == report
     assert report_path.read_bytes() == first_bytes
-    controlled_path = root / "metrics" / "controlled_fidelity.parquet"
+    controlled_path = fixture["metrics"]["controlled"]
     controlled = pd.read_parquet(controlled_path)
     controlled.loc[0, "score"] = .81
     controlled.to_parquet(controlled_path, index=False)
