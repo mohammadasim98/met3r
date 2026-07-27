@@ -23,6 +23,7 @@ from met3r.upper_metric_worker import (
     _clean_state_for_shoe,
     _load_geometry,
     _load_state_index,
+    _validate_native_shape,
     _validate_adjacent_pair_contract,
     _calibration_records,
     _RunContract,
@@ -31,6 +32,7 @@ from met3r.upper_metric_worker import (
     run_feature_worker,
 )
 from met3r.known_camera import KnownCameraConfig
+from met3r.upper_design import FeatureVariant
 
 
 _L_BACKBONE = "dinov3_vitl16_pixal3d"
@@ -116,6 +118,35 @@ def test_adjacent_contract_rejects_same_quartet_with_reordered_views() -> None:
         assert "view order" in str(error)
     else:
         raise AssertionError("reordered state was accepted")
+
+
+@pytest.mark.parametrize(
+    "variants",
+    [
+        (
+            FeatureVariant("track", "dino_vitb16", 592, "bilinear", 37),
+            FeatureVariant("track", "dinov2_vitb14", 592, "bilinear", 37),
+        ),
+        (
+            FeatureVariant("track", "dino_vitb16", 592, "bilinear", 37),
+            FeatureVariant("track", "dino_vitb16", 512, "bilinear", 32),
+        ),
+    ],
+)
+def test_implicit_native_requires_one_coherent_backbone_input_spec(
+    variants: tuple[FeatureVariant, FeatureVariant],
+) -> None:
+    """Catch deriving an implicit native grid from mixed backbone/input metadata."""
+
+    with pytest.raises(
+        ValueError,
+        match="feature variants must share exactly one backbone and input size",
+    ):
+        _validate_native_shape(
+            torch.ones(4, 3, 37, 37),
+            variants,
+            allow_implicit_native=True,
+        )
 
 
 def _write_q3_geometry(path: Path, views: tuple[str, str, str, str]) -> None:
@@ -237,6 +268,38 @@ def _fake_calibration_result() -> SimpleNamespace:
     return SimpleNamespace(baseline=SimpleNamespace(score=torch.tensor([.8]), first_to_second=direction(.8), second_to_first=direction(.7), abstained=torch.tensor([False])), perturbed=SimpleNamespace(score=torch.tensor([.6]), first_to_second=direction(.6), second_to_first=direction(.5), abstained=torch.tensor([False])), geometry_effect=torch.tensor([-.2]))
 
 
+def _fake_factorial_result() -> SimpleNamespace:
+    """Match the factorial result fields consumed by the real row flattener."""
+
+    def direction(score: float) -> SimpleNamespace:
+        return SimpleNamespace(
+            score=torch.tensor([score]),
+            overlap_fraction=torch.tensor([.75]),
+            cycle_error_px=torch.tensor([[[1., 2.]]]),
+            relative_depth_error=torch.tensor([[[.1, .2]]]),
+            valid_mask=torch.tensor([[[True, True]]]),
+        )
+
+    def symmetric(score: float) -> SimpleNamespace:
+        return SimpleNamespace(
+            score=torch.tensor([score]),
+            first_to_second=direction(score),
+            second_to_first=direction(score),
+            abstained=torch.tensor([False]),
+        )
+
+    return SimpleNamespace(
+        s00=symmetric(.8),
+        s10=symmetric(.6),
+        s01=symmetric(.8),
+        s11=symmetric(.6),
+        feature_effect=torch.tensor([-.2]),
+        geometry_effect=torch.tensor([0.]),
+        interaction=torch.tensor([0.]),
+        total=torch.tensor([-.2]),
+    )
+
+
 def test_fake_calibration_result_drives_real_sensitivity_row_schema() -> None:
     """Catch fake calibration scoring drift from the worker's real row adapter."""
     row = _sensitivity_row(_fake_calibration_result())
@@ -249,10 +312,39 @@ class _TinyBackbone(nn.Module):
         return torch.nn.functional.adaptive_avg_pool2d(images, (2, 2))
 
 
+class _NativeGridBackbone(nn.Module):
+    def __init__(self, native_grid: int) -> None:
+        super().__init__()
+        self.native_grid = native_grid
+        self.calls: list[tuple[int, ...]] = []
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        self.calls.append(tuple(images.shape))
+        return torch.nn.functional.adaptive_avg_pool2d(
+            images,
+            (self.native_grid, self.native_grid),
+        )
+
+
 class _TinyNAF(nn.Module):
     def forward(self, guide: torch.Tensor, native: torch.Tensor, output_size: tuple[int, int]) -> torch.Tensor:
         del guide
         return torch.nn.functional.interpolate(native, output_size, mode="bilinear", align_corners=False)
+
+
+class _RecordingNAF(_TinyNAF):
+    def __init__(self) -> None:
+        super().__init__()
+        self.output_sizes: list[tuple[int, int]] = []
+
+    def forward(
+        self,
+        guide: torch.Tensor,
+        native: torch.Tensor,
+        output_size: tuple[int, int],
+    ) -> torch.Tensor:
+        self.output_sizes.append(output_size)
+        return super().forward(guide, native, output_size)
 
 
 class _CalibrationBackbone(nn.Module):
@@ -766,27 +858,55 @@ def test_adjacent_q3_calibration_worker_rejects_available_unapproved_variant_onc
     _assert_no_persistent_features(root)
 
 
-@pytest.mark.parametrize("backbone", ["dino_vitb16", "dinov2_vitb14", "dinov3_vitb16"])
-def test_adjacent_controlled_worker_uses_clean_geometry_and_posthoc_storage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backbone: str) -> None:
-    """End-to-end q3 sentinel: fixed-base scoring must not touch changed geometry or PCA."""
+_L_CONTROLLED_KEYS = (
+    _L37_BILINEAR,
+    "user_37_grid_track__dinov3_vitl16_pixal3d__592__bilinear__74",
+    "user_37_grid_track__dinov3_vitl16_pixal3d__592__naf_normal_guide__74",
+    "user_37_grid_track__dinov3_vitl16_pixal3d__592__bilinear__148",
+    "user_37_grid_track__dinov3_vitl16_pixal3d__592__naf_normal_guide__148",
+    "user_37_grid_track__dinov3_vitl16_pixal3d__592__bilinear__296",
+    "user_37_grid_track__dinov3_vitl16_pixal3d__592__naf_normal_guide__296",
+    "user_37_grid_track__dinov3_vitl16_pixal3d__592__bilinear__592",
+    _L592_NAF,
+)
 
+
+def _make_adjacent_controlled_run(
+    tmp_path: Path,
+    backbone: str,
+    variant_keys: list[str],
+) -> tuple[Path, JobRegistry]:
     root = tmp_path / "run"
-    for name in ("config", "manifests", "registry", "states", "geometry/calibration", "metrics/parts", "visualizations"):
+    for name in (
+        "config",
+        "manifests",
+        "registry",
+        "states",
+        "geometry/calibration",
+        "metrics/parts",
+        "visualizations",
+    ):
         (root / name).mkdir(parents=True, exist_ok=True)
-    views = ("40", "41", "42", "0")
-    config = {"quartets": [{}], "stage_size": 504, "camera_label": CAMERA_MODE_LABEL, "seed": 42,
-              "metric": {"relative_depth_tolerance": .03, "min_overlap_fraction": .08, "confidence_percentile": 10.},
-              "models": {backbone: {"revision": BACKBONE_SPECS[backbone].revision}, "naf_revision": NAF_REVISION},
-              "visualization": {"policy": "posthoc_audit_only"}}
-    raw = json.dumps(config).encode(); digest = hashlib.sha256(raw).hexdigest()
+    frozen_path = Path(__file__).resolve().parents[1] / "configs" / "adjacent16_core.json"
+    config = json.loads(frozen_path.read_text(encoding="utf-8"))
+    raw = json.dumps(config).encode()
+    digest = hashlib.sha256(raw).hexdigest()
     (root / "config/frozen_config.json").write_bytes(raw)
-    (root / "run_manifest.json").write_text(json.dumps({"config_sha256": digest}))
-    variants = [{"feature_track": "track", "backbone": backbone, "input_size": 8, "feature_mode": "bilinear", "resolution": 2}]
-    (root / "manifests/feature_variants.json").write_text(json.dumps(variants))
+    (root / "run_manifest.json").write_text(
+        json.dumps({"scope": "full", "config_sha256": digest})
+    )
+    (root / "manifests/feature_variants.json").write_text(
+        json.dumps(config["feature_variants"])
+    )
+    views = ("40", "41", "42", "0")
     rows = []
     for sid, changed, corruption in (("clean", None, "clean"), ("changed", "0", "jpeg")):
-        directory = root / "states" / sid; (directory / "images").mkdir(parents=True)
-        for index, view in enumerate(views): Image.new("RGB", (504, 504), (index * 20, 0, 0)).save(directory / "images" / f"{view}.png")
+        directory = root / "states" / sid
+        (directory / "images").mkdir(parents=True)
+        for index, view in enumerate(views):
+            Image.new("RGB", (504, 504), (index * 20, 0, 0)).save(
+                directory / "images" / f"{view}.png"
+            )
         state = {"state_id": sid, "track": "controlled", "shoe_id": "shoe", "quartet_id": "q3", "view_ids": list(views), "changed_view": changed, "corruption": corruption, "severity": 0. if changed is None else .5}
         (directory / "state.json").write_text(json.dumps({"state": state, "stage_size": 504}))
         rows.append(state)
@@ -798,21 +918,177 @@ def test_adjacent_controlled_worker_uses_clean_geometry_and_posthoc_storage(tmp_
     np.savez_compressed(geometry / "depth_geometry.npz", depth=np.ones((4,504,504),np.float32), mask=np.ones((4,504,504),bool), confidence=np.ones((4,504,504),np.float32), intrinsics=np.broadcast_to(np.eye(3),(4,3,3)).copy(), extrinsics=np.broadcast_to(np.eye(4),(4,4,4)).copy(), meta__view_ids=np.asarray(views), meta__camera_groups=np.asarray(("upper",)*4), meta__camera_provenance=np.asarray("fixed_precomputed_da3"))
     (geometry / "depth_geometry.json").write_text(json.dumps({"camera_mode": CAMERA_MODE_LABEL, "camera_provenance": "fixed_precomputed_da3", "process_res": 504, "view_ids": list(views), "camera_groups": ["upper"]*4}))
     registry = JobRegistry(root / "registry/jobs.sqlite")
-    keys = [f"track__{backbone}__8__bilinear__2"]
-    payload = {"job_type": "feature", "state_id": "changed", "track": "controlled", "analysis_track": "controlled", "shoe_id": "shoe", "quartet_id": "q3", "state_dir": str((root / "states/changed").resolve()), "config_sha256": digest, "backbone": backbone, "feature_track": "track", "variant_keys": list(reversed(keys)), "geometry_contract": "fixed_base_only"}
-    registry.register(JobDefinition("wanted", "feature", payload)); registry.register(JobDefinition("other", "feature", payload))
-    monkeypatch.setattr("met3r.upper_metric_worker.load_feature_backbone", lambda _: _TinyBackbone())
+    payload = {
+        "job_type": "feature",
+        "state_id": "changed",
+        "track": "controlled",
+        "analysis_track": "controlled",
+        "shoe_id": "shoe",
+        "quartet_id": "q3",
+        "state_dir": str((root / "states/changed").resolve()),
+        "config_sha256": digest,
+        "backbone": backbone,
+        "feature_track": "user_37_grid_track",
+        "variant_keys": variant_keys,
+        "geometry_contract": "fixed_base_only",
+    }
+    registry.register(JobDefinition("wanted", "feature", payload))
+    registry.register(JobDefinition("other", "feature", payload))
+    return root, registry
+
+
+@pytest.mark.parametrize(
+    ("backbone", "native_grid"),
+    [
+        ("dino_vitb16", 37),
+        ("dinov2_vitb14", 42),
+        ("dinov3_vitb16", 37),
+    ],
+)
+def test_adjacent_controlled_b_worker_uses_pinned_native_grid_and_bilinear_37(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    backbone: str,
+    native_grid: int,
+) -> None:
+    """Catch treating the sole requested 37-grid output as every B model's native grid."""
+
+    key = f"user_37_grid_track__{backbone}__592__bilinear__37"
+    root, registry = _make_adjacent_controlled_run(tmp_path, backbone, [key])
+    model = _NativeGridBackbone(native_grid)
+    metric_shapes: list[tuple[int, int]] = []
+    from met3r import upper_metric_worker as worker_module
+
+    real_score = worker_module.score_multiscale_factorial
+
+    def tracked_score(*args, **kwargs):
+        shapes = {
+            tuple(next(iter(feature_set.values())).shape[-2:])
+            for feature_set in args[:4]
+        }
+        assert len(shapes) == 1
+        metric_shapes.append(shapes.pop())
+        return real_score(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "met3r.upper_metric_worker.load_feature_backbone",
+        lambda _: model,
+    )
     monkeypatch.setattr("met3r.upper_metric_worker.load_naf_upsampler", lambda **_: _TinyNAF())
     monkeypatch.setattr("met3r.upper_metric_worker._fit_or_load_pca", lambda *args: (_ for _ in ()).throw(AssertionError("PCA")))
+    monkeypatch.setattr(
+        "met3r.upper_metric_worker.score_multiscale_factorial",
+        tracked_score,
+    )
     assert run_feature_worker(root, backbone, "cpu", job_ids=["wanted"]).completed == 1
-    frame = pd.read_parquet(root / "metrics/parts/track/wanted.parquet")
-    assert len(frame) == 1 and frame["variant_key"].tolist() == keys
+    frame = pd.read_parquet(
+        root / "metrics/parts/user_37_grid_track/wanted.parquet"
+    )
+    assert len(frame) == 1 and frame["variant_key"].tolist() == [key]
+    assert model.calls == [(4, 3, 592, 592), (4, 3, 592, 592)]
+    assert metric_shapes == [(37, 37)]
     assert frame.iloc[0][["s00", "s01"]].nunique() == 1 and frame.iloc[0][["s10", "s11"]].nunique() == 1
     assert frame.iloc[0]["geometry_effect"] == 0 and frame.iloc[0]["interaction"] == 0
     assert frame.iloc[0]["quartet_id"] == "q3" and frame.iloc[0]["baseline_steps"] == 1 and frame.iloc[0]["angular_separation_deg"] == 7.5
     assert registry.validated_state("other") == "pending"
     visual = root / "visualizations/wanted/manifest.json"; assert json.loads(visual.read_text()) == {"files": []}
     assert not list((root / "pca").rglob("*")) if (root / "pca").exists() else True
+
+
+def test_adjacent_dinov2_native_grid_mismatch_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch accepting a tensor that disagrees with the pinned 592/14 native grid."""
+
+    backbone = "dinov2_vitb14"
+    key = f"user_37_grid_track__{backbone}__592__bilinear__37"
+    root, registry = _make_adjacent_controlled_run(tmp_path, backbone, [key])
+    monkeypatch.setattr(
+        "met3r.upper_metric_worker.load_feature_backbone",
+        lambda _: _NativeGridBackbone(41),
+    )
+    monkeypatch.setattr(
+        "met3r.upper_metric_worker.load_naf_upsampler",
+        lambda **_: _TinyNAF(),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"\(41, 41\) != \(42, 42\)",
+    ):
+        run_feature_worker(root, backbone, "cpu", job_ids=["wanted"])
+
+    row = _registry_row(registry, "wanted")
+    assert (row["state"], row["attempts"]) == ("failed", 1)
+    assert not list((root / "metrics/parts").rglob("*.parquet"))
+
+
+def test_adjacent_controlled_dinov3_l_runs_all_nine_frozen_variants_in_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch loss of full L coverage or payload-order execution in the controlled worker."""
+
+    root, registry = _make_adjacent_controlled_run(
+        tmp_path,
+        _L_BACKBONE,
+        list(reversed(_L_CONTROLLED_KEYS)),
+    )
+    backbone = _NativeGridBackbone(37)
+    naf = _RecordingNAF()
+    metric_outputs: list[tuple[str, tuple[int, int]]] = []
+
+    def fake_score(*args, **kwargs):
+        del kwargs
+        keys = tuple(args[0])
+        assert len(keys) == 1
+        key = keys[0]
+        shapes = {
+            tuple(next(iter(feature_set.values())).shape[-2:])
+            for feature_set in args[:4]
+        }
+        assert len(shapes) == 1
+        metric_outputs.append((key, shapes.pop()))
+        return {key: _fake_factorial_result()}
+
+    monkeypatch.setattr(
+        "met3r.upper_metric_worker.load_feature_backbone",
+        lambda _: backbone,
+    )
+    monkeypatch.setattr(
+        "met3r.upper_metric_worker.load_naf_upsampler",
+        lambda **_: naf,
+    )
+    monkeypatch.setattr(
+        "met3r.streaming_features.build_naf_guides",
+        lambda images: {"normal": images},
+    )
+    monkeypatch.setattr(
+        "met3r.upper_metric_worker.score_multiscale_factorial",
+        fake_score,
+    )
+
+    assert run_feature_worker(
+        root,
+        _L_BACKBONE,
+        "cpu",
+        job_ids=["wanted"],
+    ).completed == 1
+
+    frame = pd.read_parquet(
+        root / "metrics/parts/user_37_grid_track/wanted.parquet"
+    )
+    expected_sizes = (37, 74, 74, 148, 148, 296, 296, 592, 592)
+    assert len(metric_outputs) == len(frame) == 9
+    assert tuple(frame["variant_key"]) == _L_CONTROLLED_KEYS
+    assert metric_outputs == list(zip(_L_CONTROLLED_KEYS, zip(expected_sizes, expected_sizes)))
+    assert naf.output_sizes == [
+        (size, size)
+        for size in (74, 74, 148, 148, 296, 296, 592, 592)
+    ]
+    assert registry.validated_state("wanted") == "completed"
+    assert registry.validated_state("other") == "pending"
 
 
 def test_adjacent_stress_worker_loads_only_ordered_base_and_adaptive_geometry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

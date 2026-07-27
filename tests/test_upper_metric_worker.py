@@ -539,6 +539,26 @@ def test_worker_writes_factorial_rows_without_feature_artifact(
     assert len(list((run_root / "visualizations").rglob("*.png"))) == 8
 
 
+def test_legacy_worker_rejects_manifest_without_explicit_native_variant(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch adjacent implicit-native compatibility leaking into legacy manifests."""
+
+    run_root, _, _ = _make_run(tmp_path, two_tracks=False)
+    manifest_path = run_root / "manifests" / "feature_variants.json"
+    variants = json.loads(manifest_path.read_text(encoding="utf-8"))
+    variants[0]["feature_mode"] = "bilinear"
+    manifest_path.write_text(json.dumps(variants), encoding="utf-8")
+    _patch_models(monkeypatch)
+
+    with pytest.raises(
+        ValueError,
+        match="each feature track/input must have exactly one native variant",
+    ):
+        run_feature_worker(run_root, "fake_backbone", "cpu")
+
+
 def test_worker_reuses_only_active_shoe_track_clean_native_features(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

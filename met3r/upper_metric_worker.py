@@ -317,15 +317,37 @@ def _load_image_batch(
 def _validate_native_shape(
     native: Tensor,
     variants: Sequence[FeatureVariant],
+    *,
+    allow_implicit_native: bool = False,
 ) -> None:
+    backbones = {variant.backbone for variant in variants}
+    input_sizes = {variant.input_size for variant in variants}
+    if len(backbones) != 1 or len(input_sizes) != 1:
+        raise ValueError(
+            "feature variants must share exactly one backbone and input size"
+        )
     native_variants = [
         variant for variant in variants if variant.feature_mode == "native"
     ]
     if len(native_variants) == 1:
         expected = native_variants[0].resolution
     elif not native_variants:
-        # Adjacent's frozen L matrix records its native grid as bilinear.
-        expected = min(variant.resolution for variant in variants)
+        if not allow_implicit_native:
+            raise ValueError(
+                "each feature track/input must have exactly one native variant"
+            )
+        backbone = next(iter(backbones))
+        specification = BACKBONE_SPECS.get(backbone)
+        if specification is None:
+            raise ValueError(
+                "implicit native grid requires a pinned backbone specification"
+            )
+        input_size = next(iter(input_sizes))
+        expected = input_size // specification.patch_size
+        if expected <= 0:
+            raise ValueError(
+                "feature input size must be at least the pinned backbone patch size"
+            )
     else:
         raise ValueError("each feature track/input must have exactly one native variant")
     if native.ndim != 4 or tuple(native.shape[-2:]) != (expected, expected):
@@ -458,6 +480,7 @@ def _fit_or_load_pca(
                         for variant in variants
                         if variant.input_size == input_size
                     ),
+                    allow_implicit_native="quartets" in contract.config,
                 )
                 batches.append(native.detach().to(device="cpu"))
                 del native, images
@@ -1208,7 +1231,11 @@ def _factorial_rows(
         extractor,
         device,
     )
-    _validate_native_shape(clean_native, variants)
+    _validate_native_shape(
+        clean_native,
+        variants,
+        allow_implicit_native="quartets" in contract.config,
+    )
     changed_is_clean = state.state_id == clean_state.state_id
     if changed_is_clean:
         changed_images = clean_images
@@ -1216,7 +1243,11 @@ def _factorial_rows(
     else:
         changed_images = _state_images(state, input_size, device)
         changed_native = extractor.extract_native(changed_images.tensor)
-        _validate_native_shape(changed_native, variants)
+        _validate_native_shape(
+            changed_native,
+            variants,
+            allow_implicit_native="quartets" in contract.config,
+        )
     base_geometry_path = (
         contract.root / "geometry" / "calibration" / clean_state.state_id / "depth_geometry.npz"
         if contract.visualization_policy == "posthoc_audit_only"
@@ -1533,7 +1564,11 @@ def _calibration_rows(
         extractor,
         device,
     )
-    _validate_native_shape(native, variants)
+    _validate_native_shape(
+        native,
+        variants,
+        allow_implicit_native="quartets" in contract.config,
+    )
     base_geometry_path = (
         contract.root / "geometry" / "calibration" / clean_state.state_id / "depth_geometry.npz"
         if contract.visualization_policy == "posthoc_audit_only"
