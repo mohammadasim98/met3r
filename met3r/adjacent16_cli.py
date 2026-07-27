@@ -313,6 +313,45 @@ def _validated_run_paths(run_root: Path) -> Mapping[str, str] | None:
     return payload
 
 
+def _has_prepared_run_evidence(run_root: Path) -> bool:
+    root = run_root.expanduser().resolve()
+    return any(
+        path.exists()
+        for path in (
+            root / "config" / "frozen_config.json",
+            root / "config" / "frozen_config.sha256",
+            root / "run_manifest.json",
+            root / "manifests" / "adjacent16_manifest.json",
+            root / "registry" / "jobs.sqlite",
+        )
+    )
+
+
+def _prepared_stress_contract(
+    run_root: Path,
+) -> tuple[Adjacent16Contract, Mapping[str, str]]:
+    root = run_root.expanduser().resolve()
+    try:
+        paths = _validated_run_paths(root)
+        frozen = root / "config" / "frozen_config.json"
+        if paths is None or not frozen.is_file():
+            raise ValueError("authoritative prepared-run evidence is incomplete")
+        contract = load_adjacent16_contract(frozen)
+        contract = replace(
+            contract,
+            output_root=Path(paths["output_root"]),
+            stress_root=Path(paths["stress_root"]),
+        )
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        if str(error).startswith("legacy run-path recovery failed"):
+            raise
+        raise ValueError(
+            "legacy run-path recovery failed; restore authoritative frozen "
+            "config/hash and prepared run/source metadata"
+        ) from error
+    return contract, paths
+
+
 @contextmanager
 def _effective_gate_paths(run_root: Path) -> Iterator[None]:
     payload = _validated_run_paths(run_root)
@@ -458,16 +497,27 @@ def _prepare_stress(
     max_parallel: int,
     max_outer_attempts: int,
 ) -> Mapping[str, object]:
-    contract: Adjacent16Contract = load_adjacent16_contract(config_path)
-    effective_root = Path(
-        run_root if run_root is not None else contract.output_root
-    ).expanduser().resolve()
-    _persist_run_paths(config_path, effective_root)
-    contract = replace(
-        contract,
-        output_root=effective_root,
-        stress_root=effective_root / "inputs" / "stress",
+    effective_root = (
+        run_root.expanduser().resolve()
+        if run_root is not None
+        else None
     )
+    contract: Adjacent16Contract
+    if effective_root is not None and _has_prepared_run_evidence(effective_root):
+        contract, _paths = _prepared_stress_contract(effective_root)
+    else:
+        contract = load_adjacent16_contract(config_path)
+        if effective_root is None:
+            effective_root = Path(contract.output_root).expanduser().resolve()
+        if _has_prepared_run_evidence(effective_root):
+            contract, _paths = _prepared_stress_contract(effective_root)
+        else:
+            _persist_run_paths(config_path, effective_root)
+            contract = replace(
+                contract,
+                output_root=effective_root,
+                stress_root=effective_root / "inputs" / "stress",
+            )
     if physical_gpus is not None:
         contract = replace(contract, physical_gpus=physical_gpus)
     manifest = build_adjacent16_manifest(contract, require_stress=False)

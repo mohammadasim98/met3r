@@ -353,15 +353,17 @@ def _legacy_run(
     run_root: Path,
     *,
     consistent: bool,
+    with_hash: bool = True,
 ) -> SimpleNamespace:
     config = run_root / "config" / "frozen_config.json"
     config.parent.mkdir(parents=True)
     config.write_bytes(b'{"legacy":"adjacent16"}\n')
     digest = hashlib.sha256(config.read_bytes()).hexdigest()
-    (config.parent / "frozen_config.sha256").write_text(
-        f"{digest}\n",
-        encoding="utf-8",
-    )
+    if with_hash:
+        (config.parent / "frozen_config.sha256").write_text(
+            f"{digest}\n",
+            encoding="utf-8",
+        )
     stress_root = run_root / "inputs" / "stress"
     reconstruction_root = run_root / "reconstruction"
     (run_root / "run_manifest.json").write_text(
@@ -411,6 +413,124 @@ def _legacy_run(
         raw={"shoes": {"shoe-a": "Camera A"}},
         quartets=(SimpleNamespace(quartet_id="q0", view_ids=("0", "1", "2", "3")),),
     )
+
+
+def _stub_stress_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+    seen_contracts: list[SimpleNamespace],
+) -> None:
+    monkeypatch.setattr(
+        "met3r.adjacent16_cli.replace",
+        lambda value, **changes: SimpleNamespace(**{**vars(value), **changes}),
+    )
+
+    def manifest(contract: SimpleNamespace, *, require_stress: bool) -> object:
+        assert not require_stress
+        seen_contracts.append(contract)
+        return object()
+
+    monkeypatch.setattr(
+        "met3r.adjacent16_cli.build_adjacent16_manifest",
+        manifest,
+    )
+    monkeypatch.setattr(
+        "met3r.adjacent16_cli.render_stress_references",
+        lambda contract, manifest: (),
+    )
+    monkeypatch.setattr(
+        "met3r.adjacent16_cli.build_stress_tasks",
+        lambda contract, manifest, references: (),
+    )
+    monkeypatch.setattr(
+        "met3r.adjacent16_cli.run_stress_tasks",
+        lambda tasks, **kwargs: {"accepted": 0, "rejected": 0, "tasks": {}},
+    )
+
+
+def test_prepare_stress_refuses_true_prefix_run_missing_authoritative_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from met3r.adjacent16_cli import main
+
+    run_root = tmp_path / "legacy-run"
+    contract = _legacy_run(run_root, consistent=True, with_hash=False)
+    requested = tmp_path / "requested.json"
+    requested.write_text("valid requested config", encoding="utf-8")
+    seen: list[SimpleNamespace] = []
+    monkeypatch.setattr(
+        "met3r.adjacent16_cli.load_adjacent16_contract",
+        lambda path: contract,
+    )
+    _stub_stress_pipeline(monkeypatch, seen)
+
+    with pytest.raises(ValueError, match="legacy run-path recovery failed"):
+        main(["prepare-stress", str(requested), "--run-root", str(run_root)])
+
+    assert not (run_root / "config" / "run_paths.json").exists()
+    assert not list((run_root / "config").glob(".run_paths.*.tmp"))
+    assert seen == []
+
+
+def test_requested_config_bytes_cannot_poison_true_prefix_frozen_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from met3r.adjacent16_cli import main
+
+    run_root = tmp_path / "legacy-run"
+    contract = _legacy_run(run_root, consistent=True, with_hash=False)
+    frozen = run_root / "config" / "frozen_config.json"
+    requested = tmp_path / "requested.json"
+    requested.write_bytes(frozen.read_bytes() + b" ")
+    requested_digest = hashlib.sha256(requested.read_bytes()).hexdigest()
+    seen: list[SimpleNamespace] = []
+    monkeypatch.setattr(
+        "met3r.adjacent16_cli.load_adjacent16_contract",
+        lambda path: contract,
+    )
+    _stub_stress_pipeline(monkeypatch, seen)
+
+    with pytest.raises(ValueError, match="legacy run-path recovery failed"):
+        main(["prepare-stress", str(requested), "--run-root", str(run_root)])
+
+    assert hashlib.sha256(frozen.read_bytes()).hexdigest() != requested_digest
+    assert not (run_root / "config" / "run_paths.json").exists()
+    assert seen == []
+
+
+def test_prepare_stress_migrates_authoritative_run_without_requested_overwrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from met3r.adjacent16_cli import main
+
+    run_root = tmp_path / "legacy-run"
+    frozen_contract = _legacy_run(run_root, consistent=True, with_hash=True)
+    frozen = run_root / "config" / "frozen_config.json"
+    requested = tmp_path / "requested.json"
+    requested.write_bytes(frozen.read_bytes() + b" ")
+    requested_contract = SimpleNamespace(**vars(frozen_contract))
+    requested_contract.authority = "requested"
+    frozen_contract.authority = "frozen"
+    seen: list[SimpleNamespace] = []
+
+    def load(path: Path) -> SimpleNamespace:
+        return frozen_contract if path.resolve() == frozen.resolve() else requested_contract
+
+    monkeypatch.setattr("met3r.adjacent16_cli.load_adjacent16_contract", load)
+    _stub_stress_pipeline(monkeypatch, seen)
+
+    assert main(
+        ["prepare-stress", str(requested), "--run-root", str(run_root)]
+    ) == 0
+
+    sidecar = json.loads(
+        (run_root / "config" / "run_paths.json").read_text(encoding="utf-8")
+    )
+    assert sidecar["config_sha256"] == hashlib.sha256(frozen.read_bytes()).hexdigest()
+    assert sidecar["config_sha256"] != hashlib.sha256(requested.read_bytes()).hexdigest()
+    assert [contract.authority for contract in seen] == ["frozen"]
 
 
 def test_production_shaped_legacy_run_atomically_migrates_before_later_command(
