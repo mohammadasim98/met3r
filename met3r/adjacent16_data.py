@@ -14,7 +14,7 @@ from PIL import Image
 
 from .adjacent16_contract import Adjacent16Contract, load_adjacent16_contract
 from .bytesize_data import validate_processed_image
-from .upper_data import (
+from .deformation_audit import (
     DeformationQuality,
     _load_json,
     _quality,

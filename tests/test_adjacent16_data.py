@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from itertools import combinations
 from pathlib import Path
 
-import pytest
 import numpy as np
+import pytest
 
 from met3r.adjacent16_contract import load_adjacent16_contract
 from met3r.adjacent16_data import build_adjacent16_manifest, pair_baseline
-from tests.helpers_adjacent16 import write_dense_source
+from met3r.deformation_audit import DeformationQuality
+from met3r.upper_data import DeformationQuality as LegacyDeformationQuality
+from tests.helpers_adjacent16 import write_dense_source, write_valid_stress
 
 
 CONFIG = Path(__file__).resolve().parents[1] / "configs" / "adjacent16_core.json"
@@ -23,6 +26,20 @@ def dense_contract(tmp_path: Path):
     stress = tmp_path / "stress"
     write_dense_source(root, contract)
     return replace(contract, reconstruction_root=root, stress_root=stress)
+
+
+@pytest.fixture
+def irregular_dense_contract(tmp_path: Path):
+    contract = load_adjacent16_contract(CONFIG)
+    root = tmp_path / "reconstruction"
+    write_dense_source(root, contract, orbit_gaps_deg=(7.0, 8.0) * 24)
+    return replace(contract, reconstruction_root=root, stress_root=tmp_path / "stress")
+
+
+def test_deformation_audit_is_shared_without_changing_upper_legacy_import() -> None:
+    """Catch reintroducing adjacent16's dependency on upper-data audit internals."""
+
+    assert LegacyDeformationQuality is DeformationQuality
 
 
 def test_manifest_validates_all_sources_and_retains_frozen_adjacent_views(dense_contract) -> None:
@@ -71,3 +88,34 @@ def test_manifest_requires_complete_strict_stress_audits(dense_contract) -> None
 
     with pytest.raises(FileNotFoundError, match="stress"):
         build_adjacent16_manifest(dense_contract, require_stress=True)
+
+
+def test_manifest_rejects_present_stress_view_with_incomplete_audit(dense_contract) -> None:
+    """Catch accepting a present selected stress view with missing audit metadata."""
+
+    shoe_id = next(iter(dense_contract.raw["shoes"]))
+    assert isinstance(shoe_id, str)
+    write_valid_stress(dense_contract.stress_root, shoe_id, "1")
+    (dense_contract.stress_root / shoe_id / "1/deformation/metrics.json").unlink()
+
+    with pytest.raises(FileNotFoundError, match="stress deformation metrics"):
+        build_adjacent16_manifest(dense_contract, require_stress=True)
+
+
+def test_pair_baselines_preserve_irregular_measured_camera_angles(
+    irregular_dense_contract,
+) -> None:
+    """Catch replacing measured pair angles with a nominal 7.5 degrees per step."""
+
+    manifest = build_adjacent16_manifest(irregular_dense_contract, require_stress=False)
+
+    for shoe in manifest.shoes:
+        pairs = [
+            pair_baseline(first, second)
+            for quartet in range(4)
+            for first, second in combinations(shoe.views[quartet * 4 : quartet * 4 + 4], 2)
+        ]
+        assert {steps for steps, _ in pairs} == {1, 2, 3}
+        assert pair_baseline(shoe.views[0], shoe.views[1]) == pytest.approx((1, 8.0))
+        assert pair_baseline(shoe.views[0], shoe.views[3]) == pytest.approx((3, 23.0))
+        assert pair_baseline(shoe.views[0], shoe.views[1])[1] != pytest.approx(7.5)

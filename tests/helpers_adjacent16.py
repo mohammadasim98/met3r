@@ -11,7 +11,12 @@ from PIL import Image
 from met3r.adjacent16_contract import Adjacent16Contract
 
 
-def write_dense_source(root: Path, contract: Adjacent16Contract) -> None:
+def write_dense_source(
+    root: Path,
+    contract: Adjacent16Contract,
+    *,
+    orbit_gaps_deg: tuple[float, ...] = (7.5,) * 48,
+) -> None:
     """Write four complete 48-view sources with deliberately nonnumeric orbit order."""
 
     for shoe_offset, display_name in enumerate(contract.raw["shoes"].values()):
@@ -37,7 +42,10 @@ def write_dense_source(root: Path, contract: Adjacent16Contract) -> None:
                 )
         np.savez(outputs / "processed_images.npz", processed_images=np.stack(processed))
         np.savez(outputs / "intrinsics.npz", intrinsics=np.broadcast_to(np.eye(3), (48, 3, 3)))
-        np.savez(outputs / "extrinsics.npz", extrinsics=_orbit_extrinsics(contract.camera_order))
+        np.savez(
+            outputs / "extrinsics.npz",
+            extrinsics=_orbit_extrinsics(contract.camera_order, orbit_gaps_deg),
+        )
 
 
 def write_valid_stress(root: Path, shoe_id: str, view_id: str) -> None:
@@ -91,17 +99,23 @@ def _view_image(index: int, shoe_offset: int) -> Image.Image:
     return Image.fromarray(pixels, mode="RGB")
 
 
-def _orbit_extrinsics(camera_order: tuple[str, ...]) -> np.ndarray:
+def _orbit_extrinsics(
+    camera_order: tuple[str, ...], orbit_gaps_deg: tuple[float, ...]
+) -> np.ndarray:
     """48 world-to-camera matrices whose camera centers circle the origin."""
 
+    if len(orbit_gaps_deg) != 48 or not np.isclose(sum(orbit_gaps_deg), 360.0):
+        raise ValueError("orbit gaps must contain 48 values summing to 360 degrees")
     values = np.empty((48, 3, 4), dtype=np.float64)
+    angle_deg = 0.0
     for orbit_position, view_id in enumerate(camera_order):
         index = int(view_id)
-        angle = np.deg2rad(orbit_position * 7.5)
+        angle = np.deg2rad(angle_deg)
         center = np.array([np.cos(angle), 0.0, np.sin(angle)])
         forward = center
         right = np.cross(np.array([0.0, 1.0, 0.0]), forward)
         rotation = np.stack((right, np.array([0.0, 1.0, 0.0]), forward))
         values[index, :, :3] = rotation
         values[index, :, 3] = -rotation @ center
+        angle_deg += orbit_gaps_deg[orbit_position]
     return values
