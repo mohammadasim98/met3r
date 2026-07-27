@@ -1098,13 +1098,16 @@ def validate_adjacent16_final_gate(run_root: str | Path) -> Adjacent16FinalGateR
         if not stress_fields <= set(stress) or stress.empty:
             failures.add("stress_evidence")
         else:
-            valid = [row for row in stress.to_dict("records") if _finite_primary(row)]
-            if len(valid) != len(stress):
-                failures.add("stress_evidence")
-            else:
-                stress_rate = sum(min(float(row["s11_first_to_second_overlap"]), float(row["s11_second_to_first_overlap"])) >= 0.08 for row in valid) / len(valid)
-                if stress_rate < float(contract.raw["analyzability"]["minimum_stress_symmetric_pass_rate"]):
-                    failures.add("stress_symmetric_pass_rate")
+            stress_rate = sum(
+                _finite_primary(row)
+                and min(
+                    float(row["s11_first_to_second_overlap"]),
+                    float(row["s11_second_to_first_overlap"]),
+                ) >= 0.08
+                for row in stress.to_dict("records")
+            ) / len(stress)
+            if stress_rate < float(contract.raw["analyzability"]["minimum_stress_symmetric_pass_rate"]):
+                failures.add("stress_symmetric_pass_rate")
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError, sqlite3.Error, pa.ArrowException):
         failures.add("input_validation")
         if not (root / "registry" / "jobs.sqlite").is_file():

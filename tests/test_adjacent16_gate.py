@@ -411,6 +411,41 @@ def test_common_support_naf_bilinear_pair_uses_intersection_over_union(tmp_path:
     assert failing.failed_checks == ("common_support_retention",)
 
 
+def test_stress_symmetric_pass_rate_counts_invalid_rows_in_the_frozen_denominator(tmp_path: Path) -> None:
+    """Catch invalid stress rows being discarded or treated as a hard evidence failure."""
+
+    fixture = _final_gate_fixture(tmp_path)
+    root = fixture["root"]
+    path = fixture["metrics"]["stress"]
+    assert isinstance(root, Path)
+    frame = pd.read_parquet(path)
+    assert len(frame) == 1152
+    passing_rows = frame.index[:807]
+    abstained_rows = frame.index[807:922]
+    subthreshold_rows = frame.index[922:1037]
+    nonfinite_rows = frame.index[1037:]
+    assert sum(len(rows) for rows in (passing_rows, abstained_rows, subthreshold_rows, nonfinite_rows)) == 1152
+    frame.loc[passing_rows, ["s11_first_to_second_overlap", "s11_second_to_first_overlap"]] = .08
+    frame.loc[abstained_rows, "abstained"] = True
+    frame.loc[subthreshold_rows, "s11_first_to_second_overlap"] = .079
+    frame.loc[nonfinite_rows, "s11_second_to_first_overlap"] = float("nan")
+    frame.to_parquet(path, index=False)
+
+    passing = validate_adjacent16_final_gate(root)
+    assert passing.stress_symmetric_pass_rate == pytest.approx(807 / 1152)
+    assert passing.passed is True
+    assert "stress_evidence" not in passing.failed_checks
+    assert "stress_symmetric_pass_rate" not in passing.failed_checks
+
+    frame.loc[passing_rows[0], "s11_first_to_second_overlap"] = .079
+    frame.to_parquet(path, index=False)
+    failing = validate_adjacent16_final_gate(root)
+    assert failing.actual_rows == failing.expected_rows
+    assert failing.stress_symmetric_pass_rate == pytest.approx(806 / 1152)
+    assert failing.passed is False
+    assert failing.failed_checks == ("stress_symmetric_pass_rate",)
+
+
 def _frozen_config(root: Path) -> None:
     (root / "config").mkdir(parents=True)
     source = Path("configs/adjacent16_core.json")
