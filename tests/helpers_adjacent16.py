@@ -48,10 +48,10 @@ def write_dense_source(
         )
 
 
-def write_valid_stress(root: Path, shoe_id: str, view_id: str) -> None:
+def write_valid_stress(root: Path, shoe_id: str, quartet_id: str, view_id: str) -> None:
     """Write a strict deformation audit for one selected synthetic view."""
 
-    deformation = root / shoe_id / view_id / "deformation"
+    deformation = root / shoe_id / quartet_id / f"view_{view_id}" / "deformation"
     deformation.mkdir(parents=True)
     for name, mode in (("deformed.png", "RGB"), ("deformed_mask.png", "L")):
         Image.new(mode, (1080, 1080)).save(deformation / name)

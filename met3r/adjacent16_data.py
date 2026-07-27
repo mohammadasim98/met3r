@@ -161,10 +161,11 @@ def _stress_record(
     root: Path,
     *,
     shoe_id: str,
+    quartet_id: str,
     view_id: str,
     require_stress: bool,
 ) -> tuple[Path | None, Path | None, Path | None, Path | None, Path | None, str | None, str | None, DeformationQuality | None]:
-    deformation_root = root / shoe_id / view_id / "deformation"
+    deformation_root = root / shoe_id / quartet_id / f"view_{view_id}" / "deformation"
     if not deformation_root.exists() and not require_stress:
         return (None,) * 8
     stress_path = _require_file(deformation_root / "deformed.png", label="stress image")
@@ -260,7 +261,8 @@ def build_adjacent16_manifest(
             for view_id in quartet.view_ids:
                 record = all_records[view_id]
                 stress = _stress_record(
-                    stress_root, shoe_id=shoe_id, view_id=view_id, require_stress=require_stress
+                    stress_root, shoe_id=shoe_id, quartet_id=quartet.quartet_id,
+                    view_id=view_id, require_stress=require_stress
                 )
                 views.append(
                     AdjacentViewRecord(

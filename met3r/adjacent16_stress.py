@@ -16,6 +16,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import uuid
+from contextlib import contextmanager
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -36,6 +39,9 @@ _REQUIRED_FILES = (
     "source.png", "last_render.png", "source_mask.png", "deformed.png",
     "deformed_mask.png", "deformation.json", "metrics.json", "task.json",
 )
+_NON_TASK_FILES = tuple(name for name in _REQUIRED_FILES if name != "task.json")
+_CLAIM_GUARD = threading.Lock()
+_CLAIMS: dict[str, threading.Lock] = {}
 
 
 @dataclass(frozen=True)
@@ -179,58 +185,60 @@ def run_stress_tasks(
         raise ValueError("max_outer_attempts must be positive")
     _validate_tasks(tasks)
     results: dict[str, Mapping[str, object]] = {}
+    gpu_claims = {gpu: threading.BoundedSemaphore(1) for gpu in range(4)}
     with ThreadPoolExecutor(max_workers=max_parallel) as executor:
-        pending = {executor.submit(_run_one_task, task, max_outer_attempts): _task_key(task) for task in tasks}
+        pending = {
+            executor.submit(_run_one_task, task, max_outer_attempts, gpu_claims[task.physical_gpu]): _task_key(task)
+            for task in tasks
+        }
         for future in as_completed(pending):
             results[pending[future]] = future.result()
     accepted = sum(bool(result["accepted"]) for result in results.values())
     return {"accepted": accepted, "rejected": len(results) - accepted, "tasks": results}
 
 
-def _run_one_task(task: StressTask, max_outer_attempts: int) -> Mapping[str, object]:
-    fingerprint = _task_fingerprint(task)
-    if _is_reusable(task.output_dir, fingerprint):
-        return {"accepted": True, "reused": True, "fingerprint": fingerprint}
-    for outer_attempt in range(1, max_outer_attempts + 1):
-        task.output_dir.parent.mkdir(parents=True, exist_ok=True)
-        staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=task.output_dir.parent))
-        try:
-            _copy_inputs(task, staging)
-            command = _deformation_command(task, staging)
-            environment = os.environ.copy()
-            environment["CUDA_VISIBLE_DEVICES"] = str(task.physical_gpu)
-            completed = subprocess.run(
-                command, cwd=_BYTESIZE_RECONSTRUCTION, env=environment,
-                text=True, capture_output=True, check=False,
-            )
-            # The frozen source mask is the one used to recover the target
-            # bbox.  Do not replace it with shoe_deform's independently
-            # segmented convenience mask.
-            shutil.copy2(task.mask_path, staging / "source_mask.png")
-            accepted, acceptance = _accepted(staging, completed.returncode)
-            task_record = {
-                "status": "accepted" if accepted else "rejected",
-                "task_key": _task_key(task), "source_sha256": _sha256(task.source_path),
-                "source_mask_sha256": _sha256(task.mask_path), "last_render_sha256": _sha256(task.last_render_path),
-                "output_hashes": _output_hashes(staging), "command": command,
-                "prompt_version": _PROMPT_VERSION, "outer_attempt": outer_attempt,
-                "fingerprint": fingerprint, "implementation_hash": _implementation_hash(),
-                "bytesize_repository_state": _bytesize_fingerprint(),
-                "camera_label": _CAMERA_LABEL, "acceptance": acceptance,
-                "returncode": completed.returncode,
-            }
-            (staging / "task.json").write_text(json.dumps(task_record, indent=2, sort_keys=True), encoding="utf-8")
-            if accepted:
-                _finalise_accepted(staging, task.output_dir)
+def _run_one_task(
+    task: StressTask, max_outer_attempts: int, gpu_claim: threading.BoundedSemaphore
+) -> Mapping[str, object]:
+    with _output_claim(task.output_dir):
+        fingerprint = _task_fingerprint(task)
+        if _is_reusable(task, fingerprint):
+            return {"accepted": True, "reused": True, "fingerprint": fingerprint}
+        run_id = uuid.uuid4().hex
+        for outer_attempt in range(1, max_outer_attempts + 1):
+            task.output_dir.parent.mkdir(parents=True, exist_ok=True)
+            staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=task.output_dir.parent))
+            record: dict[str, object] | None = None
+            try:
+                _copy_inputs(task, staging)
+                command = _deformation_command(staging)
+                environment = os.environ.copy()
+                environment["CUDA_VISIBLE_DEVICES"] = str(task.physical_gpu)
+                with gpu_claim:
+                    completed = subprocess.run(
+                        command, cwd=_BYTESIZE_RECONSTRUCTION, env=environment,
+                        text=True, capture_output=True, check=False,
+                    )
+                shutil.copy2(task.mask_path, staging / "source_mask.png")
+                accepted, acceptance = _accepted(staging, completed.returncode)
+                record = _task_record(task, fingerprint, command, outer_attempt, acceptance, completed.returncode, run_id)
+                if not accepted:
+                    _write_record(staging, {**record, "status": "rejected", "reason": "acceptance gates failed"})
+                    _archive_rejected(staging, task, outer_attempt, fingerprint, run_id)
+                    continue
+                output_hashes = _verified_output_hashes(staging)
+                _write_record(staging, {**record, "status": "accepted", "output_hashes": output_hashes})
+                _promote(staging, task.output_dir, task, fingerprint, run_id)
                 return {"accepted": True, "reused": False, "fingerprint": fingerprint}
-            _archive_rejected(staging, task, outer_attempt, fingerprint)
-        except Exception as error:
-            if staging.exists():
-                _archive_rejected(staging, task, outer_attempt, fingerprint)
-            if outer_attempt == max_outer_attempts:
-                return {"accepted": False, "error": str(error), "fingerprint": fingerprint}
-        # staging was renamed to its archive on rejection.
-    return {"accepted": False, "fingerprint": fingerprint}
+            except Exception as error:
+                if staging.exists():
+                    rejected = {**(record or _task_record(task, fingerprint, [], outer_attempt, _false_acceptance(), None, run_id)),
+                                "status": "rejected", "reason": str(error), "acceptance": _false_acceptance()}
+                    _write_record(staging, rejected)
+                    _archive_rejected(staging, task, outer_attempt, fingerprint, run_id)
+                if outer_attempt == max_outer_attempts:
+                    return {"accepted": False, "error": str(error), "fingerprint": fingerprint}
+        return {"accepted": False, "fingerprint": fingerprint}
 
 
 def _accepted(staging: Path, returncode: int) -> tuple[bool, dict[str, bool]]:
@@ -264,35 +272,38 @@ def _copy_inputs(task: StressTask, staging: Path) -> None:
         shutil.copy2(source, staging / name)
 
 
-def _deformation_command(task: StressTask, staging: Path) -> list[str]:
-    return [sys.executable, "-m", "shoe_deform", "--image", str(task.source_path), "--last-render", str(task.last_render_path), "--output-dir", str(staging), "--max-attempts", "2"]
+def _deformation_command(staging: Path) -> list[str]:
+    return [
+        sys.executable, "-m", "shoe_deform", "--image", str(staging / "source.png"),
+        "--last-render", str(staging / "last_render.png"), "--output-dir", str(staging),
+        "--max-attempts", "2",
+    ]
 
 
-def _finalise_accepted(staging: Path, output_dir: Path) -> None:
-    # Preserve the source-mask provenance instead of the segmenter-derived
-    # mask that shoe_deform writes internally.
-    required = set(_REQUIRED_FILES) - {"task.json"}
-    missing = [name for name in required if not (staging / name).is_file()]
-    if missing:
-        raise ValueError(f"accepted deformation is missing required artifacts: {missing}")
-    parent = output_dir.parent
-    backup = parent / f".superseded-{output_dir.name}-{os.urandom(6).hex()}"
-    if output_dir.exists():
-        os.replace(output_dir, backup)
-    os.replace(staging, output_dir)
-    if backup.exists():
-        shutil.rmtree(backup)
+def _promote(staging: Path, output_dir: Path, task: StressTask, fingerprint: str, run_id: str) -> None:
+    """Atomically install staging; never delete an accepted predecessor."""
 
-
-def _archive_rejected(staging: Path, task: StressTask, outer_attempt: int, fingerprint: str) -> None:
-    archive = task.output_dir.parent / "rejected_attempts" / fingerprint / f"outer_{outer_attempt:02d}"
+    if not output_dir.exists():
+        os.replace(staging, output_dir)
+        return
+    _rename_exchange(staging, output_dir)
+    # Exchange leaves the old canonical at staging, where it can be retained
+    # immutably instead of being deleted after a successful replacement.
+    archive = output_dir.parent / "superseded_accepted" / fingerprint / f"run_{run_id}"
     archive.parent.mkdir(parents=True, exist_ok=True)
-    if archive.exists():
-        shutil.rmtree(archive)
     os.replace(staging, archive)
 
 
-def _is_reusable(output_dir: Path, fingerprint: str) -> bool:
+def _archive_rejected(
+    staging: Path, task: StressTask, outer_attempt: int, fingerprint: str, run_id: str
+) -> None:
+    archive = task.output_dir.parent / "rejected_attempts" / fingerprint / f"run_{run_id}" / f"outer_{outer_attempt:02d}"
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(staging, archive)
+
+
+def _is_reusable(task: StressTask, fingerprint: str) -> bool:
+    output_dir = task.output_dir
     task_path = output_dir / "task.json"
     if not task_path.is_file() or any(not (output_dir / name).is_file() for name in _REQUIRED_FILES):
         return False
@@ -300,7 +311,17 @@ def _is_reusable(output_dir: Path, fingerprint: str) -> bool:
         record = _json_object(task_path)
     except (OSError, ValueError):
         return False
-    return record.get("status") == "accepted" and record.get("fingerprint") == fingerprint
+    try:
+        expected_inputs = _input_hashes(task)
+        expected_outputs = _verified_output_hashes(output_dir)
+    except (OSError, ValueError):
+        return False
+    return (
+        record.get("status") == "accepted"
+        and record.get("fingerprint") == fingerprint
+        and record.get("input_hashes") == expected_inputs
+        and record.get("output_hashes") == expected_outputs
+    )
 
 
 def _task_fingerprint(task: StressTask) -> str:
@@ -311,6 +332,36 @@ def _task_fingerprint(task: StressTask) -> str:
         "camera_label": _CAMERA_LABEL,
     }
     return _hash_json(payload)
+
+
+def _input_hashes(task: StressTask) -> Mapping[str, str]:
+    return {
+        "source.png": _sha256(task.source_path), "source_mask.png": _sha256(task.mask_path),
+        "last_render.png": _sha256(task.last_render_path),
+    }
+
+
+def _false_acceptance() -> dict[str, bool]:
+    return {"camera_preserved": False, "background_preserved": False, "crop_preservation_gate": False}
+
+
+def _task_record(
+    task: StressTask, fingerprint: str, command: Sequence[str], outer_attempt: int,
+    acceptance: Mapping[str, bool], returncode: int | None, run_id: str,
+) -> dict[str, object]:
+    return {
+        "task_key": _task_key(task), "run_id": run_id, "input_hashes": _input_hashes(task),
+        "command": list(command), "prompt_version": _PROMPT_VERSION,
+        "outer_attempt": outer_attempt, "fingerprint": fingerprint,
+        "implementation_hash": _implementation_hash(),
+        "bytesize_repository_state": _bytesize_fingerprint(),
+        "camera_label": _CAMERA_LABEL, "acceptance": dict(acceptance),
+        "returncode": returncode,
+    }
+
+
+def _write_record(directory: Path, record: Mapping[str, object]) -> None:
+    (directory / "task.json").write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def _implementation_hash() -> str:
@@ -327,12 +378,19 @@ def _bytesize_fingerprint() -> Mapping[str, object]:
         if process.returncode:
             raise RuntimeError(f"cannot fingerprint ByteSize: {stderr.strip()}")
         return stdout
+    untracked = git("ls-files", "--others", "--exclude-standard", "-z").split("\0")
+    untracked_hashes = {
+        name: _sha256(_BYTESIZE_RECONSTRUCTION / name)
+        for name in untracked if name and (_BYTESIZE_RECONSTRUCTION / name).is_file()
+    }
     status = git("status", "--porcelain=v1")
     return {
         "repository": str(_BYTESIZE_RECONSTRUCTION), "head": git("rev-parse", "HEAD").strip(),
         "dirty": bool(status), "status_porcelain_v1": status.splitlines(),
-        "diff_sha256": hashlib.sha256(git("diff", "--no-ext-diff", "--binary").encode()).hexdigest(),
-        "last_view_match_render_sha256": _sha256(_BYTESIZE_RECONSTRUCTION / "last_view_match" / "render.py"),
+        "unstaged_binary_diff_sha256": hashlib.sha256(git("diff", "--no-ext-diff", "--binary").encode()).hexdigest(),
+        "staged_binary_diff_sha256": hashlib.sha256(git("diff", "--cached", "--no-ext-diff", "--binary").encode()).hexdigest(),
+        "untracked_file_sha256": untracked_hashes,
+        "last_view_match_tree_sha256": _tree_hash(_BYTESIZE_RECONSTRUCTION / "last_view_match"),
         "shoe_deform_tree_sha256": _tree_hash(_BYTESIZE_RECONSTRUCTION / "shoe_deform"),
     }
 
@@ -458,14 +516,48 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _output_hashes(directory: Path) -> Mapping[str, str]:
-    """Hash materialized artifacts that exist before the task record itself."""
+def _verified_output_hashes(directory: Path) -> Mapping[str, str]:
+    """Verify and hash exactly the non-task accepted artifacts."""
 
-    return {
-        path.name: _sha256(path)
-        for path in sorted(directory.iterdir())
-        if path.is_file() and path.name != "task.json"
-    }
+    missing = [name for name in _NON_TASK_FILES if not (directory / name).is_file()]
+    if missing:
+        raise ValueError(f"accepted deformation is missing required artifacts: {missing}")
+    return {name: _sha256(directory / name) for name in _NON_TASK_FILES}
+
+
+@contextmanager
+def _output_claim(output_dir: Path):
+    """Cross-thread and cross-process lock for one canonical deformation path."""
+
+    import fcntl  # Linux is the supported production platform for this run.
+
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    key = str(output_dir.resolve())
+    with _CLAIM_GUARD:
+        thread_claim = _CLAIMS.setdefault(key, threading.Lock())
+    with thread_claim:
+        claim_path = output_dir.parent / f".{output_dir.name}.claim.lock"
+        with claim_path.open("a+") as claim:
+            fcntl.flock(claim.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(claim.fileno(), fcntl.LOCK_UN)
+
+
+def _rename_exchange(first: Path, second: Path) -> None:
+    """Use Linux renameat2(RENAME_EXCHANGE), never a delete-then-replace swap."""
+
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise OSError("renameat2(RENAME_EXCHANGE) is required to replace an accepted deformation")
+    result = renameat2(-100, os.fsencode(first), -100, os.fsencode(second), 0x2)
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, f"renameat2 exchange failed: {first} <-> {second}")
 
 
 def _tree_hash(directory: Path) -> str:

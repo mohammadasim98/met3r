@@ -95,8 +95,8 @@ def test_manifest_rejects_present_stress_view_with_incomplete_audit(dense_contra
 
     shoe_id = next(iter(dense_contract.raw["shoes"]))
     assert isinstance(shoe_id, str)
-    write_valid_stress(dense_contract.stress_root, shoe_id, "1")
-    (dense_contract.stress_root / shoe_id / "1/deformation/metrics.json").unlink()
+    write_valid_stress(dense_contract.stress_root, shoe_id, "q0", "1")
+    (dense_contract.stress_root / shoe_id / "q0/view_1/deformation/metrics.json").unlink()
 
     with pytest.raises(FileNotFoundError, match="stress deformation metrics"):
         build_adjacent16_manifest(dense_contract, require_stress=True)
