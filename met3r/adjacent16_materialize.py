@@ -85,6 +85,19 @@ def _expected_metadata(
     }
 
 
+def _images_manifest(state: AdjacentImageState) -> dict[str, object]:
+    return {
+        "views": [
+            {
+                "view_id": view_id,
+                "image": f"images/{view_id}.png",
+                "mask": f"masks/{view_id}.png",
+            }
+            for view_id in state.view_ids
+        ]
+    }
+
+
 def _expected_view(
     state: AdjacentImageState,
     records: dict[str, AdjacentViewRecord],
@@ -132,7 +145,9 @@ def _matches(
         canonical_metadata = json.loads(json.dumps(metadata, sort_keys=True))
         if json.loads((destination / "state.json").read_text(encoding="utf-8")) != canonical_metadata:
             return False
-        expected_files = {"state.json"}
+        if json.loads((destination / "images.json").read_text(encoding="utf-8")) != _images_manifest(state):
+            return False
+        expected_files = {"state.json", "images.json"}
         for view_id in state.view_ids:
             expected_files.update({f"images/{view_id}.png", f"masks/{view_id}.png"})
         actual_files = {str(path.relative_to(destination)) for path in destination.rglob("*") if path.is_file()}
@@ -159,9 +174,12 @@ def _replace(temporary: Path, destination: Path) -> None:
     backup: Path | None = None
     try:
         if destination.exists():
-            backup = destination.with_name(f".{destination.name}.backup")
-            if backup.exists():
-                shutil.rmtree(backup)
+            backup = Path(
+                tempfile.mkdtemp(
+                    prefix=f".{destination.name}.backup.", dir=destination.parent
+                )
+            )
+            backup.rmdir()
             destination.rename(backup)
         temporary.rename(destination)
         if backup is not None:
@@ -208,6 +226,10 @@ def materialize_adjacent_state(
             image, mask = _expected_view(state, records, view_id, stage_size, manifest=manifest)
             Image.fromarray(image).save(images / f"{view_id}.png")
             Image.fromarray(mask.astype(np.uint8) * 255).save(masks / f"{view_id}.png")
+        (temporary / "images.json").write_text(
+            json.dumps(_images_manifest(state), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
         (temporary / "state.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         if not _matches(temporary, state, metadata):
             raise RuntimeError("staged state failed canonical validation")

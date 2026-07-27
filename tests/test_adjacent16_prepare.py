@@ -3,12 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from met3r.adjacent16_contract import load_adjacent16_contract
-from met3r.adjacent16_prepare import prepare_adjacent16_run
+from met3r.adjacent16_data import build_adjacent16_manifest
+from met3r.adjacent16_prepare import _write_camera_artifact, prepare_adjacent16_run
 from tests.helpers_adjacent16 import write_dense_source, write_valid_stress
 
 
@@ -101,3 +103,20 @@ def test_failed_stress_audit_blocks_before_registration(tmp_path: Path) -> None:
     with pytest.raises(ValueError):
         prepare_adjacent16_run(CONFIG, output_root=tmp_path / "run", reconstruction_root=source, stress_root=stress)
     assert not (tmp_path / "run" / "registry" / "jobs.sqlite").exists()
+
+
+def test_camera_resume_replaces_nested_junk(tmp_path: Path) -> None:
+    contract = load_adjacent16_contract(CONFIG)
+    source = tmp_path / "reconstruction"
+    write_dense_source(source, contract)
+    contract = replace(contract, reconstruction_root=source)
+    manifest = build_adjacent16_manifest(contract, require_stress=False)
+    shoe_id = manifest.shoes[0].shoe_id
+    destination = tmp_path / "run" / "cameras" / shoe_id / "q0"
+
+    _write_camera_artifact(manifest, tmp_path / "run", shoe_id, "q0")
+    (destination / "nested").mkdir()
+    (destination / "nested" / "junk.txt").write_text("junk")
+    _write_camera_artifact(manifest, tmp_path / "run", shoe_id, "q0")
+
+    assert not (destination / "nested").exists()

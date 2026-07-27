@@ -111,7 +111,12 @@ def _camera_matches(destination: Path, arrays: Mapping[str, np.ndarray], images:
             return False
         if json.loads((destination / "metadata.json").read_text(encoding="utf-8")) != metadata:
             return False
-        return {path.name for path in destination.iterdir() if path.is_file()} == {"cameras.npz", "images.json", "metadata.json"}
+        actual_files = {
+            str(path.relative_to(destination))
+            for path in destination.rglob("*")
+            if path.is_file()
+        }
+        return actual_files == {"cameras.npz", "images.json", "metadata.json"}
     except (OSError, ValueError, json.JSONDecodeError):
         return False
 
