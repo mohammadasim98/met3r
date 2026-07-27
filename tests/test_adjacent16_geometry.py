@@ -152,6 +152,145 @@ def _patch_model(monkeypatch: pytest.MonkeyPatch, model: _FakeDepthModel) -> Non
     )
 
 
+def _assert_one_attempt_rejection(
+    run_root: Path,
+    registry: JobRegistry,
+    state_dir: Path,
+    model: _FakeDepthModel,
+    *,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        run_geometry_worker(run_root, "shoe-a", "cpu", "/fake/da3")
+
+    assert model.calls == []
+    assert not (run_root / "geometry" / state_dir.name).exists()
+    job_id = f"geometry__{state_dir.name}"
+    assert registry.validated_state(job_id) == "failed"
+    with sqlite3.connect(registry.path) as connection:
+        attempts = connection.execute(
+            "SELECT attempts FROM jobs WHERE job_id = ?", (job_id,)
+        ).fetchone()[0]
+    assert attempts == 1
+
+
+def _images_manifest(state_dir: Path) -> dict[str, object]:
+    return json.loads((state_dir / "images.json").read_text())
+
+
+def _write_images_manifest(state_dir: Path, manifest: dict[str, object]) -> None:
+    (state_dir / "images.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+
+@pytest.mark.parametrize("unsafe_view_id", ["../escape", "/tmp/escape", "40\\escape", ".", ".."])
+def test_geometry_rejects_unsafe_manifest_view_ids_before_file_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unsafe_view_id: str,
+) -> None:
+    run_root, registry, state_dir, _ = _write_adjacent_run(tmp_path)
+    manifest = _images_manifest(state_dir)
+    view = manifest["views"][0]
+    assert isinstance(view, dict)
+    view.update(
+        {
+            "view_id": unsafe_view_id,
+            "image": f"images/{unsafe_view_id}.png",
+            "mask": f"masks/{unsafe_view_id}.png",
+        }
+    )
+    _write_images_manifest(state_dir, manifest)
+    external_sentinel = tmp_path / "outside.png"
+    external_sentinel.write_bytes(b"must-not-change")
+    model = _FakeDepthModel()
+    _patch_model(monkeypatch, model)
+
+    _assert_one_attempt_rejection(
+        run_root,
+        registry,
+        state_dir,
+        model,
+        message="unsafe materialized state view ID",
+    )
+
+    assert external_sentinel.read_bytes() == b"must-not-change"
+
+
+@pytest.mark.parametrize("case", ["missing", "extra", "nested", "duplicate"])
+def test_geometry_rejects_noncanonical_state_artifact_sets_before_inference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    run_root, registry, state_dir, _ = _write_adjacent_run(tmp_path)
+    if case == "missing":
+        (state_dir / "images" / "40.png").unlink()
+    elif case == "extra":
+        Image.new("RGB", (504, 504), "white").save(
+            state_dir / "images" / "extra.png"
+        )
+    elif case == "nested":
+        nested = state_dir / "masks" / "nested"
+        nested.mkdir()
+        Image.fromarray(np.ones((504, 504), dtype=np.uint8) * 255).save(
+            nested / "extra.png"
+        )
+    elif case == "duplicate":
+        manifest = _images_manifest(state_dir)
+        view = manifest["views"][1]
+        assert isinstance(view, dict)
+        view.update(
+            {
+                "view_id": "40",
+                "image": "images/40.png",
+                "mask": "masks/40.png",
+            }
+        )
+        _write_images_manifest(state_dir, manifest)
+    else:
+        raise AssertionError(f"unhandled state-artifact case: {case}")
+    model = _FakeDepthModel()
+    _patch_model(monkeypatch, model)
+
+    _assert_one_attempt_rejection(
+        run_root,
+        registry,
+        state_dir,
+        model,
+        message=("duplicate view IDs" if case == "duplicate" else "artifact set"),
+    )
+
+
+def test_geometry_rejects_symlinked_state_artifact_without_reading_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_root, registry, state_dir, _ = _write_adjacent_run(tmp_path)
+    external = tmp_path / "external.png"
+    Image.new("RGB", (504, 504), "white").save(external)
+    image_path = state_dir / "images" / "40.png"
+    image_path.unlink()
+    image_path.symlink_to(external)
+    original_open = Image.open
+
+    def reject_external_read(path: object, *args: object, **kwargs: object):
+        if Path(path).resolve() == external.resolve():
+            raise AssertionError("external artifact target was read")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("met3r.upper_geometry.Image.open", reject_external_read)
+    model = _FakeDepthModel()
+    _patch_model(monkeypatch, model)
+
+    _assert_one_attempt_rejection(
+        run_root,
+        registry,
+        state_dir,
+        model,
+        message="artifact set",
+    )
+
+
 def test_geometry_uses_exact_q3_state_order_through_depth_and_calibration(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -34,6 +35,7 @@ from .upper_design import MaterializedState
 
 _PROCESS_RES = 504
 _STALE_SECONDS = 21_600
+_SAFE_VIEW_ID = re.compile(r"[A-Za-z0-9_.-]+\Z")
 _TRANSIENT_ERRNOS = frozenset(
     {
         errno.EAGAIN,
@@ -65,6 +67,36 @@ def _path_within(path: str | Path, root: Path, label: str) -> Path:
     except ValueError as error:
         raise ValueError(f"{label} must be inside {root}: {resolved}") from error
     return resolved
+
+
+def _validated_view_id(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value in {".", ".."}
+        or "\x00" in value
+        or "/" in value
+        or "\\" in value
+        or _SAFE_VIEW_ID.fullmatch(value) is None
+    ):
+        raise ValueError("unsafe materialized state view ID")
+    return value
+
+
+def _validate_state_artifact_set(
+    root: Path,
+    expected_paths: tuple[Path, ...],
+    label: str,
+) -> None:
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError(f"materialized state artifact set is not exact: {label}")
+    actual_paths: set[Path] = set()
+    for path in root.rglob("*"):
+        if path.is_symlink() or path.is_dir() or not path.is_file():
+            raise ValueError(f"materialized state artifact set is not exact: {label}")
+        actual_paths.add(path)
+    if actual_paths != set(expected_paths):
+        raise ValueError(f"materialized state artifact set is not exact: {label}")
 
 
 def _load_config(run_root: Path) -> tuple[Mapping[str, object], str, str]:
@@ -109,27 +141,42 @@ def _read_materialized_state(state_dir: Path) -> MaterializedState:
     records = images_manifest.get("views")
     if not isinstance(records, list) or len(records) != 4:
         raise ValueError("materialized state images.json must contain exactly four views")
+    manifest_records: list[Mapping[str, object]] = []
     view_ids: list[str] = []
-    image_paths: list[Path] = []
-    mask_paths: list[Path] = []
     for record in records:
         if not isinstance(record, Mapping):
             raise ValueError("materialized state images.json view is malformed")
-        view_id = record.get("view_id")
-        if not isinstance(view_id, str) or not view_id:
-            raise ValueError("materialized state images.json view ID is malformed")
-        expected_image = f"images/{view_id}.png"
-        expected_mask = f"masks/{view_id}.png"
-        if record.get("image") != expected_image or record.get("mask") != expected_mask:
-            raise ValueError("materialized state images.json path contract mismatch")
+        view_id = _validated_view_id(record.get("view_id"))
+        manifest_records.append(record)
         view_ids.append(view_id)
-        image_paths.append(state_dir / expected_image)
-        mask_paths.append(state_dir / expected_mask)
     if len(set(view_ids)) != 4:
         raise ValueError("materialized state images.json has duplicate view IDs")
     exact_view_ids = tuple(view_ids)
     if len(exact_view_ids) != 4:
         raise AssertionError("four-view state contract was not enforced")
+    image_root = state_dir / "images"
+    mask_root = state_dir / "masks"
+    image_paths: list[Path] = []
+    mask_paths: list[Path] = []
+    for record, view_id in zip(manifest_records, exact_view_ids):
+        expected_image = f"images/{view_id}.png"
+        expected_mask = f"masks/{view_id}.png"
+        if record.get("image") != expected_image or record.get("mask") != expected_mask:
+            raise ValueError("materialized state images.json path contract mismatch")
+        image_paths.append(image_root / f"{view_id}.png")
+        mask_paths.append(mask_root / f"{view_id}.png")
+    exact_image_paths = tuple(image_paths)
+    exact_mask_paths = tuple(mask_paths)
+    _validate_state_artifact_set(image_root, exact_image_paths, "images")
+    _validate_state_artifact_set(mask_root, exact_mask_paths, "masks")
+    image_paths = [
+        _path_within(path, image_root, "materialized state image")
+        for path in exact_image_paths
+    ]
+    mask_paths = [
+        _path_within(path, mask_root, "materialized state mask")
+        for path in exact_mask_paths
+    ]
     for metadata_view_ids in (state.get("view_ids"), metadata.get("view_ids")):
         if metadata_view_ids is not None:
             if (
