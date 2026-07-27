@@ -844,6 +844,33 @@ def test_runtime_projection_rejects_bad_sentinel_evidence(tmp_path: Path, mutati
     assert ("sentinel_job_state" if mutation in {"failed", "pending"} else "runtime_validation") in report.failed_checks
 
 
+@pytest.mark.parametrize("mutation", ("missing", "ambiguous", "unclassifiable"))
+def test_runtime_projection_rejects_missing_ambiguous_or_unclassifiable_sentinels(tmp_path: Path, mutation: str) -> None:
+    """Catch selection evidence that no longer resolves to one frozen runtime class."""
+
+    root, registry, ids = _runtime_failure_fixture(tmp_path)
+    changed = ids[1::3]
+    states = {row["state_id"]: row for row in (json.loads(line) for line in (root / "manifests" / "image_states.jsonl").read_text().splitlines())}
+    with sqlite3.connect(registry.path) as connection:
+        payloads = [json.loads(connection.execute("SELECT payload_json FROM jobs WHERE job_id=?", (job_id,)).fetchone()[0]) for job_id in changed]
+        assert all(states[payload["state_id"]][field] == value for payload in payloads for field, value in (("quartet_id", "q0"), ("corruption", "translation"), ("severity", .2), ("changed_view", "1")))
+        target = changed[0]
+        if mutation == "missing":
+            connection.execute("DELETE FROM jobs WHERE job_id=?", (target,))
+        elif mutation == "ambiguous":
+            payload_json = connection.execute("SELECT payload_json FROM jobs WHERE job_id=?", (target,)).fetchone()[0]
+            payload_hash = hashlib.sha256(payload_json.encode()).hexdigest()
+            connection.execute("INSERT INTO jobs(job_id, phase, state, payload_json, payload_hash) VALUES (?, 'feature', 'pending', ?, ?)", ("feature__ambiguous_sentinel", payload_json, payload_hash))
+        else:
+            payload = json.loads(connection.execute("SELECT payload_json FROM jobs WHERE job_id=?", (target,)).fetchone()[0])
+            payload["job_type"] = "unclassifiable"
+            canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            connection.execute("UPDATE jobs SET payload_json=?, payload_hash=? WHERE job_id=?", (canonical, hashlib.sha256(canonical.encode()).hexdigest(), target))
+    report = validate_timed_runtime_projection(root)
+    assert report.passed is False
+    assert report.failed_checks == ("runtime_validation",)
+
+
 def test_final_gate_reports_missing_inputs_as_failed_evidence(tmp_path: Path) -> None:
     """Catch a final gate that turns absent analysis artifacts into zero evidence."""
 
