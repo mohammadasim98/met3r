@@ -6,6 +6,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 import pytest
+import pandas as pd
 
 from met3r.adjacent16_gate import (
     validate_adjacent16_final_gate,
@@ -88,6 +89,51 @@ def test_independent_manifest_design_registers_the_exact_production_job_graph(tm
     assert sum(payload["job_type"] == "geometry_calibration_feature" for payload in payloads) == 16
     assert sum(payload["job_type"] == "stress" for payload in payloads) == 64
     assert all(payload["geometry_contract"] in {"fixed_base_only", "base_plus_adaptive"} for payload in payloads)
+
+
+def _metric_row(condition: dict[str, object], variant: object, config_hash: str, **extra: object) -> dict[str, object]:
+    return {**condition, "variant_key": variant.key, "feature_track": variant.feature_track, "backbone": variant.backbone, "input_size": variant.input_size, "feature_mode": variant.feature_mode, "resolution": variant.resolution, "config_sha256": config_hash, "camera_label": "fixed/precomputed DA3 cameras (not calibrated GT)", "camera_provenance": "fixed_precomputed_da3", "abstained": False, "score": .8, "s00": .8, "s10": .8, "s01": .8, "s11": .8, "s11_first_to_second_overlap": .8, "s11_second_to_first_overlap": .8, **extra}
+
+
+def _write_frozen_metric_tables(root: Path, contract: object, design: object, config_hash: str) -> dict[str, Path]:
+    controlled = [_metric_row(asdict(condition), variant, config_hash) for condition in design.controlled_conditions for variant in design.feature_variants]
+    stress = [_metric_row(asdict(condition), variant, config_hash) for condition in design.stress_conditions for variant in design.feature_variants]
+    calibration_variants = [variant for variant in design.feature_variants if variant.key in contract.geometry_calibration_variant_keys]
+    calibration = []
+    kind_map = {"rotation": "rotation_degrees", "relative_translation": "relative_translation", "depth_scale": "depth_scale", "relative_depth_noise": "relative_depth_noise_std"}
+    clean = [state for state in design.controlled_states if state.corruption == "clean"]
+    for state in clean:
+        pairs = [asdict(row) for row in design.controlled_conditions if row.image_state_id == state.state_id]
+        for changed in state.view_ids:
+            for condition in pairs:
+                if changed not in {condition["first_view"], condition["second_view"]}:
+                    continue
+                for kind, config_name in kind_map.items():
+                    for magnitude in contract.raw["geometry_calibration"][config_name]:
+                        for variant in calibration_variants:
+                            calibration.append(_metric_row(condition, variant, config_hash, changed_view=changed, perturbation_kind=kind, magnitude=float(magnitude)))
+    metrics = root / "metrics"
+    metrics.mkdir(parents=True, exist_ok=True)
+    paths = {"controlled": metrics / "controlled_fidelity.parquet", "stress": metrics / "real_deformation_stress.parquet", "geometry_calibration": metrics / "geometry_calibration.parquet"}
+    for name, rows in (("controlled", controlled), ("stress", stress), ("geometry_calibration", calibration)):
+        pd.DataFrame(rows).to_parquet(paths[name], index=False)
+    return paths
+
+
+def test_independent_metric_fixture_has_all_frozen_rows_and_unique_keys(tmp_path: Path) -> None:
+    """Catch metric fixtures that replace frozen hard cells with duplicate easy rows."""
+
+    _paths, contract, design = _write_frozen_manifest_fixture(tmp_path / "run")
+    tables = _write_frozen_metric_tables(tmp_path / "run", contract, design, "a" * 64)
+    controlled, stress, calibration = (pd.read_parquet(tables[name]) for name in ("controlled", "stress", "geometry_calibration"))
+
+    assert (len(controlled), len(stress), len(calibration)) == (31104, 1152, 6528)
+    assert not controlled.duplicated(["shoe_id", "quartet_id", "first_view", "second_view", "changed_view", "corruption", "severity", "variant_key"]).any()
+    assert not stress.duplicated(["shoe_id", "quartet_id", "first_view", "second_view", "variant_key"]).any()
+    assert not calibration.duplicated(["shoe_id", "quartet_id", "first_view", "second_view", "changed_view", "perturbation_kind", "magnitude", "variant_key"]).any()
+    assert set(controlled.loc[controlled.corruption == "identity_swap", "severity"]) == {1.0}
+    assert set(controlled.variant_key) == {variant.key for variant in design.feature_variants}
+    assert set(calibration.perturbation_kind) == {"rotation", "relative_translation", "depth_scale", "relative_depth_noise"}
 
 
 def _frozen_config(root: Path) -> None:
