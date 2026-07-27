@@ -25,6 +25,7 @@ import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
 from .camera_metadata import CAMERA_MODE_LABEL
+from .adjacent16_design import Adjacent16Design
 from .da3_depth import DEFAULT_DA3_MODEL_ID, DEFAULT_DA3_REVISION
 from .features import BACKBONE_SPECS, NAF_REVISION
 from .job_registry import JobRegistry, sha256_file
@@ -308,6 +309,7 @@ def _track_for_job(row: _RegistryRow) -> str | None:
     return {
         "feature": "controlled",
         "geometry_calibration": "geometry_calibration",
+        "geometry_calibration_feature": "geometry_calibration",
         "stress": "stress",
     }.get(str(row.payload.get("job_type")))
 
@@ -318,6 +320,7 @@ def _expected_metric_part(root: Path, row: _RegistryRow, track: str) -> Path:
         "feature": ("controlled", "controlled"),
         "stress": ("stress", "stress"),
         "geometry_calibration": ("geometry_calibration", "controlled"),
+        "geometry_calibration_feature": ("geometry_calibration", "controlled"),
     }.get(job_type)
     if expected is None or expected != (
         track,
@@ -329,7 +332,7 @@ def _expected_metric_part(root: Path, row: _RegistryRow, track: str) -> Path:
         raise ValueError(f"metric job payload routing is invalid: {row.job_id}")
     directory = (
         "geometry_calibration"
-        if job_type == "geometry_calibration"
+        if job_type in {"geometry_calibration", "geometry_calibration_feature"}
         else feature_track
     )
     return (
@@ -348,32 +351,56 @@ def _part_paths(
     *,
     completed_only: bool = True,
 ) -> tuple[Path, ...]:
+    registered = _registered_metric_parts(root, rows)
     parts: list[Path] = []
     for row in rows:
         if _track_for_job(row) != track:
             continue
         if completed_only and row.state != "completed":
             continue
+        part = registered.get(row.job_id)
+        if part is not None:
+            parts.append(part)
+    return tuple(sorted(parts))
+
+
+def _registered_metric_parts(
+    root: Path,
+    rows: Sequence[_RegistryRow],
+) -> Mapping[str, Path]:
+    """Return completed metric parts after checking their registry ownership."""
+
+    part_root = (root / "metrics" / "parts").resolve()
+    registered: dict[str, Path] = {}
+    paths: set[Path] = set()
+    for row in rows:
+        track = _track_for_job(row)
+        if track is None or row.state != "completed":
+            continue
         parquet = tuple(
             path
             for path in _manifest_files(row, root)
-            if path.suffix == ".parquet"
-            and path.is_relative_to((root / "metrics" / "parts").resolve())
+            if path.suffix == ".parquet" and path.is_relative_to(part_root)
         )
-        if row.state == "completed" and len(parquet) != 1:
+        if len(parquet) != 1:
             raise ValueError(
                 f"completed metric job must register one Parquet part: {row.job_id}"
             )
-        if row.state == "completed" and parquet[0] != _expected_metric_part(
-            root, row, track
-        ):
-            raise ValueError(
-                f"metric part is not at the exact Task 7 path: {row.job_id}"
-            )
-        parts.extend(parquet)
-    if len(parts) != len(set(parts)):
-        raise ValueError("multiple registry jobs reference the same metric part")
-    return tuple(sorted(parts))
+        expected = _expected_metric_part(root, row, track)
+        if parquet[0] != expected:
+            raise ValueError(f"metric part is not at the exact Task 7 path: {row.job_id}")
+        if parquet[0] in paths:
+            raise ValueError("multiple registry jobs reference the same metric part")
+        paths.add(parquet[0])
+        registered[row.job_id] = parquet[0]
+    actual = {
+        path.resolve()
+        for path in part_root.rglob("*.parquet")
+        if path.is_file()
+    } if part_root.exists() else set()
+    if actual != paths:
+        raise ValueError("metric parts are not exactly registry-owned")
+    return registered
 
 
 def _primary_key(track: str) -> tuple[str, ...]:
@@ -386,6 +413,185 @@ def _primary_key(track: str) -> tuple[str, ...]:
         "perturbation_kind",
         "magnitude",
     )
+
+
+_ADJACENT16_CALIBRATION_MAGNITUDES = {
+    "rotation": (0.25, 0.5, 1.0, 2.0, 5.0),
+    "relative_translation": (0.0025, 0.005, 0.01, 0.02),
+    "depth_scale": (1.01, 1.02, 1.05, 1.1),
+    "relative_depth_noise": (0.005, 0.01, 0.02, 0.05),
+}
+_ADJACENT16_CALIBRATION_VARIANT_KEYS = frozenset(
+    {
+        "user_37_grid_track__dinov3_vitl16_pixal3d__592__bilinear__37",
+        "user_37_grid_track__dinov3_vitl16_pixal3d__592__naf_normal_guide__592",
+    }
+)
+
+
+def _adjacent_selected_variants(
+    row: _RegistryRow,
+    design: Adjacent16Design,
+) -> tuple[FeatureVariant, ...]:
+    requested = row.payload.get("variant_keys")
+    if (
+        not isinstance(requested, Sequence)
+        or isinstance(requested, (str, bytes))
+        or not requested
+        or any(not isinstance(key, str) for key in requested)
+        or len(set(requested)) != len(requested)
+    ):
+        raise ValueError(f"adjacent metric job variants are invalid: {row.job_id}")
+    variants = {variant.key: variant for variant in design.feature_variants}
+    if not set(requested) <= set(variants):
+        raise ValueError(f"adjacent metric job variants are unknown: {row.job_id}")
+    selected = tuple(variant for variant in design.feature_variants if variant.key in requested)
+    if not selected or any(
+        variant.backbone != row.payload.get("backbone")
+        or variant.feature_track != row.payload.get("feature_track")
+        for variant in selected
+    ):
+        raise ValueError(f"adjacent metric job variants do not match payload: {row.job_id}")
+    if row.payload.get("job_type") == "geometry_calibration_feature" and (
+        set(requested) != _ADJACENT16_CALIBRATION_VARIANT_KEYS
+    ):
+        raise ValueError("adjacent calibration must own exactly the frozen variants")
+    return selected
+
+
+def _adjacent_expected_rows(
+    row: _RegistryRow,
+    design: Adjacent16Design,
+) -> tuple[str, Mapping[tuple[object, ...], Mapping[str, object]]]:
+    """Build independent per-job ownership records from frozen design inputs."""
+
+    track = _track_for_job(row)
+    if track is None:
+        raise ValueError(f"adjacent metric job has no analysis track: {row.job_id}")
+    job_type = row.payload.get("job_type")
+    state_id = row.payload.get("state_id")
+    if not isinstance(state_id, str):
+        raise ValueError(f"adjacent metric job has no state: {row.job_id}")
+    states = {
+        state.state_id: state
+        for state in (*design.controlled_states, *design.stress_states)
+    }
+    state = states.get(state_id)
+    if state is None:
+        raise ValueError(f"adjacent metric job has an unknown state: {row.job_id}")
+    expected_state_track = "stress" if job_type == "stress" else "controlled"
+    if (
+        state.track != expected_state_track
+        or row.payload.get("track") != expected_state_track
+        or row.payload.get("shoe_id") != state.shoe_id
+        or row.payload.get("quartet_id") != state.quartet_id
+    ):
+        raise ValueError(f"adjacent metric job state identity is invalid: {row.job_id}")
+    conditions = (
+        design.stress_conditions if job_type == "stress" else design.controlled_conditions
+    )
+    attached = tuple(condition for condition in conditions if condition.image_state_id == state_id)
+    if not attached:
+        raise ValueError(f"adjacent metric job has no registered conditions: {row.job_id}")
+    variants = _adjacent_selected_variants(row, design)
+    expected: dict[tuple[object, ...], Mapping[str, object]] = {}
+    for condition in attached:
+        if job_type == "geometry_calibration_feature":
+            if state.corruption != "clean":
+                raise ValueError("adjacent calibration must use a clean state")
+            records = (
+                (changed_view, kind, magnitude)
+                for changed_view in state.view_ids
+                if changed_view in {condition.first_view, condition.second_view}
+                for kind, magnitudes in _ADJACENT16_CALIBRATION_MAGNITUDES.items()
+                for magnitude in magnitudes
+            )
+        else:
+            records = ((condition.changed_view, None, None),)
+        for changed_view, kind, magnitude in records:
+            for variant in variants:
+                values = {
+                    **asdict(condition),
+                    "changed_view": changed_view,
+                    "perturbation_kind": kind,
+                    "magnitude": magnitude,
+                    "job_id": row.job_id,
+                    "analysis_track": track,
+                    "variant_key": variant.key,
+                    "feature_track": variant.feature_track,
+                    "backbone": variant.backbone,
+                    "input_size": variant.input_size,
+                    "feature_mode": variant.feature_mode,
+                    "resolution": variant.resolution,
+                }
+                key = tuple(values[field] for field in _primary_key(track))
+                if key in expected:
+                    raise ValueError(f"adjacent metric ownership key is ambiguous: {row.job_id}")
+                expected[key] = values
+    return track, expected
+
+
+def _matches_owned_metric_row(
+    actual: Mapping[str, object],
+    expected: Mapping[str, object],
+) -> bool:
+    for field, wanted in expected.items():
+        got = _normalized_optional(actual.get(field))
+        if isinstance(wanted, float):
+            try:
+                if float(got) != wanted:
+                    return False
+            except (TypeError, ValueError):
+                return False
+        elif got != wanted:
+            return False
+    return True
+
+
+def validate_adjacent16_metric_ownership(
+    run_root: str | Path,
+    design: Adjacent16Design,
+) -> Mapping[str, int]:
+    """Validate every registered condition/variant row against its owner."""
+
+    root = Path(run_root).expanduser().resolve()
+    rows = _registry_rows(root)
+    registry = JobRegistry(root / "registry" / "jobs.sqlite")
+    parts = _registered_metric_parts(root, rows)
+    frames: dict[str, list[pd.DataFrame]] = {track: [] for track in _TRACK_FILENAMES}
+    for row in rows:
+        track = _track_for_job(row)
+        if track is None:
+            continue
+        if row.state != "completed":
+            raise ValueError(f"adjacent metric job is not completed: {row.job_id}")
+        if registry.validated_state(row.job_id) != "completed":
+            raise ValueError(f"registered output hash validation failed: {row.job_id}")
+        part = parts[row.job_id]
+        frame = pd.read_parquet(part)
+        expected_track, expected = _adjacent_expected_rows(row, design)
+        if expected_track != track:
+            raise ValueError(f"adjacent metric job track disagrees with owner: {row.job_id}")
+        frame = _validate_frame_primary_key(frame, track)
+        actual = {
+            tuple(record[field] for field in _primary_key(track)): record
+            for record in frame.to_dict("records")
+        }
+        if len(actual) != len(frame) or set(actual) != set(expected):
+            raise ValueError(f"adjacent metric part ownership differs: {row.job_id}")
+        if any(
+            not _matches_owned_metric_row(actual[key], expected[key])
+            for key in expected
+        ):
+            raise ValueError(f"adjacent metric row owner differs: {row.job_id}")
+        frames[track].append(frame)
+    counts = {
+        track: sum(len(frame) for frame in track_frames)
+        for track, track_frames in frames.items()
+    }
+    if counts != dict(design.row_counts):
+        raise ValueError("adjacent metric ownership row counts differ from design")
+    return counts
 
 
 def _sort_columns(track: str, columns: Sequence[str]) -> list[str]:
