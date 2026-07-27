@@ -1,0 +1,731 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from met3r.job_registry import sha256_file
+from met3r.adjacent16_analysis import (
+    FIGURE_FILENAMES,
+    REPORT_SECTION_TITLES,
+    TABLE_STEMS,
+    _shoe_clustered_interval,
+    analyze_adjacent16_run,
+    summarize_backbone_common37,
+    summarize_analyzability,
+    summarize_common_support,
+    summarize_geometry_low_high,
+    summarize_naf_vs_bilinear,
+    summarize_resolution_bilinear,
+    summarize_stress_reliability,
+    summarize_support_coverage,
+)
+
+
+COMMON37_BACKBONES = (
+    "dino_vitb16",
+    "dinov2_vitb14",
+    "dinov3_vitb16",
+    "dinov3_vitl16_pixal3d",
+)
+
+
+def _common37_controlled_rows() -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    severities = {
+        "translation": (0.03, 0.06, 0.12, 0.2),
+        "thin_plate_warp": (0.25, 0.5, 0.75, 1.0),
+        "jpeg": (0.25, 0.5, 0.75, 1.0),
+        "identity_swap": (1.0,),
+    }
+    jpeg_effects = (-0.2, 0.1, -0.4, 0.3)
+    for shoe in ("a", "b", "c", "d"):
+        for backbone in COMMON37_BACKBONES:
+            variant = {
+                "backbone": backbone,
+                "feature_track": "user_37_grid_track",
+                "feature_mode": "bilinear",
+                "resolution": 37,
+            }
+            base = {
+                **variant,
+                "shoe_id": shoe,
+                "quartet_id": "q0",
+                "pair_id": f"{shoe}__q0__1__2",
+                "changed_view": None,
+                "corruption": "clean",
+                "severity": 0.0,
+                "baseline_steps": 1,
+                "s00": 0.0,
+                "s10": 0.0,
+                "abstained": False,
+            }
+            rows.append(base)
+            for corruption, strengths in severities.items():
+                for index, severity in enumerate(strengths):
+                    effect = (
+                        jpeg_effects[index]
+                        if corruption == "jpeg"
+                        else float(severity)
+                    )
+                    abstained = (
+                        shoe == "d"
+                        and backbone == "dino_vitb16"
+                        and corruption == "translation"
+                        and severity == 0.2
+                    )
+                    # The other backbones carry an extreme score at the exact
+                    # key abstained by DINO. Exact common support must remove
+                    # it from every backbone rather than average marginals.
+                    if (
+                        shoe == "d"
+                        and corruption == "translation"
+                        and severity == 0.2
+                        and backbone != "dino_vitb16"
+                    ):
+                        effect = 100.0
+                    rows.append(
+                        {
+                            **variant,
+                            "shoe_id": shoe,
+                            "quartet_id": "q0",
+                            "pair_id": f"{shoe}__q0__1__2",
+                            "changed_view": "1",
+                            "corruption": corruption,
+                            "severity": severity,
+                            "baseline_steps": 1,
+                            "s00": 0.0,
+                            "s10": np.nan if abstained else effect,
+                            "abstained": abstained,
+                        }
+                    )
+    return pd.DataFrame(rows)
+
+
+def _dinov3l_controlled_rows(*, extra_shoe_a_pairs: int = 0) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    severities = {
+        "translation": (0.03, 0.06, 0.12, 0.2),
+        "thin_plate_warp": (0.25, 0.5, 0.75, 1.0),
+        "jpeg": (0.25, 0.5, 0.75, 1.0),
+        "identity_swap": (1.0,),
+    }
+    resolution_offsets = {37: 0.0, 74: 0.01, 148: 0.02, 296: 0.03, 592: 0.04}
+    variants = [
+        ("bilinear", resolution)
+        for resolution in (37, 74, 148, 296, 592)
+    ] + [
+        ("naf_normal_guide", resolution)
+        for resolution in (74, 148, 296, 592)
+    ]
+    core_pairs = (("1", "2", 1), ("1", "3", 2), ("1", "4", 3))
+    for shoe in ("a", "b", "c", "d"):
+        pairs = list(core_pairs)
+        if shoe == "a":
+            pairs.extend(
+                ("1", str(10 + index), 1)
+                for index in range(extra_shoe_a_pairs)
+            )
+        for first, second, baseline_steps in pairs:
+            pair_id = f"{shoe}__q0__{first}__{second}"
+            for feature_mode, resolution in variants:
+                variant = {
+                    "backbone": "dinov3_vitl16_pixal3d",
+                    "feature_track": "user_37_grid_track",
+                    "feature_mode": feature_mode,
+                    "resolution": resolution,
+                }
+                rows.append(
+                    {
+                        **variant,
+                        "shoe_id": shoe,
+                        "quartet_id": "q0",
+                        "pair_id": pair_id,
+                        "changed_view": None,
+                        "corruption": "clean",
+                        "severity": 0.0,
+                        "baseline_steps": baseline_steps,
+                        "s00": 0.0,
+                        "s10": 0.0,
+                        "abstained": False,
+                    }
+                )
+                for corruption, strengths in severities.items():
+                    for index, severity in enumerate(strengths):
+                        if corruption == "translation":
+                            multiplier = {"a": 1.0, "b": -1.0, "c": 0.0, "d": 1.0}[shoe]
+                            effect = multiplier * float(severity)
+                        elif corruption == "thin_plate_warp":
+                            effect = float(severity)
+                        elif corruption == "identity_swap":
+                            effect = 1.0
+                        else:
+                            effect = (
+                                (0.1, 0.2, 0.3, 0.4)[index]
+                                + resolution_offsets[resolution]
+                                + (0.05 if feature_mode == "naf_normal_guide" else 0.0)
+                            )
+                        abstained = (
+                            shoe == "d"
+                            and baseline_steps == 3
+                            and feature_mode == "bilinear"
+                            and resolution == 592
+                            and corruption == "jpeg"
+                            and severity == 1.0
+                        )
+                        if (
+                            shoe == "d"
+                            and baseline_steps == 3
+                            and resolution != 592
+                            and corruption == "jpeg"
+                            and severity == 1.0
+                        ):
+                            effect = (
+                                100.05
+                                if feature_mode == "naf_normal_guide"
+                                else 100.0
+                            )
+                        rows.append(
+                            {
+                                **variant,
+                                "shoe_id": shoe,
+                                "quartet_id": "q0",
+                                "pair_id": pair_id,
+                                "changed_view": first,
+                                "corruption": corruption,
+                                "severity": severity,
+                                "baseline_steps": baseline_steps,
+                                "s00": 0.0,
+                                "s10": np.nan if abstained else effect,
+                                "abstained": abstained,
+                            }
+                        )
+    return pd.DataFrame(rows)
+
+
+def test_common37_endpoints_use_exact_row_intersection_and_four_shoe_units() -> None:
+    """Catch an abstention becoming zero or unrelated backbone marginals being compared."""
+
+    summary = summarize_backbone_common37(
+        _common37_controlled_rows(),
+        bootstrap_repeats=100,
+        seed=42,
+    )
+
+    identity = summary.query(
+        "baseline_steps == 'all' and corruption == 'identity_swap' "
+        "and endpoint == 'clean_corrupt_auroc'"
+    )
+    assert set(identity["backbone"]) == set(COMMON37_BACKBONES)
+    assert identity["estimate"].tolist() == pytest.approx([1.0] * 4)
+    assert identity["n_shoes_valid"].tolist() == [4] * 4
+
+    translation = summary.query(
+        "baseline_steps == 'all' and corruption == 'translation'"
+    )
+    for endpoint in ("severity_spearman", "pairwise_rank_accuracy"):
+        rows = translation.query("endpoint == @endpoint")
+        assert rows["estimate"].tolist() == pytest.approx([1.0] * 4)
+        assert rows["n_common_support"].tolist() == [15] * 4
+        assert rows["n_union_support"].tolist() == [16] * 4
+        assert rows["support_retention"].tolist() == pytest.approx([15 / 16] * 4)
+        assert rows["complete_series_coverage"].tolist() == pytest.approx([3 / 4] * 4)
+
+    for corruption in ("translation", "thin_plate_warp"):
+        assert set(
+            summary.query(
+                "baseline_steps == 'all' and corruption == @corruption"
+            )["endpoint"]
+        ) == {"severity_spearman", "pairwise_rank_accuracy"}
+
+    jpeg = summary.query(
+        "baseline_steps == 'all' and corruption == 'jpeg'"
+    )
+    signed = jpeg.query("endpoint == 'nuisance_signed_delta'")
+    absolute = jpeg.query("endpoint == 'nuisance_absolute_delta'")
+    assert signed["estimate"].tolist() == pytest.approx([-0.05] * 4)
+    assert absolute["estimate"].tolist() == pytest.approx([0.25] * 4)
+
+
+def test_resolution_and_naf_differences_are_paired_on_exact_support_by_step() -> None:
+    """Catch five-resolution or NAF contrasts formed from unrelated marginal means."""
+
+    frame = _dinov3l_controlled_rows()
+    resolution = summarize_resolution_bilinear(
+        frame,
+        bootstrap_repeats=100,
+        seed=42,
+    )
+    naf = summarize_naf_vs_bilinear(
+        frame,
+        bootstrap_repeats=100,
+        seed=42,
+    )
+
+    assert set(resolution["baseline_steps"]) == {"all", 1, 2, 3}
+    signed = resolution.query(
+        "baseline_steps == 'all' and corruption == 'jpeg' "
+        "and endpoint == 'nuisance_signed_delta'"
+    ).sort_values("resolution")
+    assert signed["resolution"].tolist() == [37, 74, 148, 296, 592]
+    assert signed["difference_from_37"].tolist() == pytest.approx(
+        [0.0, 0.01, 0.02, 0.03, 0.04]
+    )
+    assert signed["difference_from_37_n_shoes_valid"].tolist() == [4] * 5
+    assert signed["n_common_support"].tolist() == [47] * 5
+    assert signed["n_union_support"].tolist() == [48] * 5
+    assert signed["support_retention"].tolist() == pytest.approx([47 / 48] * 5)
+
+    assert set(naf["resolution"]) == {74, 148, 296, 592}
+    for steps in ("all", 1, 2, 3):
+        paired = naf[
+            (naf["baseline_steps"] == steps)
+            & (naf["corruption"] == "jpeg")
+            & (naf["endpoint"] == "nuisance_signed_delta")
+        ]
+        assert paired["naf_minus_bilinear"].tolist() == pytest.approx(
+            [0.05] * 4
+        )
+        assert paired["naf_minus_bilinear_n_shoes_valid"].tolist() == [4] * 4
+
+
+def test_bootstrap_resamples_shoes_not_repeated_pairs() -> None:
+    """Catch quartet/pair rows being resampled as independent subjects."""
+
+    balanced = summarize_resolution_bilinear(
+        _dinov3l_controlled_rows(),
+        bootstrap_repeats=500,
+        seed=42,
+    )
+    repeated_a = summarize_resolution_bilinear(
+        _dinov3l_controlled_rows(extra_shoe_a_pairs=4),
+        bootstrap_repeats=500,
+        seed=42,
+    )
+    columns = (
+        "estimate",
+        "ci_low",
+        "ci_high",
+        "n_shoes_valid",
+    )
+    query = (
+        "baseline_steps == 'all' and resolution == 37 "
+        "and corruption == 'translation' "
+        "and endpoint == 'pairwise_rank_accuracy'"
+    )
+    first = balanced.query(query).iloc[0]
+    second = repeated_a.query(query).iloc[0]
+
+    assert first["estimate"] == pytest.approx(0.625)
+    assert second[list(columns)].tolist() == pytest.approx(
+        first[list(columns)].tolist()
+    )
+
+
+def test_bootstrap_keeps_an_entirely_missing_shoe_in_four_cluster_draws() -> None:
+    """Catch an invalid shoe being dropped instead of retained as missing evidence."""
+
+    shoes = pd.DataFrame(
+        {
+            "shoe_id": ("a", "b", "c", "d"),
+            "value": (0.0, 1.0, 2.0, np.nan),
+        }
+    )
+
+    assert _shoe_clustered_interval(
+        shoes,
+        repeats=100,
+        seed=42,
+    ) == pytest.approx((0.0, 2.0))
+
+
+def _geometry_rows() -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    for shoe in ("a", "b", "c", "d"):
+        for steps in (1, 2, 3):
+            for mode, resolution, multiplier in (
+                ("bilinear", 37, 1.0),
+                ("naf_normal_guide", 592, 2.0),
+            ):
+                for magnitude in (1.0, 2.0):
+                    abstained = (
+                        shoe == "d"
+                        and steps == 3
+                        and mode == "naf_normal_guide"
+                        and magnitude == 2.0
+                    )
+                    effect = multiplier * magnitude
+                    if (
+                        shoe == "d"
+                        and steps == 3
+                        and mode == "bilinear"
+                        and magnitude == 2.0
+                    ):
+                        effect = 100.0
+                    rows.append(
+                        {
+                            "backbone": "dinov3_vitl16_pixal3d",
+                            "feature_track": "user_37_grid_track",
+                            "feature_mode": mode,
+                            "resolution": resolution,
+                            "shoe_id": shoe,
+                            "quartet_id": "q0",
+                            "pair_id": f"{shoe}__q0__1__{steps + 1}",
+                            "changed_view": "1",
+                            "baseline_steps": steps,
+                            "perturbation_kind": "rotation",
+                            "magnitude": magnitude,
+                            "base_score": 0.0,
+                            "perturbed_score": np.nan if abstained else effect,
+                            "geometry_effect": np.nan if abstained else effect,
+                            "overlap": np.nan if abstained else 0.5,
+                            "abstained": abstained,
+                        }
+                    )
+    return pd.DataFrame(rows)
+
+
+def _stress_rows() -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    for shoe_index, shoe in enumerate(("a", "b", "c", "d")):
+        for steps in (1, 2, 3):
+            for mode, resolution in (
+                ("bilinear", 37),
+                ("naf_normal_guide", 592),
+            ):
+                high = mode == "naf_normal_guide"
+                abstained = high and shoe == "d" and steps == 3
+                low_effect = 0.1 * (shoe_index + 1) + 0.01 * steps
+                effect = low_effect + (0.2 if high else 0.0)
+                rows.append(
+                    {
+                        "backbone": "dinov3_vitl16_pixal3d",
+                        "feature_track": "user_37_grid_track",
+                        "feature_mode": mode,
+                        "resolution": resolution,
+                        "shoe_id": shoe,
+                        "quartet_id": "q0",
+                        "pair_id": f"{shoe}__q0__1__{steps + 1}",
+                        "baseline_steps": steps,
+                        "s00": 0.0,
+                        "s10": np.nan if abstained else effect,
+                        "s01": 0.0,
+                        "s11": np.nan if abstained else effect,
+                        "score": np.nan if abstained else effect,
+                        "feature_effect": np.nan if abstained else effect,
+                        "s11_first_to_second_overlap": np.nan if abstained else 0.5,
+                        "s11_second_to_first_overlap": np.nan if abstained else 0.4,
+                        "abstained": abstained,
+                    }
+                )
+    return pd.DataFrame(rows)
+
+
+def _all_variant_controlled_rows() -> pd.DataFrame:
+    dinov3l = _dinov3l_controlled_rows()
+    common37_source = dinov3l[
+        (dinov3l["feature_mode"] == "bilinear")
+        & (dinov3l["resolution"] == 37)
+    ]
+    b_backbones = [
+        common37_source.assign(backbone=backbone)
+        for backbone in COMMON37_BACKBONES[:-1]
+    ]
+    return pd.concat([dinov3l, *b_backbones], ignore_index=True)
+
+
+def _preflight_rows() -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    for shoe in ("a", "b", "c", "d"):
+        for steps in (1, 2, 3):
+            symmetric = not (shoe == "d" and steps == 3)
+            rows.append(
+                {
+                    "shoe_id": shoe,
+                    "quartet_id": "q0",
+                    "pair_id": f"{shoe}__q0__1__{steps + 1}",
+                    "baseline_steps": steps,
+                    "first_to_second_overlap": 0.5,
+                    "second_to_first_overlap": 0.4,
+                    "minimum_directional_overlap": 0.4,
+                    "symmetric_pass": symmetric,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def test_geometry_low_high_uses_exact_support_and_exposes_shoe_counts() -> None:
+    """Catch an abstained high-resolution calibration cell becoming a low-score zero."""
+
+    summary = summarize_geometry_low_high(
+        _geometry_rows(),
+        bootstrap_repeats=100,
+        seed=42,
+    )
+    magnitude_two = summary.query(
+        "baseline_steps == 'all' and perturbation_kind == 'rotation' "
+        "and magnitude == 2.0"
+    )
+
+    assert set(magnitude_two["variant"]) == {"L37-bilinear", "L592-NAF"}
+    assert magnitude_two.sort_values("variant")["geometry_response"].tolist() == pytest.approx(
+        [2.0, 4.0]
+    )
+    assert magnitude_two["geometry_response_n_shoes_valid"].tolist() == [4, 4]
+    assert magnitude_two["high_minus_low"].tolist() == pytest.approx([2.0, 2.0])
+    assert magnitude_two["high_minus_low_n_shoes_valid"].tolist() == [4, 4]
+    assert magnitude_two["n_common_support"].tolist() == [11, 11]
+    assert magnitude_two["n_union_support"].tolist() == [12, 12]
+    assert magnitude_two["support_retention"].tolist() == pytest.approx([11 / 12] * 2)
+    step_three = summary.query(
+        "baseline_steps == 3 and perturbation_kind == 'rotation' "
+        "and magnitude == 2.0"
+    )
+    assert step_three["geometry_response_n_shoes_valid"].tolist() == [3, 3]
+    assert step_three["high_minus_low_n_shoes_valid"].tolist() == [3, 3]
+
+
+def test_stress_reliability_counts_low_finite_high_abstained_and_disagreement() -> None:
+    """Catch stress abstention being imputed or finite disagreement using unpaired rows."""
+
+    summary = summarize_stress_reliability(
+        _stress_rows(),
+        bootstrap_repeats=100,
+        seed=42,
+    )
+    all_steps = summary[summary["baseline_steps"] == "all"].set_index("metric")
+
+    assert all_steps.loc["low_symmetric_pass_rate", "estimate"] == pytest.approx(1.0)
+    assert all_steps.loc["high_symmetric_pass_rate", "estimate"] == pytest.approx(11 / 12)
+    assert all_steps.loc[
+        "low_finite_high_abstained_rate", "estimate"
+    ] == pytest.approx(1 / 12)
+    assert all_steps.loc["both_finite_rate", "estimate"] == pytest.approx(11 / 12)
+    assert all_steps.loc[
+        "finite_low_high_disagreement", "estimate"
+    ] == pytest.approx(0.2)
+    assert all_steps.loc[
+        "finite_low_high_disagreement", "n_shoes_valid"
+    ] == 4
+    assert set(summary["baseline_steps"]) == {"all", 1, 2, 3}
+
+
+def test_support_common_support_and_analyzability_are_artifact_derived() -> None:
+    """Catch support criteria being copied from a gate report or losing four-shoe counts."""
+
+    controlled = _all_variant_controlled_rows()
+    geometry = _geometry_rows()
+    stress = _stress_rows()
+    backbone = summarize_backbone_common37(
+        controlled,
+        bootstrap_repeats=20,
+        seed=42,
+    )
+    resolution = summarize_resolution_bilinear(
+        controlled,
+        bootstrap_repeats=20,
+        seed=42,
+    )
+    naf = summarize_naf_vs_bilinear(
+        controlled,
+        bootstrap_repeats=20,
+        seed=42,
+    )
+    geometry_summary = summarize_geometry_low_high(
+        geometry,
+        bootstrap_repeats=20,
+        seed=42,
+    )
+    stress_summary = summarize_stress_reliability(
+        stress,
+        bootstrap_repeats=20,
+        seed=42,
+    )
+    support = summarize_support_coverage(
+        _preflight_rows(),
+        controlled,
+        stress,
+        bootstrap_repeats=20,
+        seed=42,
+    )
+    common = summarize_common_support(
+        backbone,
+        resolution,
+        naf,
+        geometry_summary,
+        stress_summary,
+    )
+    analyzability = summarize_analyzability(
+        controlled,
+        geometry,
+        stress,
+        common,
+    )
+
+    symmetric = support.query(
+        "baseline_steps == 'all' and metric == 'symmetric_coverage'"
+    ).iloc[0]
+    assert symmetric["estimate"] == pytest.approx(11 / 12)
+    assert symmetric["n_shoes_valid"] == 4
+    assert symmetric["complete_series_coverage"] == pytest.approx(575 / 576)
+    assert set(support["baseline_steps"]) == {"all", 1, 2, 3}
+
+    assert {
+        "four_backbone_common37",
+        "five_resolution_bilinear",
+        "naf_vs_bilinear_74",
+        "naf_vs_bilinear_148",
+        "naf_vs_bilinear_296",
+        "naf_vs_bilinear_592",
+        "geometry_low_high",
+        "stress_low_high",
+    } == set(common["comparison"])
+    assert common["n_shoes_valid"].between(0, 4).all()
+    assert common["support_retention"].notna().all()
+    assert common["complete_series_coverage"].notna().all()
+
+    criteria = analyzability.set_index("criterion")
+    assert criteria.loc[
+        "controlled_complete_series_coverage", "observed"
+    ] == pytest.approx(575 / 576)
+    assert criteria.loc[
+        "all_four_shoe_primary_cell_rate", "observed"
+    ] == pytest.approx(143 / 144)
+    controlled_comparisons = common[
+        common["comparison"].isin(
+            {
+                "four_backbone_common37",
+                "five_resolution_bilinear",
+                "naf_vs_bilinear_74",
+                "naf_vs_bilinear_148",
+                "naf_vs_bilinear_296",
+                "naf_vs_bilinear_592",
+            }
+        )
+    ]
+    assert common["support_retention"].min() < controlled_comparisons[
+        "support_retention"
+    ].min()
+    assert criteria.loc[
+        "minimum_common_support_retention", "observed"
+    ] == pytest.approx(
+        controlled_comparisons["support_retention"].min()
+    )
+    assert criteria.loc[
+        "stress_symmetric_pass_rate", "observed"
+    ] == pytest.approx(23 / 24)
+    assert {"n_shoes_valid", "support_retention", "complete_series_coverage"} <= set(
+        analyzability
+    )
+
+
+def test_analyze_adjacent16_run_publishes_exact_atomic_research_snapshot(
+    tmp_path: Path,
+) -> None:
+    """Catch publication omitting a frozen table, figure group, report section, or coverage."""
+
+    generation = (
+        tmp_path
+        / "metrics"
+        / "aggregate_generations"
+        / "successful-generation"
+    )
+    generation.mkdir(parents=True)
+    controlled = _all_variant_controlled_rows()
+    geometry = _geometry_rows()
+    stress = _stress_rows()
+    controlled.to_parquet(generation / "controlled_fidelity.parquet", index=False)
+    geometry.to_parquet(generation / "geometry_calibration.parquet", index=False)
+    stress.to_parquet(generation / "real_deformation_stress.parquet", index=False)
+    (generation / "summary_preview.csv").write_text(
+        "analysis_track\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "metrics" / "current").symlink_to(
+        Path("aggregate_generations") / generation.name,
+        target_is_directory=True,
+    )
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    _preflight_rows().to_parquet(
+        reports / "geometry_preflight.parquet",
+        index=False,
+    )
+
+    outputs = analyze_adjacent16_run(
+        tmp_path,
+        bootstrap_repeats=20,
+        seed=42,
+    )
+
+    assert {path.stem for path in outputs.tables} == set(TABLE_STEMS)
+    assert {path.name for path in outputs.figures} == set(FIGURE_FILENAMES)
+    assert outputs.report_path == tmp_path / "reports/final_research_report.md"
+    assert all(path.is_file() and path.stat().st_size > 0 for path in outputs.tables)
+    assert all(path.is_file() and path.stat().st_size > 0 for path in outputs.figures)
+    assert (tmp_path / "reports/geometry_preflight.parquet").is_file()
+    for stem in TABLE_STEMS:
+        csv_path = tmp_path / "reports" / "tables" / f"{stem}.csv"
+        parquet_path = tmp_path / "reports" / "tables" / f"{stem}.parquet"
+        assert csv_path.is_file() and parquet_path.is_file()
+        table = pd.read_parquet(parquet_path)
+        assert any("n_shoes_valid" in column for column in table.columns)
+        assert "support_retention" in table
+        assert "complete_series_coverage" in table
+
+    report = outputs.report_path.read_text(encoding="utf-8")
+    assert [
+        line.removeprefix("## ")
+        for line in report.splitlines()
+        if line.startswith("## ")
+    ] == [
+        f"{index}. {title}"
+        for index, title in enumerate(REPORT_SECTION_TITLES, start=1)
+    ]
+    assert "fixed/precomputed DA3 cameras (not calibrated GT)" in report
+    assert "four shoe clusters" in report
+    assert "descriptive" in report
+    assert "conditional feature fidelity" in report.lower()
+    assert "geometry/visibility reliability" in report.lower()
+    assert f"controlled rows: {len(controlled):,}" in report
+    assert f"geometry calibration rows: {len(geometry):,}" in report
+    assert f"stress rows: {len(stress):,}" in report
+    assert "seed: `42`" in report
+    assert "bootstrap repeats: `20`" in report
+    assert "sha256" in report.lower()
+
+    published_paths = [
+        outputs.report_path,
+        *outputs.tables,
+        *outputs.figures,
+        *[
+            tmp_path / "reports" / "tables" / f"{stem}.parquet"
+            for stem in TABLE_STEMS
+        ],
+    ]
+    first_hashes = {
+        path.relative_to(tmp_path): sha256_file(path)
+        for path in published_paths
+    }
+    second = analyze_adjacent16_run(
+        tmp_path,
+        bootstrap_repeats=20,
+        seed=42,
+    )
+    second_paths = [
+        second.report_path,
+        *second.tables,
+        *second.figures,
+        *[
+            tmp_path / "reports" / "tables" / f"{stem}.parquet"
+            for stem in TABLE_STEMS
+        ],
+    ]
+    assert {
+        path.relative_to(tmp_path): sha256_file(path)
+        for path in second_paths
+    } == first_hashes
+    assert not list(tmp_path.glob(".reports.staging.*"))
+    assert not list(tmp_path.glob(".reports.backup.*"))
