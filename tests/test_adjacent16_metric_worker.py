@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
+import shutil
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,6 +21,7 @@ from met3r.job_registry import JobDefinition, JobRegistry, sha256_file
 from met3r.upper_metric_worker import (
     _StateRecord,
     _clean_state_for_shoe,
+    _load_geometry,
     _load_state_index,
     _validate_adjacent_pair_contract,
     _calibration_records,
@@ -181,7 +182,7 @@ def _write_adjacent_calibration_fixture(
                     / "geometry.npz"
                 )
                 path.parent.mkdir(parents=True)
-                os.link(template, path)
+                shutil.copyfile(template, path)
                 records.append(
                     {
                         "condition_id": f"{kind}_{magnitude}",
@@ -193,6 +194,7 @@ def _write_adjacent_calibration_fixture(
                         "sha256": sha256_file(path),
                     }
                 )
+    template.unlink()
     (directory / "calibration_manifest.json").write_text(
         json.dumps(
             {
@@ -267,6 +269,7 @@ class _CalibrationNAF(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.calls = 0
+        self.output_sizes: list[tuple[int, int]] = []
 
     def forward(
         self,
@@ -274,8 +277,10 @@ class _CalibrationNAF(nn.Module):
         native: torch.Tensor,
         output_size: tuple[int, int],
     ) -> torch.Tensor:
-        del guide, output_size
+        del guide
         self.calls += 1
+        self.output_sizes.append(output_size)
+        # Keep the test's heavy feature path small after proving the requested grid.
         return native
 
 
@@ -478,6 +483,17 @@ def test_adjacent_q3_calibration_worker_runs_only_frozen_variants_in_manifest_or
     )
     backbone, naf, score_calls = _patch_calibration_work(monkeypatch)
 
+    geometry_loads: list[Path] = []
+
+    def tracked_load_geometry(path, *args, **kwargs):
+        geometry_loads.append(Path(path))
+        return _load_geometry(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        "met3r.upper_metric_worker._load_geometry",
+        tracked_load_geometry,
+    )
+
     summary = run_feature_worker(
         root,
         _L_BACKBONE,
@@ -502,24 +518,24 @@ def test_adjacent_q3_calibration_worker_runs_only_frozen_variants_in_manifest_or
 
     pair_order = {
         "40": (
-            ("shoe__q3__40__41", 1, 7.0),
-            ("shoe__q3__40__42", 2, 15.0),
-            ("shoe__q3__40__0", 3, 22.5),
+            ("G1", "shoe__q3__40__41", "40", "41", 1, 7.0),
+            ("G2", "shoe__q3__40__42", "40", "42", 2, 15.0),
+            ("G3", "shoe__q3__40__0", "40", "0", 3, 22.5),
         ),
         "41": (
-            ("shoe__q3__40__41", 1, 7.0),
-            ("shoe__q3__41__42", 1, 8.0),
-            ("shoe__q3__41__0", 2, 15.5),
+            ("G1", "shoe__q3__40__41", "40", "41", 1, 7.0),
+            ("G4", "shoe__q3__41__42", "41", "42", 1, 8.0),
+            ("G5", "shoe__q3__41__0", "41", "0", 2, 15.5),
         ),
         "42": (
-            ("shoe__q3__40__42", 2, 15.0),
-            ("shoe__q3__41__42", 1, 8.0),
-            ("shoe__q3__42__0", 1, 7.5),
+            ("G2", "shoe__q3__40__42", "40", "42", 2, 15.0),
+            ("G4", "shoe__q3__41__42", "41", "42", 1, 8.0),
+            ("G6", "shoe__q3__42__0", "42", "0", 1, 7.5),
         ),
         "0": (
-            ("shoe__q3__40__0", 3, 22.5),
-            ("shoe__q3__41__0", 2, 15.5),
-            ("shoe__q3__42__0", 1, 7.5),
+            ("G3", "shoe__q3__40__0", "40", "0", 3, 22.5),
+            ("G5", "shoe__q3__41__0", "41", "0", 2, 15.5),
+            ("G6", "shoe__q3__42__0", "42", "0", 1, 7.5),
         ),
     }
     perturbation_order = (
@@ -542,11 +558,29 @@ def test_adjacent_q3_calibration_worker_runs_only_frozen_variants_in_manifest_or
         ("relative_depth_noise", 0.05),
     )
     expected_order = [
-        (variant_key, view_id, kind, magnitude, pair_id, steps, angle)
+        (
+            variant_key,
+            view_id,
+            kind,
+            magnitude,
+            design_id,
+            pair_id,
+            first_view,
+            second_view,
+            steps,
+            angle,
+        )
         for variant_key in (_L37_BILINEAR, _L592_NAF)
         for view_id in ("40", "41", "42", "0")
         for kind, magnitude in perturbation_order
-        for pair_id, steps, angle in pair_order[view_id]
+        for (
+            design_id,
+            pair_id,
+            first_view,
+            second_view,
+            steps,
+            angle,
+        ) in pair_order[view_id]
     ]
     assert list(
         frame[
@@ -555,12 +589,33 @@ def test_adjacent_q3_calibration_worker_runs_only_frozen_variants_in_manifest_or
                 "changed_view",
                 "perturbation_kind",
                 "magnitude",
+                "design_id",
                 "pair_id",
+                "first_view",
+                "second_view",
                 "baseline_steps",
                 "angular_separation_deg",
             ]
         ].itertuples(index=False, name=None)
     ) == expected_order
+    artifact_paths = [
+        (
+            root
+            / "geometry"
+            / "calibration"
+            / "clean"
+            / view_id
+            / f"{kind}_{magnitude}"
+            / "geometry.npz"
+        )
+        for view_id in ("40", "41", "42", "0")
+        for kind, magnitude in perturbation_order
+    ]
+    assert geometry_loads == [
+        root / "geometry" / "calibration" / "clean" / "depth_geometry.npz",
+        *artifact_paths,
+        *artifact_paths,
+    ]
     assert frame[
         [
             "job_id",
@@ -614,7 +669,33 @@ def test_adjacent_q3_calibration_worker_runs_only_frozen_variants_in_manifest_or
             "resolution": 592,
         },
     ]
+    expected_sensitivity = {
+        "base_score": 0.8,
+        "perturbed_score": 0.6,
+        "geometry_effect": -0.2,
+        "base_first_to_second_score": 0.8,
+        "base_second_to_first_score": 0.7,
+        "perturbed_first_to_second_score": 0.6,
+        "perturbed_second_to_first_score": 0.5,
+        "base_first_to_second_overlap": 0.75,
+        "base_second_to_first_overlap": 0.75,
+        "perturbed_first_to_second_overlap": 0.75,
+        "perturbed_second_to_first_overlap": 0.75,
+        "overlap": 0.75,
+        "cycle_error_px_median": 1.0,
+        "relative_depth_error_median": 0.1,
+    }
+    for column, expected in expected_sensitivity.items():
+        np.testing.assert_allclose(
+            frame[column].to_numpy(),
+            expected,
+            rtol=1e-6,
+            atol=1e-6,
+        )
+    assert not frame["abstained"].any()
+    assert not frame["abstention"].any()
     assert (backbone.calls, naf.calls, len(score_calls)) == (1, 2, 408)
+    assert naf.output_sizes == [(592, 592), (592, 592)]
 
     visual_manifest = root / "visualizations" / job_id / "manifest.json"
     assert [path.name for path in visual_manifest.parent.iterdir()] == [
