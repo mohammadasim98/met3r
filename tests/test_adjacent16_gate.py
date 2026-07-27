@@ -6,42 +6,75 @@ import sqlite3
 from dataclasses import asdict
 from pathlib import Path
 
+import numpy as np
 import pytest
 import pandas as pd
+from PIL import Image
 
 from met3r.adjacent16_gate import (
     validate_adjacent16_final_gate,
     validate_timed_runtime_projection,
     write_timed_sentinel_manifest,
 )
-from met3r.job_registry import JobDefinition, JobRegistry
+from met3r.job_registry import JobDefinition, JobRegistry, sha256_file
 from met3r.adjacent16_contract import load_adjacent16_contract
 from met3r.adjacent16_data import Adjacent16Manifest, AdjacentShoeRecord, AdjacentViewRecord
 from met3r.adjacent16_design import build_adjacent16_design
-from met3r.adjacent16_prepare import register_adjacent16_jobs
-from met3r.adjacent16_gate import validate_adjacent16_final_gate
+from met3r.adjacent16_prepare import _write_manifests, register_adjacent16_jobs
 
 
 def _write_frozen_manifest_fixture(root: Path) -> tuple[tuple[Path, ...], object, object]:
     contract = load_adjacent16_contract("configs/adjacent16_core.json")
     positions = {view: index for index, view in enumerate(contract.camera_order)}
     shoes = []
-    for shoe in contract.raw["shoes"]:
+    root.mkdir(parents=True, exist_ok=True)
+    for shoe_index, (shoe, camera_dataset_id) in enumerate(
+        contract.raw["shoes"].items()
+    ):
         views = []
         for quartet in contract.quartets:
             for view in quartet.view_ids:
-                views.append(AdjacentViewRecord(shoe, "fixture", quartet.quartet_id, view, positions[view], root / "rgb", root / "mask", None, None, None, None, None, 1.0, positions[view] * 7.5, "0" * 64, "0" * 64, None, None, None))
-        shoes.append(AdjacentShoeRecord(shoe, "fixture", tuple(views)))
-    design = build_adjacent16_design(Adjacent16Manifest(root, root, tuple(shoes)), contract)
+                serial = shoe_index * 16 + len(views)
+                source = root / "sources" / shoe / quartet.quartet_id / f"{view}.png"
+                mask = source.with_name(f"{view}.mask.png")
+                source.parent.mkdir(parents=True, exist_ok=True)
+                Image.new(
+                    "RGB", (1080, 1080), (int(view), shoe_index * 60, 127)
+                ).save(source)
+                Image.new("L", (1080, 1080), 128 + serial).save(mask)
+                views.append(
+                    AdjacentViewRecord(
+                        shoe,
+                        camera_dataset_id,
+                        quartet.quartet_id,
+                        view,
+                        positions[view],
+                        source.resolve(),
+                        mask.resolve(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        1.0,
+                        float((positions[view] * 7.5) % 360.0),
+                        sha256_file(source),
+                        sha256_file(mask),
+                        None,
+                        None,
+                        None,
+                    )
+                )
+        shoes.append(AdjacentShoeRecord(shoe, camera_dataset_id, tuple(views)))
+    manifest = Adjacent16Manifest(
+        contract.reconstruction_root, contract.stress_root, tuple(shoes)
+    )
+    design = build_adjacent16_design(manifest, contract)
+    _write_manifests(root, manifest, design)
     manifests = root / "manifests"
-    manifests.mkdir(parents=True)
-    states = (*design.controlled_states, *design.stress_states)
     state_path = manifests / "image_states.jsonl"
     pair_path = manifests / "pair_conditions.jsonl"
     variant_path = manifests / "feature_variants.json"
-    state_path.write_text("".join(json.dumps(asdict(item), sort_keys=True) + "\n" for item in states))
-    pair_path.write_text("".join(json.dumps(asdict(item), sort_keys=True) + "\n" for item in (*design.controlled_conditions, *design.stress_conditions)))
-    variant_path.write_text(json.dumps([asdict(item) for item in design.feature_variants], sort_keys=True))
     return (state_path, pair_path, variant_path), contract, design
 
 
@@ -52,7 +85,19 @@ def test_independent_frozen_manifest_fixture_is_exact_and_byte_stable(tmp_path: 
     second, _contract2, _design2 = _write_frozen_manifest_fixture(tmp_path / "two")
     states = [json.loads(line) for line in first[0].read_text().splitlines()]
     pairs = [json.loads(line) for line in first[1].read_text().splitlines()]
+    source_manifest = json.loads(
+        (tmp_path / "one/manifests/adjacent16_manifest.json").read_text()
+    )
+    source_views = [
+        view for shoe in source_manifest["shoes"] for view in shoe["views"]
+    ]
 
+    assert set(source_manifest) == {"reconstruction_root", "stress_root", "shoes"}
+    assert len(source_views) == 64
+    assert len({row["source_path"] for row in source_views}) == 64
+    assert len({row["source_mask_path"] for row in source_views}) == 64
+    assert len({row["source_sha256"] for row in source_views}) == 64
+    assert len({row["source_mask_sha256"] for row in source_views}) == 64
     assert len(states) == 864
     assert sum(row["track"] == "controlled" for row in states) == 848
     assert sum(row["track"] == "stress" for row in states) == 16
@@ -93,13 +138,47 @@ def test_independent_manifest_design_registers_the_exact_production_job_graph(tm
     assert all(payload["geometry_contract"] in {"fixed_base_only", "base_plus_adaptive"} for payload in payloads)
 
 
-def _metric_row(condition: dict[str, object], variant: object, config_hash: str, **extra: object) -> dict[str, object]:
-    return {**condition, "variant_key": variant.key, "feature_track": variant.feature_track, "backbone": variant.backbone, "input_size": variant.input_size, "feature_mode": variant.feature_mode, "resolution": variant.resolution, "config_sha256": config_hash, "camera_label": "fixed/precomputed DA3 cameras (not calibrated GT)", "camera_provenance": "fixed_precomputed_da3", "abstained": False, "score": .8, "s00": .8, "s10": .8, "s01": .8, "s11": .8, "s11_first_to_second_overlap": .8, "s11_second_to_first_overlap": .8, **extra}
+def _metric_row(
+    condition: dict[str, object],
+    variant: object,
+    config_hash: str,
+    *,
+    analysis_track: str,
+    **extra: object,
+) -> dict[str, object]:
+    state_id = condition["image_state_id"]
+    job_id = (
+        f"feature__{analysis_track}__{state_id}__"
+        f"{variant.backbone}__{variant.feature_track}"
+    )
+    return {
+        **condition,
+        "job_id": job_id,
+        "analysis_track": analysis_track,
+        "variant_key": variant.key,
+        "feature_track": variant.feature_track,
+        "backbone": variant.backbone,
+        "input_size": variant.input_size,
+        "feature_mode": variant.feature_mode,
+        "resolution": variant.resolution,
+        "config_sha256": config_hash,
+        "camera_label": "fixed/precomputed DA3 cameras (not calibrated GT)",
+        "camera_provenance": "fixed_precomputed_da3",
+        "abstained": False,
+        "score": .8,
+        "s00": .8,
+        "s10": .8,
+        "s01": .8,
+        "s11": .8,
+        "s11_first_to_second_overlap": .8,
+        "s11_second_to_first_overlap": .8,
+        **extra,
+    }
 
 
 def _write_frozen_metric_tables(root: Path, contract: object, design: object, config_hash: str) -> dict[str, Path]:
-    controlled = [_metric_row(asdict(condition), variant, config_hash) for condition in design.controlled_conditions for variant in design.feature_variants]
-    stress = [_metric_row(asdict(condition), variant, config_hash) for condition in design.stress_conditions for variant in design.feature_variants]
+    controlled = [_metric_row(asdict(condition), variant, config_hash, analysis_track="controlled") for condition in design.controlled_conditions for variant in design.feature_variants]
+    stress = [_metric_row(asdict(condition), variant, config_hash, analysis_track="stress") for condition in design.stress_conditions for variant in design.feature_variants]
     calibration_variants = [variant for variant in design.feature_variants if variant.key in contract.geometry_calibration_variant_keys]
     calibration = []
     kind_map = {"rotation": "rotation_degrees", "relative_translation": "relative_translation", "depth_scale": "depth_scale", "relative_depth_noise": "relative_depth_noise_std"}
@@ -113,7 +192,7 @@ def _write_frozen_metric_tables(root: Path, contract: object, design: object, co
                 for kind, config_name in kind_map.items():
                     for magnitude in contract.raw["geometry_calibration"][config_name]:
                         for variant in calibration_variants:
-                            calibration.append(_metric_row(condition, variant, config_hash, changed_view=changed, perturbation_kind=kind, magnitude=float(magnitude)))
+                            calibration.append(_metric_row(condition, variant, config_hash, analysis_track="geometry_calibration", changed_view=changed, perturbation_kind=kind, magnitude=float(magnitude)))
     metrics = root / "metrics"
     metrics.mkdir(parents=True, exist_ok=True)
     paths = {"controlled": metrics / "controlled_fidelity.parquet", "stress": metrics / "real_deformation_stress.parquet", "geometry_calibration": metrics / "geometry_calibration.parquet"}
@@ -173,7 +252,31 @@ def _materialize_owned_outputs(root: Path, registry: JobRegistry) -> None:
             files = []
             for path in paths:
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(job_id.encode())
+                if phase == "geometry" and path.suffix == ".npz":
+                    np.savez_compressed(
+                        path,
+                        depth=np.ones((1, 1, 1), dtype=np.float32),
+                        confidence=np.ones((1, 1, 1), dtype=np.float32),
+                        mask=np.ones((1, 1, 1), dtype=bool),
+                        extrinsics=np.eye(4, dtype=np.float32)[None],
+                        intrinsics=np.eye(3, dtype=np.float32)[None],
+                        meta__artifact_type=np.asarray("fixed_camera_depth"),
+                        meta__model_id=np.asarray("fixture-da3"),
+                        meta__model_revision=np.asarray("fixture-revision"),
+                        meta__runtime_fingerprint=np.asarray("fixture-runtime"),
+                        meta__source_revision=np.asarray("fixture-source"),
+                        meta__source_dirty=np.asarray(False),
+                        meta__source_dirty_fingerprint=np.asarray(""),
+                        meta__camera_provenance=np.asarray(
+                            "fixed_precomputed_da3"
+                        ),
+                        meta__image_set_id=np.asarray(job_id),
+                        meta__view_ids=np.asarray(["1"]),
+                        meta__camera_groups=np.asarray(["upper"]),
+                        meta__analysis_tier=np.asarray("primary"),
+                    )
+                else:
+                    path.write_bytes(job_id.encode())
                 files.append({"path": str(path.resolve()), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
             connection.execute("UPDATE jobs SET output_manifest_json=? WHERE job_id=?", (json.dumps({"files": files}), job_id))
 
@@ -489,6 +592,65 @@ def test_final_gate_rejects_identity_swap_manifest_mutation_without_row_loss(tmp
     assert "input_validation" in report.failed_checks
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "duplicate_thirteenth_variant",
+        "stress_condition_state_id",
+        "stress_condition_baseline",
+        "stress_state_id",
+        "state_order",
+    ),
+)
+def test_final_gate_rejects_exact_manifest_graph_mutations(
+    tmp_path: Path, mutation: str
+) -> None:
+    """Catch unordered, partial, or key-only final-manifest validation."""
+
+    fixture = _final_gate_fixture(tmp_path)
+    root = fixture["root"]
+    assert isinstance(root, Path)
+    if mutation == "duplicate_thirteenth_variant":
+        path = root / "manifests/feature_variants.json"
+        variants = json.loads(path.read_text())
+        variants.append(dict(variants[0]))
+        path.write_text(json.dumps(variants, indent=2, sort_keys=True) + "\n")
+    elif mutation in {"stress_condition_state_id", "stress_condition_baseline"}:
+        path = root / "manifests/pair_conditions.jsonl"
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        stress = next(row for row in rows if row["track"] == "stress")
+        if mutation == "stress_condition_state_id":
+            stress["image_state_id"] = "stress__fabricated_state"
+        else:
+            stress["baseline_steps"] = 3 if stress["baseline_steps"] != 3 else 2
+        path.write_text(
+            "".join(
+                json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
+                for row in rows
+            )
+        )
+    else:
+        path = root / "manifests/image_states.jsonl"
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        if mutation == "stress_state_id":
+            stress = next(row for row in rows if row["track"] == "stress")
+            stress["state_id"] = "stress__fabricated_state"
+        else:
+            rows[0], rows[1] = rows[1], rows[0]
+        path.write_text(
+            "".join(
+                json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
+                for row in rows
+            )
+        )
+
+    report = validate_adjacent16_final_gate(root)
+
+    assert report.actual_rows == report.expected_rows
+    assert report.passed is False
+    assert report.failed_checks == ("registry_graph",)
+
+
 @pytest.mark.parametrize("track", ("controlled", "stress", "geometry_calibration"))
 def test_final_gate_rejects_duplicate_metric_keys_without_row_loss(tmp_path: Path, track: str) -> None:
     """Catch a metric validator that checks only the frozen row cardinality."""
@@ -514,6 +676,37 @@ def test_final_gate_rejects_duplicate_metric_keys_without_row_loss(tmp_path: Pat
     assert report.passed is False
     assert "metric_row_counts" not in report.failed_checks
     assert "metric_row_keys" in report.failed_checks
+
+
+@pytest.mark.parametrize(
+    ("track", "column", "replacement"),
+    (
+        ("stress", "pair_id", "stress__constant_pair"),
+        ("geometry_calibration", "pair_id", "calibration__constant_pair"),
+        ("controlled", "job_id", "feature__fabricated_job"),
+        ("controlled", "design_id", "C99999999"),
+        ("controlled", "image_state_id", "controlled__fabricated_state"),
+        ("controlled", "resolution", 999),
+    ),
+)
+def test_final_gate_rejects_exact_metric_identity_mutations(
+    tmp_path: Path, track: str, column: str, replacement: object
+) -> None:
+    """Catch count-preserving metric identity or variant-binding drift."""
+
+    fixture = _final_gate_fixture(tmp_path)
+    root = fixture["root"]
+    path = fixture["metrics"][track]
+    assert isinstance(root, Path)
+    frame = pd.read_parquet(path)
+    frame.loc[frame.index[0], column] = replacement
+    frame.to_parquet(path, index=False)
+
+    report = validate_adjacent16_final_gate(root)
+
+    assert report.actual_rows == report.expected_rows
+    assert report.passed is False
+    assert report.failed_checks == ("metric_row_keys",)
 
 
 @pytest.mark.parametrize(
@@ -584,6 +777,56 @@ def test_final_gate_reports_exact_relative_raw_feature_artifact_paths(tmp_path: 
     assert report.passed is False
     assert report.failed_checks == ("raw_feature_artifact",)
     assert report.raw_feature_artifacts == tuple(sorted(f"reports/{name}" for name in names))
+
+
+def test_final_gate_rejects_arbitrary_npz_outside_geometry_camera_allowlist(
+    tmp_path: Path,
+) -> None:
+    """Catch arbitrary raw arrays hidden in a generically named NPZ."""
+
+    fixture = _final_gate_fixture(tmp_path)
+    root = fixture["root"]
+    assert isinstance(root, Path)
+    camera = root / "cameras/allowlist_shoe/q0/cameras.npz"
+    camera.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        camera,
+        extrinsics=np.eye(4, dtype=np.float32)[None],
+        intrinsics=np.eye(3, dtype=np.float32)[None],
+        mask=np.ones((1, 1, 1), dtype=bool),
+        view_ids=np.asarray(["1"]),
+        camera_groups=np.asarray(["upper"]),
+    )
+
+    allowed = validate_adjacent16_final_gate(root)
+    assert allowed.passed is True
+    assert allowed.raw_feature_artifacts == ()
+
+    canonical_geometry = next(root.glob("geometry/**/depth_geometry.npz"))
+    with np.load(canonical_geometry, allow_pickle=False) as artifact:
+        arrays = {name: artifact[name] for name in artifact.files}
+    disguised = root / "geometry/evil/depth_geometry.npz"
+    disguised.parent.mkdir(parents=True)
+    np.savez_compressed(
+        disguised,
+        **arrays,
+        embedding=np.ones((2, 3), dtype=np.float32),
+    )
+    disguised_report = validate_adjacent16_final_gate(root)
+    assert disguised_report.passed is False
+    assert disguised_report.failed_checks == ("raw_feature_artifact",)
+    assert disguised_report.raw_feature_artifacts == (
+        "geometry/evil/depth_geometry.npz",
+    )
+    disguised.unlink()
+
+    raw = root / "reports/raw_embedding.npz"
+    np.savez_compressed(raw, embedding=np.ones((2, 3), dtype=np.float32))
+    rejected = validate_adjacent16_final_gate(root)
+
+    assert rejected.passed is False
+    assert rejected.failed_checks == ("raw_feature_artifact",)
+    assert rejected.raw_feature_artifacts == ("reports/raw_embedding.npz",)
 
 
 def test_final_gate_rejects_another_jobs_valid_output_part(tmp_path: Path) -> None:

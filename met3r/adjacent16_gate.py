@@ -25,7 +25,13 @@ import torch
 from PIL import Image
 
 from .adjacent16_contract import Adjacent16Contract, load_adjacent16_contract
-from .adjacent16_data import camera_azimuths
+from .adjacent16_data import (
+    Adjacent16Manifest,
+    AdjacentShoeRecord,
+    AdjacentViewRecord,
+    camera_azimuths,
+)
+from .adjacent16_design import Adjacent16Design, build_adjacent16_design
 from .camera_metadata import CAMERA_MODE_LABEL
 from .geometry import confidence_percentile_mask
 from .job_registry import sha256_file
@@ -76,6 +82,30 @@ _ADJACENT_VIEW_KEYS = frozenset(
         "stress_sha256",
         "stress_mask_sha256",
         "quality",
+    }
+)
+_CAMERA_NPZ_KEYS = frozenset(
+    {"extrinsics", "intrinsics", "mask", "view_ids", "camera_groups"}
+)
+_FIXED_GEOMETRY_NPZ_KEYS = frozenset(
+    {
+        "depth",
+        "confidence",
+        "mask",
+        "extrinsics",
+        "intrinsics",
+        "meta__artifact_type",
+        "meta__model_id",
+        "meta__model_revision",
+        "meta__runtime_fingerprint",
+        "meta__source_revision",
+        "meta__source_dirty",
+        "meta__source_dirty_fingerprint",
+        "meta__camera_provenance",
+        "meta__image_set_id",
+        "meta__view_ids",
+        "meta__camera_groups",
+        "meta__analysis_tier",
     }
 )
 
@@ -1158,12 +1188,38 @@ def _raw_feature_artifacts(root: Path) -> tuple[str, ...]:
             found.append(str(relative))
             continue
         if path.suffix.lower() == ".npz":
+            camera_artifact = (
+                len(relative.parts) == 4
+                and relative.parts[0] == "cameras"
+                and path.name == "cameras.npz"
+            )
+            geometry_artifact = (
+                bool(relative.parts)
+                and relative.parts[0] == "geometry"
+                and path.name in {"depth_geometry.npz", "geometry.npz"}
+            )
+            if not camera_artifact and not geometry_artifact:
+                found.append(str(relative))
+                continue
             try:
                 with np.load(path, allow_pickle=False) as artifact:
-                    if any(key in artifact.files and str(np.asarray(artifact[key]).item()) == "dino_features" for key in ("meta__artifact_type", "artifact_type")):
+                    keys = frozenset(artifact.files)
+                    if camera_artifact and keys != _CAMERA_NPZ_KEYS:
+                        found.append(str(relative))
+                    elif geometry_artifact and (
+                        keys != _FIXED_GEOMETRY_NPZ_KEYS
+                        or str(np.asarray(artifact["meta__artifact_type"]).item())
+                        != "fixed_camera_depth"
+                    ):
+                        found.append(str(relative))
+                    elif any(
+                        key in artifact.files
+                        and str(np.asarray(artifact[key]).item()) == "dino_features"
+                        for key in ("meta__artifact_type", "artifact_type")
+                    ):
                         found.append(str(path.relative_to(root)))
             except (OSError, ValueError):
-                continue
+                found.append(str(relative))
     return tuple(sorted(set(found)))
 
 
@@ -1283,36 +1339,79 @@ def _actual_primary_rows(frame: pd.DataFrame) -> dict[tuple[object, ...], Mappin
     return indexed
 
 
-def _frozen_states(contract: Adjacent16Contract) -> tuple[Mapping[str, object], ...]:
-    shoes = tuple(contract.raw["shoes"])
-    states: list[Mapping[str, object]] = []
-    for shoe_index, shoe in enumerate(shoes):
-        donor = shoes[(shoe_index + 1) % len(shoes)]
+def _frozen_design(root: Path, contract: Adjacent16Contract) -> Adjacent16Design:
+    source = _source_manifest(root, contract)
+    shoes: list[AdjacentShoeRecord] = []
+    for shoe_id, camera_dataset_id in contract.raw["shoes"].items():
+        views: list[AdjacentViewRecord] = []
         for quartet in contract.quartets:
-            states.append({"state_id": f"controlled__{shoe}__{quartet.quartet_id}__clean", "track": "controlled", "shoe_id": shoe, "quartet_id": quartet.quartet_id, "view_ids": list(quartet.view_ids), "changed_view": None, "corruption": "clean", "severity": 0.0, "direction": 1, "seed": 0, "donor_shoe_id": None, "donor_view": None})
-            for corruption, strengths in contract.raw["corruptions"].items():
-                for raw_severity in strengths:
-                    severity = float(raw_severity)
-                    for changed in quartet.view_ids:
-                        seed_text = f"42|{shoe}|{quartet.quartet_id}|{changed}|{corruption}|{severity:.6f}".encode()
-                        seed = int.from_bytes(hashlib.sha256(seed_text).digest()[:4], "big")
-                        direction = 1 if seed % 2 else -1
-                        states.append({"state_id": f"controlled__{shoe}__{quartet.quartet_id}__view_{changed}__{corruption}__{severity:.6f}__{direction:+d}", "track": "controlled", "shoe_id": shoe, "quartet_id": quartet.quartet_id, "view_ids": list(quartet.view_ids), "changed_view": changed, "corruption": corruption, "severity": severity, "direction": direction, "seed": seed, "donor_shoe_id": donor if corruption == "identity_swap" else None, "donor_view": changed if corruption == "identity_swap" else None})
-            seed_text = f"42|{shoe}|{quartet.quartet_id}|all|deformed|{1.0:.6f}".encode()
-            states.append({"state_id": f"stress__{shoe}__{quartet.quartet_id}__deformed", "track": "stress", "shoe_id": shoe, "quartet_id": quartet.quartet_id, "view_ids": list(quartet.view_ids), "changed_view": None, "corruption": "deformed", "severity": 1.0, "direction": 1, "seed": int.from_bytes(hashlib.sha256(seed_text).digest()[:4], "big"), "donor_shoe_id": None, "donor_view": None})
-    return tuple(states)
+            records = source.get((shoe_id, quartet.quartet_id))
+            if records is None:
+                raise ValueError("source manifest is missing a frozen design unit")
+            for record in records:
+                views.append(
+                    AdjacentViewRecord(
+                        shoe_id=record.shoe_id,
+                        camera_dataset_id=record.camera_dataset_id,
+                        quartet_id=record.quartet_id,
+                        view_id=record.view_id,
+                        orbit_position=record.orbit_position,
+                        source_path=record.source_path,
+                        source_mask_path=record.source_mask_path,
+                        stress_path=None,
+                        stress_mask_path=None,
+                        deformation_json_path=None,
+                        metrics_json_path=None,
+                        task_json_path=None,
+                        processed_image_correlation=record.processed_image_correlation,
+                        camera_azimuth_deg=record.camera_azimuth_deg,
+                        source_sha256=record.source_sha256,
+                        source_mask_sha256=record.source_mask_sha256,
+                        stress_sha256=None,
+                        stress_mask_sha256=None,
+                        quality=None,
+                    )
+                )
+        shoes.append(
+            AdjacentShoeRecord(shoe_id, str(camera_dataset_id), tuple(views))
+        )
+    manifest = Adjacent16Manifest(
+        contract.reconstruction_root, contract.stress_root, tuple(shoes)
+    )
+    return build_adjacent16_design(manifest, contract)
+
+
+def _read_exact_jsonl(path: Path) -> list[object]:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if not lines or any(not line for line in lines):
+        raise ValueError(f"manifest JSONL is empty or contains blank rows: {path}")
+    return [json.loads(line) for line in lines]
 
 
 def _validate_registry_graph(root: Path, contract: Adjacent16Contract, config_sha256: str, rows: Sequence[_RegistryRow]) -> bool:
-    states = _frozen_states(contract)
-    expected_state_map = {str(state["state_id"]): state for state in states}
-    state_path = root / "manifests" / "image_states.jsonl"
     try:
-        actual_states = [json.loads(line) for line in state_path.read_text(encoding="utf-8").splitlines() if line]
-    except (OSError, json.JSONDecodeError):
-        return False
-    actual_state_map = {str(item.get("state_id")): item for item in actual_states if isinstance(item, Mapping)}
-    if len(actual_state_map) != len(actual_states) or actual_state_map != expected_state_map:
+        design = _frozen_design(root, contract)
+        states = [
+            json.loads(json.dumps(asdict(state)))
+            for state in (*design.controlled_states, *design.stress_states)
+        ]
+        pairs = [
+            json.loads(json.dumps(asdict(condition)))
+            for condition in (*design.controlled_conditions, *design.stress_conditions)
+        ]
+        variants = [asdict(variant) for variant in design.feature_variants]
+        if (
+            _read_exact_jsonl(root / "manifests" / "image_states.jsonl") != states
+            or _read_exact_jsonl(root / "manifests" / "pair_conditions.jsonl") != pairs
+            or json.loads(
+                (root / "manifests" / "feature_variants.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            != variants
+        ):
+            return False
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
         return False
     variants_by_backbone: dict[str, list[str]] = defaultdict(list)
     for variant in contract.feature_variants:
@@ -1345,39 +1444,150 @@ def _validate_registry_graph(root: Path, contract: Adjacent16Contract, config_sh
     return actual == expected
 
 
-def _exact_metric_keys(contract: Adjacent16Contract) -> Mapping[str, set[tuple[object, ...]]]:
-    variants = tuple(item.key for item in contract.feature_variants)
+_METRIC_IDENTITY_FIELDS = (
+    "job_id",
+    "design_id",
+    "image_state_id",
+    "pair_id",
+    "analysis_track",
+    "track",
+    "shoe_id",
+    "quartet_id",
+    "first_view",
+    "second_view",
+    "changed_view",
+    "corruption",
+    "severity",
+    "baseline_steps",
+    "angular_separation_deg",
+    "variant_key",
+    "feature_track",
+    "backbone",
+    "input_size",
+    "feature_mode",
+    "resolution",
+)
+_CALIBRATION_IDENTITY_FIELDS = (
+    *_METRIC_IDENTITY_FIELDS[:15],
+    "perturbation_kind",
+    "magnitude",
+    *_METRIC_IDENTITY_FIELDS[15:],
+)
+
+
+def _metric_identity(
+    condition: object,
+    variant: object,
+    *,
+    analysis_track: str,
+    changed_view: str | None,
+) -> tuple[object, ...]:
+    job_id = (
+        f"feature__{analysis_track}__{condition.image_state_id}__"
+        f"{variant.backbone}__{variant.feature_track}"
+    )
+    return (
+        job_id,
+        condition.design_id,
+        condition.image_state_id,
+        condition.pair_id,
+        analysis_track,
+        condition.track,
+        condition.shoe_id,
+        condition.quartet_id,
+        condition.first_view,
+        condition.second_view,
+        changed_view,
+        condition.corruption,
+        float(condition.severity),
+        condition.baseline_steps,
+        float(condition.angular_separation_deg),
+        variant.key,
+        variant.feature_track,
+        variant.backbone,
+        variant.input_size,
+        variant.feature_mode,
+        variant.resolution,
+    )
+
+
+def _exact_metric_keys(
+    contract: Adjacent16Contract,
+    design: Adjacent16Design,
+) -> Mapping[str, set[tuple[object, ...]]]:
     controlled: set[tuple[object, ...]] = set()
     stress: set[tuple[object, ...]] = set()
     calibration: set[tuple[object, ...]] = set()
-    calibration_variants = tuple(contract.geometry_calibration_variant_keys)
+    calibration_variants = tuple(
+        variant
+        for variant in design.feature_variants
+        if variant.key in contract.geometry_calibration_variant_keys
+    )
     kind_config = {"rotation": "rotation_degrees", "relative_translation": "relative_translation", "depth_scale": "depth_scale", "relative_depth_noise": "relative_depth_noise_std"}
-    for shoe in contract.raw["shoes"]:
-        for quartet in contract.quartets:
-            for first, second in itertools.combinations(quartet.view_ids, 2):
-                pair = f"{shoe}__{quartet.quartet_id}__{first}__{second}"
-                for variant in variants:
-                    controlled.add((shoe, quartet.quartet_id, first, second, None, "clean", 0.0, variant))
-                    stress.add((shoe, quartet.quartet_id, first, second, None, "deformed", 1.0, variant))
-                for changed in quartet.view_ids:
-                    if changed not in {first, second}:
-                        continue
-                    for corruption, strengths in contract.raw["corruptions"].items():
-                        for strength in strengths:
-                            for variant in variants:
-                                controlled.add((shoe, quartet.quartet_id, first, second, changed, corruption, float(strength), variant))
-                    for kind, config_name in kind_config.items():
-                        for magnitude in contract.raw["geometry_calibration"][config_name]:
-                            for variant in calibration_variants:
-                                calibration.add((shoe, quartet.quartet_id, first, second, changed, kind, float(magnitude), variant))
+    for condition in design.controlled_conditions:
+        for variant in design.feature_variants:
+            controlled.add(
+                _metric_identity(
+                    condition,
+                    variant,
+                    analysis_track="controlled",
+                    changed_view=condition.changed_view,
+                )
+            )
+    for condition in design.stress_conditions:
+        for variant in design.feature_variants:
+            stress.add(
+                _metric_identity(
+                    condition,
+                    variant,
+                    analysis_track="stress",
+                    changed_view=None,
+                )
+            )
+    for condition in design.controlled_conditions:
+        if condition.corruption != "clean":
+            continue
+        quartet = next(
+            item
+            for item in contract.quartets
+            if item.quartet_id == condition.quartet_id
+        )
+        for changed_view in quartet.view_ids:
+            if changed_view not in {condition.first_view, condition.second_view}:
+                continue
+            for kind, config_name in kind_config.items():
+                for magnitude in contract.raw["geometry_calibration"][config_name]:
+                    for variant in calibration_variants:
+                        base = _metric_identity(
+                            condition,
+                            variant,
+                            analysis_track="geometry_calibration",
+                            changed_view=changed_view,
+                        )
+                        calibration.add(
+                            (
+                                *base[:15],
+                                kind,
+                                float(magnitude),
+                                *base[15:],
+                            )
+                        )
     return {"controlled": controlled, "stress": stress, "geometry_calibration": calibration}
 
 
-def _validate_metric_keys(frames: Mapping[str, pd.DataFrame], contract: Adjacent16Contract) -> bool:
-    expected = _exact_metric_keys(contract)
+def _validate_metric_keys(
+    root: Path,
+    frames: Mapping[str, pd.DataFrame],
+    contract: Adjacent16Contract,
+) -> bool:
+    expected = _exact_metric_keys(contract, _frozen_design(root, contract))
     for track, wanted in expected.items():
         frame = frames[track]
-        fields = ("shoe_id", "quartet_id", "first_view", "second_view", "changed_view", "corruption", "severity", "variant_key") if track != "geometry_calibration" else ("shoe_id", "quartet_id", "first_view", "second_view", "changed_view", "perturbation_kind", "magnitude", "variant_key")
+        fields = (
+            _CALIBRATION_IDENTITY_FIELDS
+            if track == "geometry_calibration"
+            else _METRIC_IDENTITY_FIELDS
+        )
         if not set(fields) <= set(frame):
             return False
         actual = {tuple(row.get(field) for field in fields) for row in frame.to_dict("records")}
@@ -1419,7 +1629,7 @@ def validate_adjacent16_final_gate(run_root: str | Path) -> Adjacent16FinalGateR
         actual_rows["total"] = sum(actual_rows.values())
         if actual_rows != expected_rows:
             failures.add("metric_row_counts")
-        if not _validate_metric_keys(frames, contract):
+        if not _validate_metric_keys(root, frames, contract):
             failures.add("metric_row_keys")
         for track, frame in frames.items():
             if frame.empty:
