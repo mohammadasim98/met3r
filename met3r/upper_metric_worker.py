@@ -838,6 +838,36 @@ def _condition_columns(row: Mapping[str, object]) -> dict[str, object]:
     }
 
 
+def _validate_adjacent_pair_contract(
+    pair: Mapping[str, object],
+    state: _StateRecord,
+    *,
+    clean_state: _StateRecord | None = None,
+) -> None:
+    """Fail closed on quartet identity, order, and measured-baseline drift."""
+
+    if clean_state is not None and state.view_ids != clean_state.view_ids:
+        raise ValueError("adjacent state and clean state view order differ")
+    if pair.get("quartet_id") != state.quartet_id:
+        raise ValueError("adjacent pair quartet does not match state")
+    if (
+        pair.get("first_view") not in state.view_ids
+        or pair.get("second_view") not in state.view_ids
+    ):
+        raise ValueError("adjacent pair is outside the current quartet")
+    steps = pair.get("baseline_steps")
+    if not isinstance(steps, int) or isinstance(steps, bool) or steps not in {1, 2, 3}:
+        raise ValueError("adjacent pair baseline_steps must be 1, 2, or 3")
+    angle = pair.get("angular_separation_deg")
+    if (
+        not isinstance(angle, (int, float))
+        or isinstance(angle, bool)
+        or not math.isfinite(float(angle))
+        or float(angle) <= 0
+    ):
+        raise ValueError("adjacent pair angular_separation_deg must be finite and positive")
+
+
 def _safe_name(value: str) -> str:
     return "".join(
         character if character.isalnum() or character in "._-+" else "_"
@@ -1879,6 +1909,11 @@ def _run_claimed_job(
     if job.payload.get("quartet_id", state.quartet_id) != state.quartet_id:
         raise ValueError("feature job quartet identity mismatch")
     clean_state = _clean_state_for_shoe(states, state.shoe_id, state.quartet_id)
+    if (
+        contract.visualization_policy == "posthoc_audit_only"
+        and state.view_ids != clean_state.view_ids
+    ):
+        raise ValueError("adjacent state and clean state view order differ")
     pairs = tuple(
         row for row in all_pairs if row.get("image_state_id") == state.state_id
     )
@@ -1906,6 +1941,8 @@ def _run_claimed_job(
             or pair.get("second_view") not in state.view_ids
         ):
             raise ValueError("pair condition is outside its current quartet")
+        if contract.visualization_policy == "posthoc_audit_only":
+            _validate_adjacent_pair_contract(pair, state, clean_state=clean_state)
     selected_variants = _job_variants(job, variants)
     pca_staging, pca_destination, diagnostic_staging, diagnostic_destination = (
         _stage_job_directories(contract, job, selected_variants[0].feature_track)
@@ -2028,12 +2065,14 @@ def run_feature_worker(
             if any(not isinstance(job_id, str) or not job_id for job_id in requested_ids):
                 raise ValueError("job_ids must contain non-empty strings")
             for job_id in requested_ids:
-                job = registry.claim_exact(f"feature:{backbone}", "feature", job_id)
+                job = registry.claim_exact(
+                    f"feature:{backbone}",
+                    "feature",
+                    job_id,
+                    expected_payload={"backbone": backbone},
+                )
                 if job is None:
                     continue
-                if job.payload.get("backbone") != backbone:
-                    registry.fail(job.job_id, "exact job backbone mismatch", retryable=False)
-                    raise ValueError("exact job backbone mismatch")
                 track = job.payload.get("feature_track")
                 if not isinstance(track, str) or track not in tracks:
                     registry.fail(job.job_id, "exact job feature track mismatch", retryable=False)

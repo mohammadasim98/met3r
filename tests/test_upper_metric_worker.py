@@ -865,3 +865,40 @@ def test_valid_completed_resume_keeps_outputs_and_cleans_exact_debris(
     assert not backup.exists()
     assert not Path(f"{part}.tmp").exists()
     assert not staging.exists()
+
+
+def test_exact_worker_run_does_not_claim_wrong_or_unlisted_jobs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch timed sentinel fallback from named jobs to arbitrary pending work."""
+
+    run_root, registry, _ = _make_run(tmp_path, two_tracks=True)
+    _patch_models(monkeypatch)
+    config_sha256 = json.loads((run_root / "run_manifest.json").read_text())["config_sha256"]
+    registry.register(
+        JobDefinition(
+            "feature__wrong-backbone", "feature",
+            {
+                "job_type": "feature", "state_id": "controlled__shoe-a__left__blur__0.500000__+1",
+                "track": "controlled", "analysis_track": "controlled", "shoe_id": "shoe-a",
+                "state_dir": str((run_root / "states" / "controlled__shoe-a__left__blur__0.500000__+1").resolve()),
+                "camera_path": str((run_root / "cameras" / "shoe-a" / "cameras.npz").resolve()),
+                "config_sha256": config_sha256, "backbone": "other_backbone", "feature_track": "track_8",
+            },
+        )
+    )
+    target = "feature__feature__controlled__shoe-a__left__blur__0.500000__+1__fake_backbone__track_8"
+    monkeypatch.setattr(
+        JobRegistry, "claim_next", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("fallback claim_next"))
+    )
+
+    summary = run_feature_worker(run_root, "fake_backbone", "cpu", job_ids=[target, target, "missing", "feature__wrong-backbone"])
+
+    assert summary.completed == 1
+    with sqlite3.connect(registry.path) as connection:
+        rows = dict(connection.execute("SELECT job_id, state || ':' || attempts FROM jobs"))
+    assert rows[target] == "completed:1"
+    assert rows["feature__wrong-backbone"] == "pending:0"
+    other = "feature__feature__controlled__shoe-a__left__blur__0.500000__+1__fake_backbone__track_12"
+    assert rows[other] == "pending:0"

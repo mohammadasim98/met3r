@@ -206,6 +206,8 @@ class JobRegistry:
         worker_id: str,
         phase: str,
         job_id: str,
+        *,
+        expected_payload: Mapping[str, object] | None = None,
     ) -> ClaimedJob | None:
         """Transactionally claim one named pending job, or return ``None``."""
 
@@ -224,6 +226,15 @@ class JobRegistry:
                     (job_id, phase),
                 ).fetchone()
                 if row is None:
+                    connection.commit()
+                    return None
+                payload = json.loads(str(row["payload_json"]))
+                if not isinstance(payload, Mapping):
+                    raise ValueError("stored job payload is malformed")
+                if expected_payload is not None and any(
+                    payload.get(key) != value
+                    for key, value in expected_payload.items()
+                ):
                     connection.commit()
                     return None
                 attempts = int(row["attempts"]) + 1
@@ -245,9 +256,6 @@ class JobRegistry:
                 if updated.rowcount != 1:
                     raise RuntimeError("transactional exact job claim lost ownership")
                 connection.commit()
-                payload = json.loads(str(row["payload_json"]))
-                if not isinstance(payload, Mapping):
-                    raise ValueError("stored job payload is malformed")
                 return ClaimedJob(job_id, phase, payload, attempts)
             except Exception:
                 connection.rollback()

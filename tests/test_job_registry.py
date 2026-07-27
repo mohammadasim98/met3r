@@ -173,3 +173,56 @@ def test_claim_exact_claims_only_the_named_pending_job(tmp_path: Path) -> None:
     assert registry.claim_exact("sentinel", "feature", "missing") is None
     assert registry.claim_exact("sentinel", "feature", "wanted") is None
     assert registry.claim_next("normal", "feature", {}).job_id == "other"
+
+
+def test_claim_exact_payload_predicate_keeps_wrong_backbone_pending(tmp_path: Path) -> None:
+    """Catch a targeted L worker consuming a named B job before rejecting it."""
+
+    registry = JobRegistry(tmp_path / "jobs.sqlite")
+    registry.register(JobDefinition("b-job", "feature", {"backbone": "B"}))
+
+    claimed = registry.claim_exact(
+        "sentinel", "feature", "b-job", expected_payload={"backbone": "L"}
+    )
+
+    assert claimed is None
+    with registry._connect() as connection:
+        row = connection.execute(
+            "SELECT state, attempts, worker_id FROM jobs WHERE job_id = 'b-job'"
+        ).fetchone()
+    assert tuple(row) == ("pending", 0, None)
+
+
+def test_claim_exact_predicate_allows_only_one_concurrent_match(tmp_path: Path) -> None:
+    """Catch a non-atomic exact claim allowing two sentinel owners."""
+
+    path = tmp_path / "jobs.sqlite"
+    registry = JobRegistry(path)
+    registry.register(JobDefinition("wanted", "feature", {"backbone": "L"}))
+
+    def claim(worker: int) -> str | None:
+        result = JobRegistry(path).claim_exact(
+            f"worker-{worker}", "feature", "wanted", expected_payload={"backbone": "L"}
+        )
+        return result.job_id if result is not None else None
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        claims = list(executor.map(claim, range(2)))
+
+    assert claims.count("wanted") == 1
+    assert claims.count(None) == 1
+
+
+def test_claim_exact_ignores_wrong_phase_and_completed_job(tmp_path: Path) -> None:
+    """Catch exact claiming of a non-pending or different-phase registry row."""
+
+    output = tmp_path / "result"
+    output.write_text("ok")
+    registry = JobRegistry(tmp_path / "jobs.sqlite")
+    registry.register(JobDefinition("geometry", "geometry", {"backbone": "L"}))
+    registry.register(JobDefinition("complete", "feature", {"backbone": "L"}))
+    assert registry.claim_next("worker", "feature", {}) is not None
+    registry.complete("complete", {"files": [{"path": str(output), "sha256": sha256_file(output)}]})
+
+    assert registry.claim_exact("sentinel", "feature", "geometry") is None
+    assert registry.claim_exact("sentinel", "feature", "complete") is None
