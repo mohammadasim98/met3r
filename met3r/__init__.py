@@ -9,23 +9,29 @@ from __future__ import annotations
 from typing import Any
 
 from .known_camera import (
+    DirectionalGeometrySupport,
     FactorialMetricResult,
     KnownCameraConfig,
     PairMetricResult,
+    SymmetricGeometrySupport,
     SymmetricPairMetricResult,
     score_factorial_known_camera_pair,
     score_known_camera_pair,
+    score_symmetric_geometry_support,
     score_symmetric_known_camera_pair,
 )
 
 __all__ = [
     "KnownCameraConfig",
+    "DirectionalGeometrySupport",
     "FactorialMetricResult",
     "MEt3R",
     "PairMetricResult",
+    "SymmetricGeometrySupport",
     "SymmetricPairMetricResult",
     "score_factorial_known_camera_pair",
     "score_known_camera_pair",
+    "score_symmetric_geometry_support",
     "score_symmetric_known_camera_pair",
 ]
 
