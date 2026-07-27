@@ -100,7 +100,7 @@ _TOP_LEVEL_KEYS = frozenset(
         "camera_label", "source_size", "stage_size", "seed", "camera_order", "quartets",
         "shoes", "metric", "physical_gpus", "corruptions", "models", "feature_variants",
         "geometry_calibration_variant_keys", "visualization_variant_keys", "geometry_calibration",
-        "preflight", "runtime", "analyzability", "expected_rows",
+        "visualization", "preflight", "runtime", "analyzability", "expected_rows",
     }
 )
 
@@ -255,6 +255,7 @@ def load_adjacent16_contract(path: str | Path) -> Adjacent16Contract:
         list(_GEOMETRY_VARIANT_KEYS),
         "visualization_variant_keys",
     )
+    _require_exact(raw["visualization"], {"policy": "posthoc_audit_only"}, "visualization")
     _require_exact(raw["geometry_calibration"], _EXPECTED_GEOMETRY, "geometry_calibration")
     _require_exact(raw["preflight"], _EXPECTED_PREFLIGHT, "preflight")
     _require_exact(raw["runtime"], _EXPECTED_RUNTIME, "runtime")

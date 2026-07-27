@@ -157,3 +157,19 @@ def test_registry_enables_wal_and_foreign_keys(tmp_path: Path) -> None:
 
     assert pragmas["journal_mode"] == "wal"
     assert pragmas["foreign_keys"] == 1
+
+
+def test_claim_exact_claims_only_the_named_pending_job(tmp_path: Path) -> None:
+    """Catch a sentinel worker silently claiming an unrelated pending job."""
+
+    registry = JobRegistry(tmp_path / "jobs.sqlite")
+    registry.register(JobDefinition("wanted", "feature", {"backbone": "L"}))
+    registry.register(JobDefinition("other", "feature", {"backbone": "L"}))
+
+    claimed = registry.claim_exact("sentinel", "feature", "wanted")
+
+    assert claimed is not None
+    assert claimed.job_id == "wanted"
+    assert registry.claim_exact("sentinel", "feature", "missing") is None
+    assert registry.claim_exact("sentinel", "feature", "wanted") is None
+    assert registry.claim_next("normal", "feature", {}).job_id == "other"

@@ -201,6 +201,58 @@ class JobRegistry:
                 connection.rollback()
                 raise
 
+    def claim_exact(
+        self,
+        worker_id: str,
+        phase: str,
+        job_id: str,
+    ) -> ClaimedJob | None:
+        """Transactionally claim one named pending job, or return ``None``."""
+
+        if not worker_id or not phase or not job_id:
+            raise ValueError("worker_id, phase, and job_id must be non-empty")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    """
+                    SELECT job_id, phase, payload_json, attempts
+                    FROM jobs
+                    WHERE job_id = ? AND phase = ? AND state = 'pending'
+                      AND attempts < 3
+                    """,
+                    (job_id, phase),
+                ).fetchone()
+                if row is None:
+                    connection.commit()
+                    return None
+                attempts = int(row["attempts"]) + 1
+                updated = connection.execute(
+                    """
+                    UPDATE jobs
+                    SET state = 'running', worker_id = ?, attempts = ?,
+                        started_at = ?, finished_at = NULL, error = NULL
+                    WHERE job_id = ? AND phase = ? AND state = 'pending'
+                    """,
+                    (
+                        worker_id,
+                        attempts,
+                        _utc_text(datetime.now(timezone.utc)),
+                        job_id,
+                        phase,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise RuntimeError("transactional exact job claim lost ownership")
+                connection.commit()
+                payload = json.loads(str(row["payload_json"]))
+                if not isinstance(payload, Mapping):
+                    raise ValueError("stored job payload is malformed")
+                return ClaimedJob(job_id, phase, payload, attempts)
+            except Exception:
+                connection.rollback()
+                raise
+
     def complete(
         self, job_id: str, output_manifest: Mapping[str, object]
     ) -> None:

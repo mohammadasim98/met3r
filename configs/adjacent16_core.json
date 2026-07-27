@@ -65,6 +65,9 @@
     "user_37_grid_track__dinov3_vitl16_pixal3d__592__bilinear__37",
     "user_37_grid_track__dinov3_vitl16_pixal3d__592__naf_normal_guide__592"
   ],
+  "visualization": {
+    "policy": "posthoc_audit_only"
+  },
   "visualization_variant_keys": [
     "user_37_grid_track__dinov3_vitl16_pixal3d__592__bilinear__37",
     "user_37_grid_track__dinov3_vitl16_pixal3d__592__naf_normal_guide__592"

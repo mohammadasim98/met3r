@@ -86,6 +86,7 @@ class _RunContract:
     metric_config: KnownCameraConfig
     confidence_percentile: float
     backbone_revision: str
+    visualization_policy: str
 
 
 @dataclass(frozen=True)
@@ -93,6 +94,8 @@ class _StateRecord:
     state_id: str
     track: str
     shoe_id: str
+    quartet_id: str
+    view_ids: tuple[str, str, str, str]
     changed_view: str | None
     corruption: str
     severity: float
@@ -114,7 +117,7 @@ class _InstalledOutput:
 
 @dataclass
 class _CleanFeatureCache:
-    key: tuple[str, str, int] | None = None
+    key: tuple[str, str, tuple[str, str, str, str], str, int] | None = None
     images: _ImageBatch | None = None
     native: Tensor | None = None
 
@@ -147,15 +150,16 @@ def _load_run_contract(root: Path, backbone: str) -> _RunContract:
     config = json.loads(content)
     if not isinstance(config, Mapping):
         raise ValueError("frozen config must contain an object")
+    adjacent = "quartets" in config
     run_manifest = _json_object(root / "run_manifest.json")
     if run_manifest.get("config_sha256") != config_sha256:
         raise ValueError("run manifest config hash mismatch")
-    scope = run_manifest.get("scope")
+    scope = run_manifest.get("scope", "full" if adjacent else None)
     if scope not in {"pilot", "full"}:
         raise ValueError("run manifest scope must be 'pilot' or 'full'")
     if config.get("stage_size") != 504:
         raise ValueError("frozen stage_size must be exactly 504")
-    if tuple(config.get("views", ())) != UPPER_VIEWS:
+    if not adjacent and tuple(config.get("views", ())) != UPPER_VIEWS:
         raise ValueError(f"frozen views must be exactly {UPPER_VIEWS}")
     if config.get("camera_label") != CAMERA_MODE_LABEL:
         raise ValueError("frozen camera label does not match the report contract")
@@ -199,6 +203,14 @@ def _load_run_contract(root: Path, backbone: str) -> _RunContract:
         raise ValueError("backbone revision does not match the pinned implementation")
     if models.get("naf_revision") != NAF_REVISION:
         raise ValueError("NAF revision does not match the pinned implementation")
+    visualization = config.get("visualization", {})
+    if not isinstance(visualization, Mapping):
+        raise ValueError("frozen config visualization must be an object")
+    policy = visualization.get("policy", "legacy_pca")
+    if policy not in {"legacy_pca", "posthoc_audit_only"}:
+        raise ValueError("unknown frozen visualization policy")
+    if adjacent and policy != "posthoc_audit_only":
+        raise ValueError("adjacent runs require posthoc_audit_only visualization")
     return _RunContract(
         root=root,
         config=config,
@@ -210,6 +222,7 @@ def _load_run_contract(root: Path, backbone: str) -> _RunContract:
         ),
         confidence_percentile=float(percentile),
         backbone_revision=revision,
+        visualization_policy=str(policy),
     )
 
 
@@ -496,14 +509,21 @@ def _load_state_index(root: Path) -> dict[str, _StateRecord]:
         corruption = payload.get("corruption")
         severity = payload.get("severity")
         changed_view = payload.get("changed_view")
+        quartet_id = payload.get("quartet_id", "__legacy_upper__")
+        raw_view_ids = payload.get("view_ids", list(UPPER_VIEWS))
         if (
             not isinstance(state_id, str)
             or not isinstance(track, str)
             or not isinstance(shoe_id, str)
             or not isinstance(corruption, str)
+            or not isinstance(quartet_id, str)
+            or not isinstance(raw_view_ids, list)
+            or len(raw_view_ids) != 4
+            or any(not isinstance(view_id, str) for view_id in raw_view_ids)
+            or len(set(raw_view_ids)) != 4
             or not isinstance(severity, (int, float))
             or isinstance(severity, bool)
-            or (changed_view is not None and changed_view not in UPPER_VIEWS)
+            or (changed_view is not None and changed_view not in raw_view_ids)
         ):
             raise ValueError(f"image state line {line_number} is malformed")
         if state_id in states:
@@ -512,6 +532,8 @@ def _load_state_index(root: Path) -> dict[str, _StateRecord]:
             state_id=state_id,
             track=track,
             shoe_id=shoe_id,
+            quartet_id=quartet_id,
+            view_ids=tuple(raw_view_ids),
             changed_view=changed_view,
             corruption=corruption,
             severity=float(severity),
@@ -523,11 +545,13 @@ def _load_state_index(root: Path) -> dict[str, _StateRecord]:
 def _clean_state_for_shoe(
     states: Mapping[str, _StateRecord],
     shoe_id: str,
+    quartet_id: str | None = None,
 ) -> _StateRecord:
     matches = [
         state
         for state in states.values()
         if state.shoe_id == shoe_id
+        and (quartet_id is None or state.quartet_id == quartet_id)
         and state.track == "controlled"
         and state.corruption == "clean"
     ]
@@ -551,11 +575,13 @@ def _state_images(
         raise ValueError("state metadata shoe does not match its manifest")
     if raw_state.get("track") != state.track:
         raise ValueError("state metadata track does not match its manifest")
+    if raw_state.get("quartet_id", state.quartet_id) != state.quartet_id:
+        raise ValueError("state metadata quartet does not match its manifest")
+    if tuple(raw_state.get("view_ids", state.view_ids)) != state.view_ids:
+        raise ValueError("state metadata view order does not match its manifest")
     if metadata.get("stage_size") != 504:
         raise ValueError("materialized feature state must be staged at 504")
-    paths = tuple(
-        state.state_dir / "images" / f"{view_id}.png" for view_id in UPPER_VIEWS
-    )
+    paths = tuple(state.state_dir / "images" / f"{view_id}.png" for view_id in state.view_ids)
     return _load_image_batch(paths, input_size=input_size, device=device)
 
 
@@ -567,7 +593,7 @@ def _clean_features(
     extractor: MultiScaleFeatureExtractor,
     device: torch.device,
 ) -> tuple[_ImageBatch, Tensor]:
-    key = (state.shoe_id, feature_track, input_size)
+    key = (state.shoe_id, state.quartet_id, state.view_ids, feature_track, input_size)
     if cache.key != key:
         cache.release()
         images = _state_images(state, input_size, device)
@@ -584,6 +610,7 @@ def _load_geometry(
     path: Path,
     device: torch.device,
     *,
+    expected_view_ids: tuple[str, str, str, str],
     validate_metadata: bool,
 ) -> ViewGeometry:
     if validate_metadata:
@@ -594,7 +621,7 @@ def _load_geometry(
             raise ValueError("geometry camera provenance mismatch")
         if metadata.get("process_res") != 504:
             raise ValueError("geometry process resolution must be 504")
-        if tuple(metadata.get("view_ids", ())) != UPPER_VIEWS:
+        if tuple(metadata.get("view_ids", ())) != expected_view_ids:
             raise ValueError("geometry metadata view order mismatch")
         if tuple(metadata.get("camera_groups", ())) != ("upper",) * 4:
             raise ValueError("geometry metadata contains a non-upper view")
@@ -631,8 +658,8 @@ def _load_geometry(
         raise ValueError("geometry confidence shape mismatch")
     if intrinsics.shape != (4, 3, 3) or extrinsics.shape != (4, 4, 4):
         raise ValueError("geometry camera arrays have unexpected shapes")
-    if views != UPPER_VIEWS or groups != ("upper",) * 4:
-        raise ValueError("geometry must contain only canonical upper views")
+    if views != expected_view_ids or groups != ("upper",) * 4:
+        raise ValueError("geometry must contain only the state quartet views")
     if provenance != "fixed_precomputed_da3":
         raise ValueError("geometry artifact camera provenance mismatch")
     return ViewGeometry(
@@ -659,8 +686,8 @@ def _load_geometry(
 def select_geometry(geometry: ViewGeometry, index: int) -> ViewGeometry:
     """Select one canonical upper view while retaining a batch dimension."""
 
-    if index not in range(len(UPPER_VIEWS)):
-        raise IndexError("upper geometry index is out of range")
+    if index not in range(int(geometry.depth.shape[0])):
+        raise IndexError("geometry index is out of range")
     return ViewGeometry(
         depth=geometry.depth[index : index + 1],
         mask=geometry.mask[index : index + 1],
@@ -675,7 +702,14 @@ def select_geometry(geometry: ViewGeometry, index: int) -> ViewGeometry:
 
 
 def _pair_rows(root: Path) -> tuple[dict[str, object], ...]:
-    frame = pd.read_parquet(root / "manifests" / "pair_conditions.parquet")
+    jsonl_path = root / "manifests" / "pair_conditions.jsonl"
+    if jsonl_path.is_file():
+        rows = tuple(
+            json.loads(line) for line in jsonl_path.read_text(encoding="utf-8").splitlines()
+        )
+    else:
+        frame = pd.read_parquet(root / "manifests" / "pair_conditions.parquet")
+        rows = tuple(frame.to_dict(orient="records"))
     required = {
         "design_id",
         "track",
@@ -687,24 +721,26 @@ def _pair_rows(root: Path) -> tuple[dict[str, object], ...]:
         "corruption",
         "severity",
     }
-    if not required <= set(frame):
-        raise ValueError(f"pair manifest is missing columns: {sorted(required - set(frame))}")
-    rows = tuple(frame.to_dict(orient="records"))
+    if any(not isinstance(row, Mapping) or not required <= set(row) for row in rows):
+        raise ValueError("pair manifest is missing required columns")
     for row in rows:
         first = row.get("first_view")
         second = row.get("second_view")
         if (
-            first not in UPPER_VIEWS
-            or second not in UPPER_VIEWS
+            not isinstance(first, str)
+            or not isinstance(second, str)
             or first == second
-            or row.get("pair_id") != f"{first}__{second}"
+            or not isinstance(row.get("pair_id"), str)
         ):
-            raise ValueError("pair manifest contains a non-canonical upper pair")
+            raise ValueError("pair manifest contains a malformed pair")
     return rows
 
 
 def _quality_index(root: Path) -> dict[tuple[str, str], Mapping[str, object]]:
-    manifest = _json_object(root / "manifests" / "upper_manifest.json")
+    path = root / "manifests" / "upper_manifest.json"
+    if not path.is_file():
+        path = root / "manifests" / "adjacent16_manifest.json"
+    manifest = _json_object(path)
     shoes = manifest.get("shoes")
     if not isinstance(shoes, list):
         raise ValueError("upper manifest requires a shoes list")
@@ -716,7 +752,7 @@ def _quality_index(root: Path) -> dict[tuple[str, str], Mapping[str, object]]:
         if not isinstance(views, list):
             raise ValueError("upper manifest shoe requires views")
         for view in views:
-            if not isinstance(view, Mapping) or view.get("view_id") not in UPPER_VIEWS:
+            if not isinstance(view, Mapping) or not isinstance(view.get("view_id"), str):
                 raise ValueError("upper manifest view is malformed")
             quality = view.get("quality")
             if not isinstance(quality, Mapping):
@@ -781,6 +817,7 @@ def _condition_columns(row: Mapping[str, object]) -> dict[str, object]:
         "design_id": row["design_id"],
         "track": row["track"],
         "shoe_id": row["shoe_id"],
+        "quartet_id": row.get("quartet_id", "__legacy_upper__"),
         "pair_id": row["pair_id"],
         "first_view": row["first_view"],
         "second_view": row["second_view"],
@@ -796,6 +833,8 @@ def _condition_columns(row: Mapping[str, object]) -> dict[str, object]:
         "image_state_id": row["image_state_id"],
         "corruption": row["corruption"],
         "severity": float(row["severity"]),
+        "baseline_steps": row.get("baseline_steps"),
+        "angular_separation_deg": row.get("angular_separation_deg"),
     }
 
 
@@ -866,11 +905,12 @@ def _render_pca_variant(
     basis: PCABasis,
     variant: FeatureVariant,
     output_dir: Path,
+    view_ids: Sequence[str],
     *,
     track_max_resolution: int,
 ) -> tuple[Path, ...]:
     paths: list[Path] = []
-    for index, view_id in enumerate(UPPER_VIEWS):
+    for index, view_id in enumerate(view_ids):
         path = output_dir / f"{_safe_name(variant.key)}__{view_id}.png"
         rendered = render_pca_png(
             feature[index : index + 1],
@@ -890,11 +930,13 @@ def _save_factorial_diagnostics(
     variant: FeatureVariant,
     changed_images: _ImageBatch,
     output_dir: Path,
+    view_ids: Sequence[str],
 ) -> tuple[Path, ...]:
     first_view = str(condition["first_view"])
     second_view = str(condition["second_view"])
-    first = UPPER_VIEWS.index(first_view)
-    second = UPPER_VIEWS.index(second_view)
+    view_index = {view_id: index for index, view_id in enumerate(view_ids)}
+    first = view_index[first_view]
+    second = view_index[second_view]
     design = _safe_name(str(condition["design_id"]))
     key = _safe_name(variant.key)
     first_path = output_dir / f"{design}__{key}__first_to_second.png"
@@ -956,7 +998,7 @@ def _stage_job_directories(
     contract: _RunContract,
     job: ClaimedJob,
     feature_track: str,
-) -> tuple[Path, Path, Path, Path]:
+) -> tuple[Path, Path | None, Path, Path]:
     pca_destination = (
         contract.root
         / "pca"
@@ -965,14 +1007,19 @@ def _stage_job_directories(
         / job.job_id
     )
     diagnostic_destination = contract.root / "visualizations" / job.job_id
-    pca_destination.parent.mkdir(parents=True, exist_ok=True)
     diagnostic_destination.parent.mkdir(parents=True, exist_ok=True)
-    pca_staging = Path(
-        tempfile.mkdtemp(
-            prefix=f".{pca_destination.name}.staging.",
-            dir=pca_destination.parent,
+    if contract.visualization_policy == "posthoc_audit_only":
+        transient_parent = contract.root / ".feature-transient"
+        transient_parent.mkdir(parents=True, exist_ok=True)
+        pca_staging = Path(tempfile.mkdtemp(prefix="job.", dir=transient_parent))
+        pca_destination = None
+    else:
+        pca_destination.parent.mkdir(parents=True, exist_ok=True)
+        pca_staging = Path(
+            tempfile.mkdtemp(
+                prefix=f".{pca_destination.name}.staging.", dir=pca_destination.parent,
+            )
         )
-    )
     diagnostic_staging = Path(
         tempfile.mkdtemp(
             prefix=f".{diagnostic_destination.name}.staging.",
@@ -1102,7 +1149,7 @@ def _publish_job_outputs(
 def _factorial_rows(
     contract: _RunContract,
     job: ClaimedJob,
-    basis: PCABasis,
+    basis: PCABasis | None,
     extractor: MultiScaleFeatureExtractor,
     naf: torch.nn.Module,
     variants: Sequence[FeatureVariant],
@@ -1136,16 +1183,33 @@ def _factorial_rows(
         changed_images = _state_images(state, input_size, device)
         changed_native = extractor.extract_native(changed_images.tensor)
         _validate_native_shape(changed_native, variants)
+    base_geometry_path = (
+        contract.root / "geometry" / "calibration" / clean_state.state_id / "depth_geometry.npz"
+        if contract.visualization_policy == "posthoc_audit_only"
+        else contract.root / "geometry" / clean_state.state_id / "depth_geometry.npz"
+    )
     base_geometry = _load_geometry(
-        contract.root / "geometry" / clean_state.state_id / "depth_geometry.npz",
+        base_geometry_path,
         device,
+        expected_view_ids=clean_state.view_ids,
         validate_metadata=True,
     )
-    adaptive_geometry = _load_geometry(
-        contract.root / "geometry" / state.state_id / "depth_geometry.npz",
-        device,
-        validate_metadata=True,
-    )
+    geometry_contract = str(job.payload.get("geometry_contract", "base_plus_adaptive"))
+    if geometry_contract == "fixed_base_only":
+        adaptive_geometry = base_geometry
+    elif geometry_contract == "base_plus_adaptive":
+        adaptive_geometry = _load_geometry(
+            (
+                contract.root / "geometry" / "stress" / state.state_id / "depth_geometry.npz"
+                if contract.visualization_policy == "posthoc_audit_only"
+                else contract.root / "geometry" / state.state_id / "depth_geometry.npz"
+            ),
+            device,
+            expected_view_ids=state.view_ids,
+            validate_metadata=True,
+        )
+    else:
+        raise ValueError("unknown feature geometry contract")
     track_max = max(variant.resolution for variant in variants)
     rows: list[dict[str, object]] = []
     pca_paths: list[Path] = []
@@ -1159,20 +1223,23 @@ def _factorial_rows(
             variants,
             naf,
         ):
-            pca_paths.extend(
-                _render_pca_variant(
-                    changed_feature,
-                    basis,
-                    variant,
-                    pca_staging,
-                    track_max_resolution=track_max,
+            if basis is not None:
+                pca_paths.extend(
+                    _render_pca_variant(
+                        changed_feature, basis, variant, pca_staging,
+                        state.view_ids, track_max_resolution=track_max,
+                    )
                 )
-            )
             for condition in pairs:
                 first_view = str(condition["first_view"])
                 second_view = str(condition["second_view"])
-                first = UPPER_VIEWS.index(first_view)
-                second = UPPER_VIEWS.index(second_view)
+                view_index = {
+                    view_id: index for index, view_id in enumerate(state.view_ids)
+                }
+                try:
+                    first, second = view_index[first_view], view_index[second_view]
+                except KeyError as error:
+                    raise ValueError("pair is outside the current state quartet") from error
                 result = score_multiscale_factorial(
                     {variant.key: clean_feature[first : first + 1]},
                     {variant.key: clean_feature[second : second + 1]},
@@ -1189,6 +1256,7 @@ def _factorial_rows(
                 row = {
                     **_condition_columns(condition),
                     **_row_provenance(contract, job, variant),
+                    "geometry_contract": geometry_contract,
                     **flat,
                     **_quality_columns(
                         qualities,
@@ -1199,7 +1267,7 @@ def _factorial_rows(
                     ),
                 }
                 rows.append(row)
-                if _retain_diagnostic(
+                if contract.visualization_policy != "posthoc_audit_only" and _retain_diagnostic(
                     contract,
                     condition,
                     abstained=bool(flat["abstained"]),
@@ -1211,10 +1279,14 @@ def _factorial_rows(
                             variant,
                             changed_images,
                             diagnostic_staging,
+                            state.view_ids,
                         )
                     )
     finally:
-        del clean_native, base_geometry, adaptive_geometry, clean_images
+        adaptive_is_base = adaptive_geometry is base_geometry
+        del clean_native, base_geometry, clean_images
+        if not adaptive_is_base:
+            del adaptive_geometry
         if not changed_is_clean:
             del changed_native, changed_images
     _write_manifest(pca_staging, "manifest.json", pca_paths)
@@ -1297,13 +1369,12 @@ def _calibration_records(
     contract: _RunContract,
     clean_state: _StateRecord,
 ) -> tuple[Mapping[str, object], ...]:
-    path = (
-        contract.root
-        / "geometry"
-        / clean_state.state_id
-        / "calibration"
-        / "calibration_manifest.json"
+    calibration_root = (
+        contract.root / "geometry" / "calibration" / clean_state.state_id
+        if contract.visualization_policy == "posthoc_audit_only"
+        else contract.root / "geometry" / clean_state.state_id / "calibration"
     )
+    path = calibration_root / "calibration_manifest.json"
     manifest = _json_object(path)
     if manifest.get("artifact_type") != "upper_geometry_calibration":
         raise ValueError("geometry calibration artifact type mismatch")
@@ -1311,14 +1382,10 @@ def _calibration_records(
         raise ValueError("geometry calibration config hash mismatch")
     if manifest.get("seed") != 42:
         raise ValueError("geometry calibration seed mismatch")
-    if tuple(manifest.get("views", ())) != UPPER_VIEWS:
+    if tuple(manifest.get("views", ())) != clean_state.view_ids:
         raise ValueError("geometry calibration view order mismatch")
-    expected_base = (
-        contract.root
-        / "geometry"
-        / clean_state.state_id
-        / "depth_geometry.npz"
-    ).resolve()
+    expected_base = (calibration_root if contract.visualization_policy == "posthoc_audit_only"
+                     else contract.root / "geometry" / clean_state.state_id / "depth_geometry.npz").resolve()
     if Path(str(manifest.get("base_geometry", ""))).resolve() != expected_base:
         raise ValueError("geometry calibration base path mismatch")
     raw_records = manifest.get("artifacts")
@@ -1352,7 +1419,7 @@ def _calibration_records(
         raise ValueError("frozen geometry calibration must define 17 perturbations")
     calibration_root = path.parent.resolve()
     records: list[Mapping[str, object]] = []
-    counts = {view_id: 0 for view_id in UPPER_VIEWS}
+    counts = {view_id: 0 for view_id in clean_state.view_ids}
     identities: set[tuple[str, str, float]] = set()
     for raw in raw_records:
         if not isinstance(raw, Mapping):
@@ -1362,8 +1429,8 @@ def _calibration_records(
         magnitude = raw.get("magnitude")
         view_index = raw.get("view_index")
         if (
-            view_id not in UPPER_VIEWS
-            or view_index != UPPER_VIEWS.index(str(view_id))
+            view_id not in clean_state.view_ids
+            or view_index != clean_state.view_ids.index(str(view_id))
             or not isinstance(kind, str)
             or not isinstance(magnitude, (int, float))
             or isinstance(magnitude, bool)
@@ -1390,7 +1457,7 @@ def _calibration_records(
         records.append({**raw, "path": str(artifact_path)})
     if set(counts.values()) != {17}:
         raise ValueError("geometry calibration requires 17 perturbations per view")
-    for view_id in UPPER_VIEWS:
+    for view_id in clean_state.view_ids:
         for kind, magnitudes in expected_values.items():
             actual = {
                 float(record["magnitude"])
@@ -1430,9 +1497,15 @@ def _calibration_rows(
         device,
     )
     _validate_native_shape(native, variants)
+    base_geometry_path = (
+        contract.root / "geometry" / "calibration" / clean_state.state_id / "depth_geometry.npz"
+        if contract.visualization_policy == "posthoc_audit_only"
+        else contract.root / "geometry" / clean_state.state_id / "depth_geometry.npz"
+    )
     base_geometry = _load_geometry(
-        contract.root / "geometry" / clean_state.state_id / "depth_geometry.npz",
+        base_geometry_path,
         device,
+        expected_view_ids=clean_state.view_ids,
         validate_metadata=True,
     )
     records = _calibration_records(contract, clean_state)
@@ -1454,6 +1527,7 @@ def _calibration_rows(
                 perturbed = _load_geometry(
                     Path(str(record["path"])),
                     device,
+                    expected_view_ids=clean_state.view_ids,
                     validate_metadata=False,
                 )
                 for condition in pairs:
@@ -1462,8 +1536,12 @@ def _calibration_rows(
                         condition["second_view"],
                     }:
                         continue
-                    first = UPPER_VIEWS.index(str(condition["first_view"]))
-                    second = UPPER_VIEWS.index(str(condition["second_view"]))
+                    view_index = {
+                        view_id: index
+                        for index, view_id in enumerate(clean_state.view_ids)
+                    }
+                    first = view_index[str(condition["first_view"])]
+                    second = view_index[str(condition["second_view"])]
                     first_base = select_geometry(base_geometry, first)
                     second_base = select_geometry(base_geometry, second)
                     first_perturbed = select_geometry(perturbed, first)
@@ -1568,7 +1646,7 @@ def _part_path(contract: _RunContract, job: ClaimedJob) -> Path:
     job_type = job.payload.get("job_type")
     track = (
         "geometry_calibration"
-        if job_type == "geometry_calibration"
+        if job_type in {"geometry_calibration", "geometry_calibration_feature"}
         else str(job.payload["feature_track"])
     )
     return contract.root / "metrics" / "parts" / track / f"{job.job_id}.parquet"
@@ -1580,15 +1658,14 @@ def _job_destinations(
     payload: Mapping[str, object],
 ) -> tuple[Path, Path, Path]:
     fake = ClaimedJob(job_id, "feature", payload, 0)
-    return (
-        _part_path(contract, fake),
-        contract.root
-        / "pca"
-        / str(payload["backbone"])
-        / str(payload["feature_track"])
-        / job_id,
-        contract.root / "visualizations" / job_id,
-    )
+    destinations = [_part_path(contract, fake), contract.root / "visualizations" / job_id]
+    if contract.visualization_policy != "posthoc_audit_only":
+        destinations.insert(
+            1,
+            contract.root / "pca" / str(payload["backbone"])
+            / str(payload["feature_track"]) / job_id,
+        )
+    return tuple(destinations)
 
 
 def _siblings(destination: Path, kind: str) -> list[Path]:
@@ -1708,11 +1785,48 @@ def _is_transient(error: BaseException) -> bool:
     return isinstance(error, OSError) and error.errno in _TRANSIENT_ERRNOS
 
 
+_ADJACENT_CALIBRATION_KEYS = frozenset(
+    {
+        "user_37_grid_track__dinov3_vitl16_pixal3d__592__bilinear__37",
+        "user_37_grid_track__dinov3_vitl16_pixal3d__592__naf_normal_guide__592",
+    }
+)
+
+
+def _job_variants(
+    job: ClaimedJob, variants: Sequence[FeatureVariant]
+) -> tuple[FeatureVariant, ...]:
+    """Select a non-empty exact payload subset without changing manifest order."""
+
+    requested = job.payload.get("variant_keys")
+    if requested is None:
+        return tuple(variants)
+    if (
+        not isinstance(requested, Sequence)
+        or isinstance(requested, (str, bytes))
+        or not requested
+        or any(not isinstance(key, str) for key in requested)
+        or len(set(requested)) != len(requested)
+    ):
+        raise ValueError("feature job variant_keys must be a non-empty exact subset")
+    available = {variant.key for variant in variants}
+    requested_keys = set(requested)
+    if not requested_keys <= available:
+        raise ValueError("feature job variant_keys are not in the backbone manifest")
+    selected = tuple(variant for variant in variants if variant.key in requested_keys)
+    if len(selected) != len(requested_keys):
+        raise ValueError("feature job variant_keys are not an exact subset")
+    if job.payload.get("job_type") == "geometry_calibration_feature":
+        if set(requested) != _ADJACENT_CALIBRATION_KEYS:
+            raise ValueError("adjacent calibration must use exactly the frozen variants")
+    return selected
+
+
 def _run_claimed_job(
     contract: _RunContract,
     registry: JobRegistry,
     job: ClaimedJob,
-    basis: PCABasis,
+    basis: PCABasis | None,
     extractor: MultiScaleFeatureExtractor,
     naf: torch.nn.Module,
     variants: Sequence[FeatureVariant],
@@ -1724,12 +1838,14 @@ def _run_claimed_job(
 ) -> None:
     if job.payload.get("config_sha256") != contract.config_sha256:
         raise ValueError("feature job config hash mismatch")
+    if not variants:
+        raise ValueError("feature job has no manifest variants")
     if job.payload.get("backbone") != variants[0].backbone:
         raise ValueError("feature job backbone mismatch")
     if job.payload.get("feature_track") != variants[0].feature_track:
         raise ValueError("feature job track mismatch")
     job_type = job.payload.get("job_type")
-    if job_type not in {"feature", "stress", "geometry_calibration"}:
+    if job_type not in {"feature", "stress", "geometry_calibration", "geometry_calibration_feature"}:
         raise ValueError(f"unexpected feature job type: {job_type}")
     state_id = job.payload.get("state_id")
     if not isinstance(state_id, str) or state_id not in states:
@@ -1751,15 +1867,18 @@ def _run_claimed_job(
         "feature": "controlled",
         "stress": "stress",
         "geometry_calibration": "geometry_calibration",
+        "geometry_calibration_feature": "geometry_calibration",
     }[str(job_type)]
     if job.payload.get("analysis_track") != expected_analysis:
         raise ValueError("feature job analysis-track mismatch")
     expected_track = "stress" if job_type == "stress" else "controlled"
     if state.track != expected_track:
         raise ValueError("feature job type does not match the state track")
-    if job_type == "geometry_calibration" and state.corruption != "clean":
+    if job_type in {"geometry_calibration", "geometry_calibration_feature"} and state.corruption != "clean":
         raise ValueError("geometry calibration jobs require a clean state")
-    clean_state = _clean_state_for_shoe(states, state.shoe_id)
+    if job.payload.get("quartet_id", state.quartet_id) != state.quartet_id:
+        raise ValueError("feature job quartet identity mismatch")
+    clean_state = _clean_state_for_shoe(states, state.shoe_id, state.quartet_id)
     pairs = tuple(
         row for row in all_pairs if row.get("image_state_id") == state.state_id
     )
@@ -1772,6 +1891,7 @@ def _run_claimed_job(
         changed_view = _condition_columns(pair)["changed_view"]
         if (
             pair.get("shoe_id") != state.shoe_id
+            or pair.get("quartet_id", state.quartet_id) != state.quartet_id
             or pair.get("track") != state.track
             or changed_view != expected_changed_view
             or (
@@ -1781,17 +1901,23 @@ def _run_claimed_job(
             )
         ):
             raise ValueError("pair condition does not match its image state")
+        if (
+            pair.get("first_view") not in state.view_ids
+            or pair.get("second_view") not in state.view_ids
+        ):
+            raise ValueError("pair condition is outside its current quartet")
+    selected_variants = _job_variants(job, variants)
     pca_staging, pca_destination, diagnostic_staging, diagnostic_destination = (
-        _stage_job_directories(contract, job, variants[0].feature_track)
+        _stage_job_directories(contract, job, selected_variants[0].feature_track)
     )
     try:
-        if job_type == "geometry_calibration":
+        if job_type in {"geometry_calibration", "geometry_calibration_feature"}:
             rows = _calibration_rows(
                 contract,
                 job,
                 extractor,
                 naf,
-                variants,
+                selected_variants,
                 clean_state,
                 pairs,
                 device,
@@ -1806,7 +1932,7 @@ def _run_claimed_job(
                 basis,
                 extractor,
                 naf,
-                variants,
+                selected_variants,
                 state,
                 clean_state,
                 pairs,
@@ -1821,9 +1947,13 @@ def _run_claimed_job(
             job,
             _metric_frame(rows),
             _part_path(contract, job),
-            (
-                (pca_staging, pca_destination),
-                (diagnostic_staging, diagnostic_destination),
+            tuple(
+                pair
+                for pair in (
+                    (pca_staging, pca_destination),
+                    (diagnostic_staging, diagnostic_destination),
+                )
+                if pair[1] is not None
             ),
         )
     finally:
@@ -1837,8 +1967,10 @@ def run_feature_worker(
     run_root: str | Path,
     backbone: str,
     device: str,
+    *,
+    job_ids: Sequence[str] | None = None,
 ) -> WorkerSummary:
-    """Claim one backbone's feature jobs while retaining no raw feature artifact."""
+    """Run matching jobs, or only the explicitly named pending feature jobs."""
 
     root = Path(run_root).expanduser().resolve()
     contract = _load_run_contract(root, backbone)
@@ -1854,12 +1986,10 @@ def run_feature_worker(
     naf = load_naf_upsampler(device=torch_device)
     naf = naf.to(torch_device).eval()
     extractor = MultiScaleFeatureExtractor(backbone_model)
-    basis = _fit_or_load_pca(
-        contract,
-        backbone,
-        extractor,
-        variants,
-        torch_device,
+    basis = (
+        None
+        if contract.visualization_policy == "posthoc_audit_only"
+        else _fit_or_load_pca(contract, backbone, extractor, variants, torch_device)
     )
     states = _load_state_index(root)
     pairs = _pair_rows(root)
@@ -1867,51 +1997,59 @@ def run_feature_worker(
 
     completed = 0
     failed = 0
-    for feature_track, track_variants in tracks.items():
-        clean_cache = _CleanFeatureCache()
+    clean_cache = _CleanFeatureCache()
+
+    def execute(job: ClaimedJob, job_variants: Sequence[FeatureVariant]) -> None:
+        nonlocal completed, failed
         try:
-            while True:
-                job = registry.claim_next(
-                    worker_id=f"feature:{backbone}",
-                    phase="feature",
-                    filters={
-                        "backbone": backbone,
-                        "feature_track": feature_track,
-                    },
-                )
+            _run_claimed_job(
+                contract, registry, job, basis, extractor, naf, job_variants,
+                states, pairs, qualities, torch_device, clean_cache,
+            )
+            completed += 1
+        except Exception as error:
+            trace = traceback.format_exc()
+            retryable = _is_transient(error)
+            error.__traceback__ = None
+            if isinstance(error, torch.cuda.OutOfMemoryError):
+                clean_cache.release()
+            gc.collect()
+            if isinstance(error, torch.cuda.OutOfMemoryError):
+                torch.cuda.empty_cache()
+            registry.fail(job.job_id, trace, retryable=retryable)
+            if not retryable:
+                raise
+            if job.attempts >= 3:
+                failed += 1
+
+    try:
+        if job_ids is not None:
+            requested_ids = tuple(dict.fromkeys(job_ids))
+            if any(not isinstance(job_id, str) or not job_id for job_id in requested_ids):
+                raise ValueError("job_ids must contain non-empty strings")
+            for job_id in requested_ids:
+                job = registry.claim_exact(f"feature:{backbone}", "feature", job_id)
                 if job is None:
-                    break
-                try:
-                    _run_claimed_job(
-                        contract,
-                        registry,
-                        job,
-                        basis,
-                        extractor,
-                        naf,
-                        track_variants,
-                        states,
-                        pairs,
-                        qualities,
-                        torch_device,
-                        clean_cache,
+                    continue
+                if job.payload.get("backbone") != backbone:
+                    registry.fail(job.job_id, "exact job backbone mismatch", retryable=False)
+                    raise ValueError("exact job backbone mismatch")
+                track = job.payload.get("feature_track")
+                if not isinstance(track, str) or track not in tracks:
+                    registry.fail(job.job_id, "exact job feature track mismatch", retryable=False)
+                    raise ValueError("exact job feature track mismatch")
+                execute(job, tracks[track])
+        else:
+            for feature_track, track_variants in tracks.items():
+                while True:
+                    job = registry.claim_next(
+                        worker_id=f"feature:{backbone}", phase="feature",
+                        filters={"backbone": backbone, "feature_track": feature_track},
                     )
-                    completed += 1
-                except Exception as error:
-                    trace = traceback.format_exc()
-                    retryable = _is_transient(error)
-                    error.__traceback__ = None
-                    if isinstance(error, torch.cuda.OutOfMemoryError):
-                        clean_cache.release()
-                    gc.collect()
-                    if isinstance(error, torch.cuda.OutOfMemoryError):
-                        torch.cuda.empty_cache()
-                    registry.fail(job.job_id, trace, retryable=retryable)
-                    if not retryable:
-                        raise
-                    if job.attempts >= 3:
-                        failed += 1
-        finally:
-            clean_cache.release()
+                    if job is None:
+                        break
+                    execute(job, track_variants)
+    finally:
+        clean_cache.release()
     del basis, extractor, naf, backbone_model
     return WorkerSummary(completed=completed, abstained=0, failed=failed)
