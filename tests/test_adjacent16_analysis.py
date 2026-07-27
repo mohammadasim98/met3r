@@ -1126,6 +1126,50 @@ def test_atomic_publish_rolls_back_when_install_rename_fails(
     assert not list(tmp_path.glob(".reports.backup.*"))
 
 
+def test_atomic_publish_restores_sole_backup_before_a_failed_install(
+    tmp_path: Path,
+) -> None:
+    """Catch cleanup deleting the only recoverable snapshot when reports is absent."""
+
+    backup = tmp_path / ".reports.backup.recoverable"
+    backup.mkdir()
+    (backup / "old.txt").write_text("old\n", encoding="utf-8")
+    missing_staging = tmp_path / ".reports.staging.missing"
+
+    with pytest.raises(OSError):
+        adjacent16_analysis._publish_reports(tmp_path, missing_staging)
+
+    assert (
+        tmp_path / "reports" / "old.txt"
+    ).read_text(encoding="utf-8") == "old\n"
+    assert not missing_staging.exists()
+    assert not list(tmp_path.glob(".reports.backup.*"))
+
+
+def test_atomic_publish_fails_closed_on_ambiguous_backup_recovery(
+    tmp_path: Path,
+) -> None:
+    """Catch multiple recovery candidates being deleted or selected arbitrarily."""
+
+    first = tmp_path / ".reports.backup.first"
+    second = tmp_path / ".reports.backup.second"
+    first.mkdir()
+    second.mkdir()
+    (first / "old.txt").write_text("first\n", encoding="utf-8")
+    (second / "old.txt").write_text("second\n", encoding="utf-8")
+    staging = tmp_path / ".reports.staging.pending"
+    staging.mkdir()
+    (staging / "new.txt").write_text("new\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="ambiguous report recovery"):
+        adjacent16_analysis._publish_reports(tmp_path, staging)
+
+    assert not (tmp_path / "reports").exists()
+    assert (first / "old.txt").read_text(encoding="utf-8") == "first\n"
+    assert (second / "old.txt").read_text(encoding="utf-8") == "second\n"
+    assert (staging / "new.txt").read_text(encoding="utf-8") == "new\n"
+
+
 def test_atomic_publish_cleanup_failure_is_committed_and_recoverable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

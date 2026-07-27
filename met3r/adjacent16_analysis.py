@@ -2263,12 +2263,21 @@ def _write_report(
 
 
 def _publish_reports(root: Path, staging: Path) -> Path:
-    for stale in root.glob(".reports.backup.*"):
-        try:
-            shutil.rmtree(stale)
-        except OSError:
-            pass
     destination = root / "reports"
+    stale_backups = sorted(root.glob(".reports.backup.*"))
+    if destination.exists():
+        for stale in stale_backups:
+            try:
+                shutil.rmtree(stale)
+            except OSError:
+                pass
+    elif len(stale_backups) == 1:
+        os.replace(stale_backups[0], destination)
+    elif len(stale_backups) > 1:
+        raise RuntimeError(
+            "ambiguous report recovery: reports is absent and multiple "
+            "backups are present"
+        )
     backup = root / f".reports.backup.{uuid.uuid4().hex}"
     had_destination = destination.exists()
     try:
