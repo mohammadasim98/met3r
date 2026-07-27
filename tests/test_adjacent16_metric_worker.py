@@ -1,13 +1,25 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
+import pytest
+import torch
+from PIL import Image
+from torch import nn
+
+from met3r.camera_metadata import CAMERA_MODE_LABEL
+from met3r.features import NAF_REVISION
+from met3r.job_registry import JobDefinition, JobRegistry
 from met3r.upper_metric_worker import (
     _StateRecord,
     _clean_state_for_shoe,
     _load_state_index,
     _validate_adjacent_pair_contract,
+    run_feature_worker,
 )
 
 
@@ -79,3 +91,60 @@ def test_adjacent_contract_rejects_same_quartet_with_reordered_views() -> None:
         assert "view order" in str(error)
     else:
         raise AssertionError("reordered state was accepted")
+
+
+class _TinyBackbone(nn.Module):
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.adaptive_avg_pool2d(images, (2, 2))
+
+
+class _TinyNAF(nn.Module):
+    def forward(self, guide: torch.Tensor, native: torch.Tensor, output_size: tuple[int, int]) -> torch.Tensor:
+        del guide
+        return torch.nn.functional.interpolate(native, output_size, mode="bilinear", align_corners=False)
+
+
+def test_adjacent_controlled_worker_uses_clean_geometry_and_posthoc_storage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """End-to-end q3 sentinel: fixed-base scoring must not touch changed geometry or PCA."""
+
+    root = tmp_path / "run"
+    for name in ("config", "manifests", "registry", "states", "geometry/calibration", "metrics/parts", "visualizations"):
+        (root / name).mkdir(parents=True, exist_ok=True)
+    views = ("40", "41", "42", "0")
+    config = {"quartets": [{}], "stage_size": 504, "camera_label": CAMERA_MODE_LABEL, "seed": 42,
+              "metric": {"relative_depth_tolerance": .03, "min_overlap_fraction": .08, "confidence_percentile": 10.},
+              "models": {"fake": {"revision": "test"}, "naf_revision": NAF_REVISION},
+              "visualization": {"policy": "posthoc_audit_only"}}
+    raw = json.dumps(config).encode(); digest = hashlib.sha256(raw).hexdigest()
+    (root / "config/frozen_config.json").write_bytes(raw)
+    (root / "run_manifest.json").write_text(json.dumps({"config_sha256": digest}))
+    variant = {"feature_track": "track", "backbone": "fake", "input_size": 8, "feature_mode": "native", "resolution": 2}
+    (root / "manifests/feature_variants.json").write_text(json.dumps([variant]))
+    rows = []
+    for sid, changed, corruption in (("clean", None, "clean"), ("changed", "0", "jpeg")):
+        directory = root / "states" / sid; (directory / "images").mkdir(parents=True)
+        for index, view in enumerate(views): Image.new("RGB", (504, 504), (index * 20, 0, 0)).save(directory / "images" / f"{view}.png")
+        state = {"state_id": sid, "track": "controlled", "shoe_id": "shoe", "quartet_id": "q3", "view_ids": list(views), "changed_view": changed, "corruption": corruption, "severity": 0. if changed is None else .5}
+        (directory / "state.json").write_text(json.dumps({"state": state, "stage_size": 504}))
+        rows.append(state)
+    (root / "manifests/image_states.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+    pair = {"design_id": "C1", "track": "controlled", "shoe_id": "shoe", "quartet_id": "q3", "pair_id": "shoe__q3__42__0", "first_view": "42", "second_view": "0", "baseline_steps": 1, "angular_separation_deg": 7.5, "changed_view": "0", "image_state_id": "changed", "corruption": "jpeg", "severity": .5}
+    (root / "manifests/pair_conditions.jsonl").write_text(json.dumps(pair) + "\n")
+    (root / "manifests/upper_manifest.json").write_text(json.dumps({"shoes": [{"shoe_id": "shoe", "views": [{"view_id": v, "quality": {"semantic_gate": True, "preservation_gate": True, "camera_preserved": True, "outsole_preserved": True, "fit_relation": "same"}} for v in views]}]}))
+    geometry = root / "geometry/calibration/clean"; geometry.mkdir()
+    np.savez_compressed(geometry / "depth_geometry.npz", depth=np.ones((4,504,504),np.float32), mask=np.ones((4,504,504),bool), confidence=np.ones((4,504,504),np.float32), intrinsics=np.broadcast_to(np.eye(3),(4,3,3)).copy(), extrinsics=np.broadcast_to(np.eye(4),(4,4,4)).copy(), meta__view_ids=np.asarray(views), meta__camera_groups=np.asarray(("upper",)*4), meta__camera_provenance=np.asarray("fixed_precomputed_da3"))
+    (geometry / "depth_geometry.json").write_text(json.dumps({"camera_mode": CAMERA_MODE_LABEL, "camera_provenance": "fixed_precomputed_da3", "process_res": 504, "view_ids": list(views), "camera_groups": ["upper"]*4}))
+    registry = JobRegistry(root / "registry/jobs.sqlite")
+    payload = {"job_type": "feature", "state_id": "changed", "track": "controlled", "analysis_track": "controlled", "shoe_id": "shoe", "quartet_id": "q3", "state_dir": str((root / "states/changed").resolve()), "config_sha256": digest, "backbone": "fake", "feature_track": "track", "variant_keys": ["track__fake__8__native__2"], "geometry_contract": "fixed_base_only"}
+    registry.register(JobDefinition("wanted", "feature", payload)); registry.register(JobDefinition("other", "feature", payload))
+    monkeypatch.setattr("met3r.upper_metric_worker.load_feature_backbone", lambda _: _TinyBackbone())
+    monkeypatch.setattr("met3r.upper_metric_worker.load_naf_upsampler", lambda **_: _TinyNAF())
+    monkeypatch.setattr("met3r.upper_metric_worker._fit_or_load_pca", lambda *args: (_ for _ in ()).throw(AssertionError("PCA")))
+    assert run_feature_worker(root, "fake", "cpu", job_ids=["wanted"]).completed == 1
+    frame = pd.read_parquet(root / "metrics/parts/track/wanted.parquet")
+    assert frame.iloc[0][["s00", "s01"]].nunique() == 1 and frame.iloc[0][["s10", "s11"]].nunique() == 1
+    assert frame.iloc[0]["geometry_effect"] == 0 and frame.iloc[0]["interaction"] == 0
+    assert frame.iloc[0]["quartet_id"] == "q3" and frame.iloc[0]["baseline_steps"] == 1 and frame.iloc[0]["angular_separation_deg"] == 7.5
+    assert registry.validated_state("other") == "pending"
+    visual = root / "visualizations/wanted/manifest.json"; assert json.loads(visual.read_text()) == {"files": []}
+    assert not list((root / "pca").rglob("*")) if (root / "pca").exists() else True
