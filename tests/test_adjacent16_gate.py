@@ -700,6 +700,90 @@ def test_runtime_projection_uses_the_frozen_four_gpu_max_load_formula(
     assert report.projected_total_hours == pytest.approx(1.0 + 1.25 * (1792 / 3600) + 2.0)
 
 
+def test_production_runtime_fixture_persists_the_frozen_sentinel_projection(tmp_path: Path) -> None:
+    """Catch a runtime projection that samples the wrong jobs, sums GPUs, or loses provenance."""
+
+    root = tmp_path / "run"
+    config = Path("configs/adjacent16_core.json").read_bytes()
+    digest = hashlib.sha256(config).hexdigest()
+    (root / "config").mkdir(parents=True)
+    (root / "config" / "frozen_config.json").write_bytes(config)
+    (root / "run_manifest.json").write_text(json.dumps({"experiment_id": "20260727_adjacent16_core_v1", "config_sha256": digest}))
+    _paths, contract, design = _write_frozen_manifest_fixture(root)
+    registry = JobRegistry(root / "registry" / "jobs.sqlite")
+    register_adjacent16_jobs(registry, root, design, digest)
+    assert registry.counts_by_phase() == {"feature": 3472, "geometry": 32}
+
+    shoe = next(iter(contract.raw["shoes"]))
+    clean = next(state for state in design.controlled_states if state.shoe_id == shoe and state.quartet_id == "q0" and state.corruption == "clean")
+    changed = next(state for state in design.controlled_states if state.shoe_id == shoe and state.quartet_id == "q0" and state.corruption == "translation" and state.severity == .2 and state.changed_view == "1")
+    stress = next(state for state in design.stress_states if state.shoe_id == shoe and state.quartet_id == "q0")
+    backbones = tuple(dict.fromkeys(variant.backbone for variant in contract.feature_variants))
+    expected: list[str] = []
+    classes: dict[str, str] = {}
+    seconds: dict[tuple[str, str], int] = {
+        ("dino_vitb16", "clean"): 1, ("dino_vitb16", "changed"): 2, ("dino_vitb16", "stress"): 3,
+        ("dinov2_vitb14", "clean"): 4, ("dinov2_vitb14", "changed"): 5, ("dinov2_vitb14", "stress"): 6,
+        ("dinov3_vitb16", "clean"): 7, ("dinov3_vitb16", "changed"): 8, ("dinov3_vitb16", "stress"): 9,
+        ("dinov3_vitl16_pixal3d", "clean"): 10, ("dinov3_vitl16_pixal3d", "changed"): 11,
+        ("dinov3_vitl16_pixal3d", "stress"): 12, ("dinov3_vitl16_pixal3d", "calibration"): 13,
+    }
+    for backbone in backbones:
+        for name, state in (("clean", clean), ("changed", changed), ("stress", stress)):
+            job_id = f"feature__{'stress' if name == 'stress' else 'controlled'}__{state.state_id}__{backbone}__user_37_grid_track"
+            expected.append(job_id)
+            classes[job_id] = name
+    calibration = f"feature__geometry_calibration__{clean.state_id}__dinov3_vitl16_pixal3d__user_37_grid_track"
+    expected.append(calibration)
+    classes[calibration] = "calibration"
+    assert len(expected) == len(set(expected)) == 13
+    assert {name: list(classes.values()).count(name) for name in ("clean", "changed", "stress", "calibration")} == {"clean": 4, "changed": 4, "stress": 4, "calibration": 1}
+
+    directory = write_timed_sentinel_manifest(root)
+    selected = tuple(job_id for path in sorted(directory.glob("*.json")) for job_id in json.loads(path.read_text())["job_ids"])
+    assert set(selected) == set(expected)
+    initial_files = {path.name: path.read_bytes() for path in directory.iterdir()}
+    manifest_report = root / "reports" / "timed_sentinel_manifest.json"
+    initial_manifest_report = manifest_report.read_bytes()
+    (directory / "stale.json").write_text("{}")
+    assert write_timed_sentinel_manifest(root) == directory
+    assert not (directory / "stale.json").exists()
+    assert {path.name: path.read_bytes() for path in directory.iterdir()} == initial_files
+    assert manifest_report.read_bytes() == initial_manifest_report
+
+    start = "2026-01-01T00:00:00+00:00"
+    with sqlite3.connect(registry.path) as connection:
+        for job_id, name in classes.items():
+            payload = json.loads(connection.execute("SELECT payload_json FROM jobs WHERE job_id = ?", (job_id,)).fetchone()[0])
+            duration = seconds[str(payload["backbone"]), name]
+            connection.execute(
+                "UPDATE jobs SET state = 'completed', attempts = 1, started_at = ?, finished_at = ? WHERE job_id = ?",
+                (start, f"2026-01-01T00:00:{duration:02d}+00:00", job_id),
+            )
+        connection.execute(
+            "UPDATE jobs SET state = 'completed', attempts = 1, started_at = ?, finished_at = ? WHERE phase = 'geometry'",
+            (start, "2026-01-01T01:00:00+00:00"),
+        )
+
+    report = validate_timed_runtime_projection(root)
+    expected_loads = {0: 1728, 1: 4320, 2: 6912, 3: 9712}
+    assert dict(zip(contract.physical_gpus, expected_loads.values(), strict=True)) == expected_loads
+    assert report.passed is True
+    assert report.sentinel_job_ids == tuple(expected)
+    assert report.projected_geometry_hours == 1.0
+    assert report.projected_feature_hours == pytest.approx(9712 / 3600)
+    assert report.projected_total_hours == pytest.approx(1.0 + 1.25 * (9712 / 3600) + 2.0)
+    assert report.projected_total_hours <= 24.0
+
+    runtime_report = root / "reports" / "runtime_projection.json"
+    persisted = json.loads(runtime_report.read_text())
+    assert all(persisted[name] for name in ("config_sha256", "registry_sha256", "timed_sentinel_manifest_sha256", "input_sha256", "output_sha256"))
+    assert persisted["sampled_class_seconds"] == {f"{backbone}/{name}": seconds[backbone, name] for backbone, name in sorted(seconds)}
+    first_bytes = runtime_report.read_bytes()
+    assert validate_timed_runtime_projection(root) == report
+    assert runtime_report.read_bytes() == first_bytes
+
+
 def test_final_gate_reports_missing_inputs_as_failed_evidence(tmp_path: Path) -> None:
     """Catch a final gate that turns absent analysis artifacts into zero evidence."""
 

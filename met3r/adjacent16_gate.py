@@ -174,6 +174,24 @@ def _tree_hash(root: Path, paths: Sequence[Path]) -> str:
     return digest.hexdigest()
 
 
+def _logical_registry_sha256(rows: Sequence[_RegistryRow]) -> str:
+    """Hash registry evidence independently of SQLite page layout."""
+
+    logical = [
+        {
+            "job_id": row.job_id,
+            "phase": row.phase,
+            "state": row.state,
+            "payload_hash": row.payload_hash,
+            "started_at": row.started_at,
+            "finished_at": row.finished_at,
+            "output_manifest": row.output_manifest,
+        }
+        for row in rows
+    ]
+    return hashlib.sha256(json.dumps(logical, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
 def _load_contract(root: Path) -> tuple[Adjacent16Contract, str]:
     config_path = root / "config" / "frozen_config.json"
     content = config_path.read_bytes()
@@ -657,12 +675,28 @@ def write_timed_sentinel_manifest(run_root: str | Path) -> Path:
     finally:
         if staging.exists():
             shutil.rmtree(staging)
-    _atomic_json({
+    manifest_paths = tuple(sorted(destination.glob("*.json")))
+    manifest_sha256 = _tree_hash(root, manifest_paths)
+    registry_sha256 = _logical_registry_sha256(_registry_rows(root))
+    image_states = root / "manifests" / "image_states.jsonl"
+    input_sha256 = hashlib.sha256(json.dumps({
         "config_sha256": config_sha256,
-        "registry_sha256": sha256_file(root / "registry" / "jobs.sqlite"),
+        "registry_sha256": registry_sha256,
+        "image_states_sha256": sha256_file(image_states) if image_states.is_file() else None,
+        "sentinel_manifest_sha256": manifest_sha256,
+    }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    report_payload = {
+        "config_sha256": config_sha256,
+        "registry_sha256": registry_sha256,
         "sentinel_job_ids": [row.job_id for row in selected],
         "files": hashes,
-    }, root / "reports" / "timed_sentinel_manifest.json")
+        "input_sha256": input_sha256,
+        "output_sha256": manifest_sha256,
+    }
+    report_path = root / "reports" / "timed_sentinel_manifest.json"
+    _atomic_json(report_payload, report_path)
+    if json.loads(report_path.read_text(encoding="utf-8")) != report_payload:
+        raise RuntimeError("timed sentinel manifest report readback differs from persisted decision")
     return destination
 
 
@@ -728,7 +762,61 @@ def validate_timed_runtime_projection(run_root: str | Path) -> RuntimeProjection
         fixed_finalize_hours=fixed_hours, projected_total_hours=total_hours,
         failed_checks=tuple(sorted(failures)),
     )
-    _atomic_json(_json_safe({**asdict(report), "sampled_class_seconds": {f"{backbone}/{kind}": seconds for (backbone, kind), seconds in sorted(class_seconds.items())}}), root / "reports" / "timed_runtime_projection.json")
+    decision = _json_safe({
+        **asdict(report),
+        "sampled_class_seconds": {
+            f"{backbone}/{kind}": seconds
+            for (backbone, kind), seconds in sorted(class_seconds.items())
+        },
+    })
+    provenance: dict[str, object] = {
+        "config_sha256": None,
+        "registry_sha256": None,
+        "timed_sentinel_manifest_sha256": None,
+        "input_sha256": None,
+        "output_sha256": None,
+    }
+    try:
+        config_path = root / "config" / "frozen_config.json"
+        rows = _registry_rows(root)
+        sentinel_report = root / "reports" / "timed_sentinel_manifest.json"
+        if not sentinel_report.is_file():
+            write_timed_sentinel_manifest(root)
+        provenance["config_sha256"] = sha256_file(config_path)
+        provenance["registry_sha256"] = _logical_registry_sha256(rows)
+        provenance["timed_sentinel_manifest_sha256"] = sha256_file(sentinel_report)
+        provenance["input_sha256"] = hashlib.sha256(json.dumps({
+            "config_sha256": provenance["config_sha256"],
+            "registry_sha256": provenance["registry_sha256"],
+            "timed_sentinel_manifest_sha256": provenance["timed_sentinel_manifest_sha256"],
+            "image_states_sha256": (
+                sha256_file(root / "manifests" / "image_states.jsonl")
+                if (root / "manifests" / "image_states.jsonl").is_file() else None
+            ),
+        }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        provenance["output_sha256"] = hashlib.sha256(
+            json.dumps(decision, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    except (OSError, ValueError, TypeError, json.JSONDecodeError, sqlite3.Error):
+        failures.add("runtime_report_provenance")
+        report = RuntimeProjectionReport(**{
+            **asdict(report), "passed": False, "failed_checks": tuple(sorted(failures)),
+        })
+        decision = _json_safe({
+            **asdict(report),
+            "sampled_class_seconds": {
+                f"{backbone}/{kind}": seconds
+                for (backbone, kind), seconds in sorted(class_seconds.items())
+            },
+        })
+        provenance["output_sha256"] = hashlib.sha256(
+            json.dumps(decision, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    payload = {**decision, **provenance}
+    destination = root / "reports" / "runtime_projection.json"
+    _atomic_json(payload, destination)
+    if json.loads(destination.read_text(encoding="utf-8")) != payload:
+        raise RuntimeError("runtime projection report readback differs from persisted decision")
     return report
 
 
