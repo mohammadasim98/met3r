@@ -784,6 +784,66 @@ def test_production_runtime_fixture_persists_the_frozen_sentinel_projection(tmp_
     assert runtime_report.read_bytes() == first_bytes
 
 
+def _runtime_failure_fixture(tmp_path: Path, *, l_changed_seconds: float = 2.0) -> tuple[Path, JobRegistry, tuple[str, ...]]:
+    root = tmp_path / "run"
+    config = Path("configs/adjacent16_core.json").read_bytes()
+    digest = hashlib.sha256(config).hexdigest()
+    (root / "config").mkdir(parents=True)
+    (root / "config" / "frozen_config.json").write_bytes(config)
+    (root / "run_manifest.json").write_text(json.dumps({"experiment_id": "20260727_adjacent16_core_v1", "config_sha256": digest}))
+    _paths, _contract, design = _write_frozen_manifest_fixture(root)
+    registry = JobRegistry(root / "registry" / "jobs.sqlite")
+    register_adjacent16_jobs(registry, root, design, digest)
+    ids = tuple(job_id for path in sorted(write_timed_sentinel_manifest(root).glob("*.json")) for job_id in json.loads(path.read_text())["job_ids"])
+    start = "2026-01-01T00:00:00+00:00"
+    with sqlite3.connect(registry.path) as connection:
+        for job_id in ids:
+            payload = json.loads(connection.execute("SELECT payload_json FROM jobs WHERE job_id = ?", (job_id,)).fetchone()[0])
+            duration = l_changed_seconds if payload["backbone"] == "dinov3_vitl16_pixal3d" and "translation__0.200000" in payload["state_id"] else 1.0
+            minutes, seconds = divmod(duration, 60.0)
+            connection.execute("UPDATE jobs SET state='completed', attempts=1, started_at=?, finished_at=? WHERE job_id=?", (start, f"2026-01-01T00:{int(minutes):02}:{seconds:06.3f}+00:00", job_id))
+        connection.execute("UPDATE jobs SET state='completed', attempts=1, started_at=?, finished_at=? WHERE phase='geometry'", (start, "2026-01-01T01:00:00+00:00"))
+    return root, registry, ids
+
+
+@pytest.mark.parametrize(("seconds", "passed"), ((72.6, True), (72.7, False)))
+def test_runtime_projection_obeys_the_exact_24_hour_boundary(tmp_path: Path, seconds: float, passed: bool) -> None:
+    root, _registry, _ids = _runtime_failure_fixture(tmp_path, l_changed_seconds=seconds)
+    report = validate_timed_runtime_projection(root)
+    assert report.projected_total_hours == pytest.approx(23.99 if passed else 24.0188888889)
+    assert report.passed is passed
+    assert report.failed_checks == (() if passed else ("projected_total_hours",))
+    path = root / "reports" / "runtime_projection.json"
+    assert json.loads(path.read_text())["passed"] is passed
+
+
+@pytest.mark.parametrize("mutation", ("zero", "negative", "naive"))
+def test_runtime_projection_checks_every_geometry_duration(tmp_path: Path, mutation: str) -> None:
+    root, registry, _ids = _runtime_failure_fixture(tmp_path)
+    with sqlite3.connect(registry.path) as connection:
+        job_id = connection.execute("SELECT job_id FROM jobs WHERE phase='geometry' ORDER BY job_id LIMIT 1").fetchone()[0]
+        finish = {"zero": "2026-01-01T00:00:00+00:00", "negative": "2025-12-31T23:59:59+00:00", "naive": "2026-01-01T00:00:01"}[mutation]
+        connection.execute("UPDATE jobs SET finished_at=? WHERE job_id=?", (finish, job_id))
+    report = validate_timed_runtime_projection(root)
+    assert report.passed is False
+    assert report.failed_checks == ("runtime_validation",)
+
+
+@pytest.mark.parametrize("mutation", ("failed", "pending", "zero", "negative", "naive"))
+def test_runtime_projection_rejects_bad_sentinel_evidence(tmp_path: Path, mutation: str) -> None:
+    root, registry, ids = _runtime_failure_fixture(tmp_path)
+    with sqlite3.connect(registry.path) as connection:
+        job_id = ids[1]
+        if mutation in {"failed", "pending"}:
+            connection.execute("UPDATE jobs SET state=? WHERE job_id=?", (mutation, job_id))
+        else:
+            finish = {"zero": "2026-01-01T00:00:00+00:00", "negative": "2025-12-31T23:59:59+00:00", "naive": "2026-01-01T00:00:01"}[mutation]
+            connection.execute("UPDATE jobs SET finished_at=? WHERE job_id=?", (finish, job_id))
+    report = validate_timed_runtime_projection(root)
+    assert report.passed is False
+    assert ("sentinel_job_state" if mutation in {"failed", "pending"} else "runtime_validation") in report.failed_checks
+
+
 def test_final_gate_reports_missing_inputs_as_failed_evidence(tmp_path: Path) -> None:
     """Catch a final gate that turns absent analysis artifacts into zero evidence."""
 
