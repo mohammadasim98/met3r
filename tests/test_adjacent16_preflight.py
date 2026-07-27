@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 from pathlib import Path
+import hashlib
+import json
+import sqlite3
 
+import numpy as np
+import pandas as pd
 import pytest
 import torch
 
 import met3r.adjacent16_gate as adjacent16_gate
 from met3r.adjacent16_gate import validate_adjacent16_geometry_preflight
+from met3r.job_registry import JobDefinition, JobRegistry, sha256_file
 from met3r.known_camera import KnownCameraConfig, score_symmetric_geometry_support
 
 
@@ -119,3 +125,69 @@ def test_preflight_pair_uses_confidence_percentile_and_the_eight_percent_pass_bo
     assert scored["minimum_directional_overlap"] == pytest.approx(2 / 14)
     assert scored["symmetric_pass"] is True
     assert scored["minimum_directional_overlap"] < 0.20
+
+
+def _canonical_preflight_run(tmp_path: Path) -> Path:
+    root = tmp_path / "run"
+    config = Path("configs/adjacent16_core.json").read_bytes()
+    (root / "config").mkdir(parents=True)
+    (root / "config/frozen_config.json").write_bytes(config)
+    config_hash = hashlib.sha256(config).hexdigest()
+    (root / "run_manifest.json").write_text(json.dumps({"experiment_id": "20260727_adjacent16_core_v1", "config_sha256": config_hash}))
+    raw = json.loads(config)
+    registry = JobRegistry(root / "registry/jobs.sqlite")
+    source = root / "source.rgb"
+    source.write_bytes(b"canonical-source")
+    source_hash = sha256_file(source)
+    conditions: list[dict[str, object]] = []
+    views_by_q = {item["quartet_id"]: item["view_ids"] for item in raw["quartets"]}
+    mask = np.ones((4, 504, 504), dtype=bool)
+    depth = np.ones((4, 504, 504), dtype=np.float32)
+    confidence = np.broadcast_to(np.linspace(0.0, 1.0, 504, dtype=np.float32), (4, 504, 504)).copy()
+    for shoe in raw["shoes"]:
+        for quartet, views in views_by_q.items():
+            camera_dir = root / "cameras" / shoe / quartet
+            camera_dir.mkdir(parents=True)
+            extrinsics = np.broadcast_to(np.eye(4), (4, 4, 4)).copy()
+            intrinsics = np.broadcast_to(np.array([[504.0, 0.0, 251.5], [0.0, 504.0, 251.5], [0.0, 0.0, 1.0]]), (4, 3, 3)).copy()
+            np.savez_compressed(camera_dir / "cameras.npz", extrinsics=extrinsics, intrinsics=intrinsics, mask=mask, view_ids=np.asarray(views), camera_groups=np.asarray(["upper"] * 4))
+            (camera_dir / "images.json").write_text(json.dumps([str(source)] * 4))
+            (camera_dir / "metadata.json").write_text(json.dumps({"camera_mode": "fixed/precomputed DA3 cameras (not calibrated GT)", "camera_provenance": "dense_camera_outputs", "camera_groups": ["upper"] * 4, "view_ids": views, "source_hashes": {view: {"rgb": source_hash, "mask": "0" * 64} for view in views}}))
+            state = f"controlled__{shoe}__{quartet}__clean"
+            output = root / "geometry" / "calibration" / state
+            output.mkdir(parents=True)
+            np.savez_compressed(output / "depth_geometry.npz", depth=depth, confidence=confidence, mask=mask, extrinsics=extrinsics, intrinsics=intrinsics, meta__artifact_type=np.asarray("fixed_camera_depth"), meta__camera_provenance=np.asarray("fixed_precomputed_da3"), meta__view_ids=np.asarray(views), meta__camera_groups=np.asarray(["upper"] * 4))
+            payload = {"job_type": "geometry_calibration", "shoe_id": shoe, "quartet_id": quartet, "config_sha256": config_hash, "camera_path": str((camera_dir / "cameras.npz").resolve()), "output_dir": str(output.resolve())}
+            job_id = f"geometry__geometry_calibration__{state}"
+            registry.register(JobDefinition(job_id, "geometry", payload))
+            with sqlite3.connect(registry.path) as connection:
+                connection.execute("UPDATE jobs SET state='completed', output_manifest_json=? WHERE job_id=?", (json.dumps({"files": [{"path": str((output / "depth_geometry.npz").resolve()), "sha256": sha256_file(output / "depth_geometry.npz")}]}), job_id))
+            for first_index, first in enumerate(views):
+                for second in views[first_index + 1:]:
+                    conditions.append({"track": "controlled", "shoe_id": shoe, "quartet_id": quartet, "pair_id": f"{shoe}__{quartet}__{first}__{second}", "first_view": first, "second_view": second, "baseline_steps": 1, "angular_separation_deg": 7.5, "changed_view": None, "corruption": "clean", "severity": 0.0})
+    (root / "manifests").mkdir(parents=True)
+    (root / "manifests/pair_conditions.jsonl").write_text("".join(json.dumps(row) + "\n" for row in conditions))
+    return root
+
+
+def test_geometry_preflight_accepts_canonical_task6_task7_fixture_and_is_idempotent(tmp_path: Path) -> None:
+    """Catch rejecting the canonical camera mask or non-atomic preflight persistence."""
+
+    root = _canonical_preflight_run(tmp_path)
+    first = validate_adjacent16_geometry_preflight(root)
+    table = pd.read_parquet(root / "reports/geometry_preflight.parquet")
+    first_bytes = (root / "reports/geometry_preflight.parquet").read_bytes()
+    report_bytes = (root / "reports/geometry_preflight.json").read_bytes()
+
+    assert first.passed is True
+    assert first.pair_units == 96
+    assert first.symmetric_pass_rate == 1.0
+    assert first.median_min_directional_overlap >= 0.20
+    assert all(rate == 1.0 for rate in first.per_shoe_pass_rate.values())
+    assert tuple(table.columns) == adjacent16_gate._PREFLIGHT_COLUMNS
+    assert not table.duplicated(["shoe_id", "quartet_id", "pair_id"]).any()
+
+    second = validate_adjacent16_geometry_preflight(root)
+    assert second == first
+    assert (root / "reports/geometry_preflight.parquet").read_bytes() == first_bytes
+    assert (root / "reports/geometry_preflight.json").read_bytes() == report_bytes
