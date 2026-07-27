@@ -700,7 +700,7 @@ def test_timed_sentinel_manifest_restores_old_tree_when_staging_rename_fails(tmp
     assert not list(directory.parent.glob(".timed_sentinel.staging.*"))
 
 
-def test_runtime_projection_rejects_pending_or_untimed_sentinel_jobs(
+def test_runtime_projection_rejects_reduced_registry_before_sentinel_timing(
     tmp_path: Path,
 ) -> None:
     """Catch projection code that estimates from pending or zero-duration work."""
@@ -712,10 +712,10 @@ def test_runtime_projection_rejects_pending_or_untimed_sentinel_jobs(
 
     assert report.passed is False
     assert report.sentinel_job_ids == ()
-    assert "sentinel_job_state" in report.failed_checks
+    assert report.failed_checks == ("runtime_graph",)
 
 
-def test_runtime_projection_uses_the_frozen_four_gpu_max_load_formula(
+def test_runtime_projection_rejects_reduced_registry_even_with_valid_timing(
     tmp_path: Path,
 ) -> None:
     """Catch summing backbone loads instead of taking the assigned-GPU maximum."""
@@ -745,10 +745,8 @@ def test_runtime_projection_uses_the_frozen_four_gpu_max_load_formula(
 
     report = validate_timed_runtime_projection(tmp_path)
 
-    assert report.passed is True
-    assert report.projected_geometry_hours == 1.0
-    assert report.projected_feature_hours == pytest.approx(1792 / 3600)
-    assert report.projected_total_hours == pytest.approx(1.0 + 1.25 * (1792 / 3600) + 2.0)
+    assert report.passed is False
+    assert report.failed_checks == ("runtime_graph",)
 
 
 def test_production_runtime_fixture_persists_the_frozen_sentinel_projection(tmp_path: Path) -> None:
