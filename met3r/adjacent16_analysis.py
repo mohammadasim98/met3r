@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import io
+import json
 import os
 import shutil
 import tempfile
@@ -51,6 +54,26 @@ CONTROLLED_SEVERITIES = {
     "thin_plate_warp": (0.25, 0.5, 0.75, 1.0),
     "jpeg": (0.25, 0.5, 0.75, 1.0),
     "identity_swap": (1.0,),
+}
+FROZEN_SHOE_IDS = frozenset(
+    {
+        "air_huarache_run_ultra_111449",
+        "air_max_90_nrg_dc6083_500",
+        "air_max_90_surplus_cq7743_300",
+        "air_tuned_max_cv6984_001",
+    }
+)
+FROZEN_BASELINE_STEPS = (1, 2, 3)
+FROZEN_BASELINE_DOMAIN: tuple[int | str, ...] = (
+    "all",
+    *FROZEN_BASELINE_STEPS,
+)
+BASELINE_KEY_COLUMNS = ("shoe_id", "quartet_id", "pair_id")
+GEOMETRY_MAGNITUDES = {
+    "rotation": (0.25, 0.5, 1.0, 2.0, 5.0),
+    "relative_translation": (0.0025, 0.005, 0.01, 0.02),
+    "depth_scale": (1.01, 1.02, 1.05, 1.1),
+    "relative_depth_noise": (0.005, 0.01, 0.02, 0.05),
 }
 _ENDPOINTS = {
     "identity_swap": ("clean_corrupt_auroc",),
@@ -107,10 +130,59 @@ class Adjacent16AnalysisOutputs:
     report_path: Path
 
 
+@dataclass(frozen=True)
+class _PreflightEvidence:
+    frame: pd.DataFrame
+    parquet_bytes: bytes
+    decision_bytes: bytes
+    parquet_sha256: str
+    decision_sha256: str
+
+
 def _require(frame: pd.DataFrame, columns: Iterable[str], label: str) -> None:
     missing = set(columns) - set(frame.columns)
     if missing:
         raise ValueError(f"{label} is missing columns: {sorted(missing)}")
+
+
+def _require_frozen_shoe_cohort(frame: pd.DataFrame, label: str) -> None:
+    _require(frame, ("shoe_id",), label)
+    observed = frozenset(frame["shoe_id"].dropna().astype(str))
+    if observed != FROZEN_SHOE_IDS:
+        raise ValueError(
+            f"{label} must contain the frozen four-shoe cohort; "
+            f"observed={sorted(observed)!r}"
+        )
+
+
+def _validated_baseline_steps(
+    frame: pd.DataFrame,
+    label: str,
+) -> None:
+    _require(frame, (*BASELINE_KEY_COLUMNS, "baseline_steps"), label)
+    numeric = pd.to_numeric(frame["baseline_steps"], errors="coerce")
+    invalid = (
+        ~np.isfinite(numeric)
+        | (numeric != np.floor(numeric))
+        | ~numeric.isin(FROZEN_BASELINE_STEPS)
+    )
+    if invalid.any():
+        raise ValueError(
+            f"{label} has baseline_steps outside the frozen 1/2/3 domain"
+        )
+    working = frame.loc[:, list(BASELINE_KEY_COLUMNS)].copy()
+    working["_baseline_steps"] = numeric.astype(int)
+    step_counts = working.groupby(
+        list(BASELINE_KEY_COLUMNS),
+        dropna=False,
+        sort=False,
+    )["_baseline_steps"].nunique()
+    inconsistent = step_counts[step_counts > 1]
+    if not inconsistent.empty:
+        raise ValueError(
+            f"{label} has inconsistent baseline_steps for physical key "
+            f"{inconsistent.index[0]!r}"
+        )
 
 
 def _safe_mean(values: Iterable[object]) -> float:
@@ -229,7 +301,7 @@ def _complete_series_coverage(
     for key in common:
         series_severities.setdefault(key[:-1], set()).add(float(key[-1]))
     if not series_severities:
-        return float("nan")
+        return 0.0
     return float(
         np.mean(
             [
@@ -412,17 +484,15 @@ def _controlled_support_groups(
         dict[str, float | int],
     ]
 ]:
-    supports = [_variant_support(variant)[1] for variant in variants.values()]
     selected = pd.concat(variants.values(), ignore_index=True, sort=False)
+    _require_frozen_shoe_cohort(selected, "controlled comparison")
+    _validated_baseline_steps(selected, "controlled comparison")
+    supports = [_variant_support(variant)[1] for variant in variants.values()]
     step_by_key = {
         _support_key(row): int(row["baseline_steps"])
         for _, row in selected[selected["corruption"] != "clean"].iterrows()
     }
-    steps: tuple[int | str, ...] = (
-        "all",
-        *sorted(set(step_by_key.values())),
-    )
-    for steps_value in steps:
+    for steps_value in FROZEN_BASELINE_DOMAIN:
         for corruption, endpoints in _ENDPOINTS.items():
             common, union = _support_slice(
                 supports,
@@ -441,7 +511,7 @@ def _controlled_support_groups(
                     "support_retention": (
                         len(common) / len(union)
                         if union
-                        else float("nan")
+                        else 0.0
                     ),
                     "complete_series_coverage": _complete_series_coverage(
                         common,
@@ -769,6 +839,8 @@ def summarize_geometry_low_high(
         ),
         "geometry calibration frame",
     )
+    _require_frozen_shoe_cohort(frame, "geometry calibration frame")
+    _validated_baseline_steps(frame, "geometry calibration frame")
     variants = {
         "L37-bilinear": _geometry_variant(
             frame,
@@ -796,24 +868,39 @@ def summarize_geometry_low_high(
         )
     union_all = set().union(*support_sets)
     common_all = set.intersection(*support_sets)
+    raw_union = {
+        _tuple_key(row, GEOMETRY_SUPPORT_COLUMNS)
+        for variant in variants.values()
+        for _, row in variant.iterrows()
+    }
     step_by_key = {
         _tuple_key(row, GEOMETRY_SUPPORT_COLUMNS): int(
             row["baseline_steps"]
         )
         for _, row in frame.iterrows()
     }
-    steps: tuple[int | str, ...] = (
-        "all",
-        *sorted(set(step_by_key.values())),
-    )
-    kinds_and_magnitudes = sorted(
-        {
-            (str(key[-2]), float(key[-1]))
-            for key in union_all
-        }
-    )
+    observed_kinds = {str(key[-2]) for key in raw_union}
+    unknown_kinds = observed_kinds - set(GEOMETRY_MAGNITUDES)
+    if unknown_kinds:
+        raise ValueError(
+            "geometry calibration frame has unknown perturbation kinds: "
+            f"{sorted(unknown_kinds)!r}"
+        )
+    kinds_and_magnitudes = [
+        (kind, magnitude)
+        for kind in sorted(observed_kinds)
+        for magnitude in GEOMETRY_MAGNITUDES[kind]
+    ]
     records: list[dict[str, object]] = []
-    for steps_value in steps:
+    for steps_value in FROZEN_BASELINE_DOMAIN:
+        series_universe = {
+            key[:-1]
+            for key in raw_union
+            if (
+                steps_value == "all"
+                or step_by_key[key] == steps_value
+            )
+        }
         for kind, magnitude in kinds_and_magnitudes:
             def selected(key: tuple[object, ...]) -> bool:
                 return (
@@ -827,7 +914,28 @@ def summarize_geometry_low_high(
 
             union = {key for key in union_all if selected(key)}
             common = {key for key in common_all if selected(key)}
-            retention = len(common) / len(union) if union else float("nan")
+            retention = len(common) / len(union) if union else 0.0
+            kind_series = {
+                series
+                for series in series_universe
+                if str(series[-1]) == kind
+            }
+            complete_series = 0
+            expected_magnitudes = set(GEOMETRY_MAGNITUDES[kind])
+            for series in kind_series:
+                observed_common = {
+                    float(key[-1])
+                    for key in common_all
+                    if key[:-1] == series
+                }
+                complete_series += int(
+                    expected_magnitudes <= observed_common
+                )
+            completeness = (
+                complete_series / len(kind_series)
+                if kind_series
+                else 0.0
+            )
             shoes_by_variant: dict[str, pd.DataFrame] = {}
             for label, variant in variants.items():
                 selected_rows = variant.copy()
@@ -886,7 +994,7 @@ def summarize_geometry_low_high(
                         "n_common_support": len(common),
                         "n_union_support": len(union),
                         "support_retention": retention,
-                        "complete_series_coverage": retention,
+                        "complete_series_coverage": completeness,
                     }
                 )
     return pd.DataFrame(records)
@@ -932,14 +1040,15 @@ def _fixed_feature_effect(frame: pd.DataFrame) -> pd.Series:
     return derived
 
 
-def summarize_stress_reliability(
+def _paired_stress_rows(
     frame: pd.DataFrame,
-    *,
-    bootstrap_repeats: int = 10_000,
-    seed: int = 42,
-) -> pd.DataFrame:
-    """Summarize paired low/high real-deformation validity and disagreement."""
-
+) -> tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    set[tuple[object, ...]],
+    set[tuple[object, ...]],
+]:
     _require(
         frame,
         (
@@ -958,6 +1067,8 @@ def summarize_stress_reliability(
         ),
         "stress metric frame",
     )
+    _require_frozen_shoe_cohort(frame, "stress metric frame")
+    _validated_baseline_steps(frame, "stress metric frame")
     low = _dinov3l_variant(
         frame,
         feature_mode="bilinear",
@@ -994,8 +1105,24 @@ def summarize_stress_reliability(
         suffixes=("_low", "_high"),
         validate="one_to_one",
     )
-    low_keys = set(low["_key"])
-    high_keys = set(high["_key"])
+    return (
+        low,
+        high,
+        paired,
+        set(low["_key"]),
+        set(high["_key"]),
+    )
+
+
+def summarize_stress_reliability(
+    frame: pd.DataFrame,
+    *,
+    bootstrap_repeats: int = 10_000,
+    seed: int = 42,
+) -> pd.DataFrame:
+    """Summarize paired low/high real-deformation validity and disagreement."""
+
+    low, high, paired, low_keys, high_keys = _paired_stress_rows(frame)
     union = low_keys | high_keys
     common = low_keys & high_keys
     paired["low_symmetric_pass_rate"] = (
@@ -1050,18 +1177,8 @@ def summarize_stress_reliability(
         "both_abstained_rate",
         "finite_low_high_disagreement",
     )
-    steps: tuple[int | str, ...] = (
-        "all",
-        *sorted(
-            int(value)
-            for value in pd.to_numeric(
-                paired["baseline_steps_low"],
-                errors="raise",
-            ).unique()
-        ),
-    )
     records: list[dict[str, object]] = []
-    for steps_value in steps:
+    for steps_value in FROZEN_BASELINE_DOMAIN:
         selected = (
             paired
             if steps_value == "all"
@@ -1102,7 +1219,18 @@ def summarize_stress_reliability(
         retention = (
             len(step_common) / len(step_union)
             if step_union
-            else float("nan")
+            else 0.0
+        )
+        complete_series = {
+            _tuple_key(row, STRESS_SUPPORT_COLUMNS)
+            for _, row in selected[
+                selected["_valid_low"] & selected["_valid_high"]
+            ].iterrows()
+        }
+        completeness = (
+            len(complete_series) / len(step_union)
+            if step_union
+            else 0.0
         )
         for metric in metrics:
             values = shoes[["shoe_id", metric]].rename(
@@ -1121,7 +1249,7 @@ def summarize_stress_reliability(
                     "n_common_support": len(step_common),
                     "n_union_support": len(step_union),
                     "support_retention": retention,
-                    "complete_series_coverage": retention,
+                    "complete_series_coverage": completeness,
                 }
             )
     return pd.DataFrame(records)
@@ -1146,6 +1274,8 @@ def _controlled_series_status(frame: pd.DataFrame) -> pd.DataFrame:
         ),
         "controlled metric frame",
     )
+    _require_frozen_shoe_cohort(frame, "controlled metric frame")
+    _validated_baseline_steps(frame, "controlled metric frame")
     working = frame.copy()
     working["_valid"] = _primary_valid(working)
     base_columns = [
@@ -1197,12 +1327,15 @@ def _controlled_series_status(frame: pd.DataFrame) -> pd.DataFrame:
 
 def _controlled_coverage_values(
     frame: pd.DataFrame,
+    *,
+    baseline_steps: int | str = "all",
 ) -> tuple[float, float, int]:
     status = _controlled_series_status(frame)
+    if baseline_steps != "all":
+        status = status[status["baseline_steps"] == baseline_steps]
     if status.empty:
-        return float("nan"), float("nan"), 0
+        return 0.0, 0.0, 0
     complete_series = float(status["complete"].mean())
-    shoes = sorted(status["shoe_id"].dropna().unique())
     status = status.copy()
     pair_parts = status["pair_id"].astype(str).str.split("__")
     status["_first_view"] = pair_parts.str[-2]
@@ -1219,25 +1352,34 @@ def _controlled_coverage_values(
         "corruption",
         "baseline_steps",
     ]
-    cells = (
-        status.groupby(physical_columns, dropna=False, sort=True)
-        .agg(
-            complete_shoes=(
-                "shoe_id",
-                lambda values: int(
-                    status.loc[values.index]
-                    .loc[status.loc[values.index, "complete"], "shoe_id"]
-                    .nunique()
-                ),
-            )
+    complete_shoe_sets = [
+        frozenset(
+            rows.loc[rows["complete"], "shoe_id"].dropna().astype(str)
         )
-        .reset_index()
-    )
+        for _, rows in status.groupby(
+            physical_columns,
+            dropna=False,
+            sort=True,
+        )
+    ]
     all_four = float(
-        (cells["complete_shoes"] == len(shoes)).mean()
+        np.mean(
+            [
+                shoe_ids == FROZEN_SHOE_IDS
+                for shoe_ids in complete_shoe_sets
+            ]
+        )
     )
     valid_shoes = int(
-        status.loc[status["complete"], "shoe_id"].nunique()
+        len(
+            frozenset(
+                status.loc[
+                    status["complete"],
+                    "shoe_id",
+                ].dropna().astype(str)
+            )
+            & FROZEN_SHOE_IDS
+        )
     )
     return complete_series, all_four, valid_shoes
 
@@ -1252,7 +1394,6 @@ def summarize_support_coverage(
 ) -> pd.DataFrame:
     """Summarize clean adjacent support by shoe and angular-baseline step."""
 
-    del stress  # Stress validity is published in its dedicated paired table.
     _require(
         preflight,
         (
@@ -1267,9 +1408,10 @@ def summarize_support_coverage(
         ),
         "geometry preflight frame",
     )
-    complete, _all_four, _valid_shoes = _controlled_coverage_values(
-        controlled
-    )
+    _require_frozen_shoe_cohort(preflight, "geometry preflight frame")
+    _validated_baseline_steps(preflight, "geometry preflight frame")
+    _require_frozen_shoe_cohort(stress, "stress metric frame")
+    _validated_baseline_steps(stress, "stress metric frame")
     working = preflight.copy()
     working["symmetric_coverage"] = (
         working["symmetric_pass"].fillna(False).astype(bool).astype(float)
@@ -1280,22 +1422,16 @@ def summarize_support_coverage(
         "second_to_first_overlap",
         "minimum_directional_overlap",
     )
-    steps: tuple[int | str, ...] = (
-        "all",
-        *sorted(
-            int(value)
-            for value in pd.to_numeric(
-                working["baseline_steps"],
-                errors="raise",
-            ).unique()
-        ),
-    )
     records: list[dict[str, object]] = []
-    for steps_value in steps:
+    for steps_value in FROZEN_BASELINE_DOMAIN:
         selected = (
             working
             if steps_value == "all"
             else working[working["baseline_steps"] == steps_value]
+        )
+        complete, _all_four, _valid_shoes = _controlled_coverage_values(
+            controlled,
+            baseline_steps=steps_value,
         )
         shoes = (
             selected.groupby("shoe_id", dropna=False, sort=True)[list(metrics)]
@@ -1318,7 +1454,9 @@ def summarize_support_coverage(
                     **summary,
                     "n_common_support": len(selected),
                     "n_union_support": len(selected),
-                    "support_retention": 1.0,
+                    "support_retention": (
+                        1.0 if len(selected) else 0.0
+                    ),
                     "complete_series_coverage": complete,
                 }
             )
@@ -1408,20 +1546,44 @@ def summarize_common_support(
         ("baseline_steps",),
         ("n_shoes_valid",),
     )
-    result = pd.DataFrame(records)
-    return result[result["n_union_support"] > 0].reset_index(drop=True)
+    return pd.DataFrame(records)
 
 
 def _overall_stress_pass(frame: pd.DataFrame) -> tuple[float, int]:
-    valid = _stress_valid(frame)
-    minimum_overlap = frame[
+    _low, _high, paired, _low_keys, _high_keys = _paired_stress_rows(
+        frame
+    )
+    low_pass = (
+        paired["_valid_low"]
+        & (
+            paired[
+                [
+                    "s11_first_to_second_overlap_low",
+                    "s11_second_to_first_overlap_low",
+                ]
+            ].min(axis=1)
+            >= 0.08
+        )
+    )
+    high_pass = (
+        paired["_valid_high"]
+        & (
+            paired[
+                [
+                    "s11_first_to_second_overlap_high",
+                    "s11_second_to_first_overlap_high",
+                ]
+            ].min(axis=1)
+            >= 0.08
+        )
+    )
+    working = pd.concat(
         [
-            "s11_first_to_second_overlap",
-            "s11_second_to_first_overlap",
-        ]
-    ].min(axis=1)
-    working = frame[["shoe_id"]].copy()
-    working["passed"] = (valid & (minimum_overlap >= 0.08)).astype(float)
+            paired[["shoe_id"]].assign(passed=low_pass.astype(float)),
+            paired[["shoe_id"]].assign(passed=high_pass.astype(float)),
+        ],
+        ignore_index=True,
+    )
     shoes = (
         working.groupby("shoe_id", dropna=False, sort=True)["passed"]
         .mean()
@@ -1438,6 +1600,8 @@ def summarize_analyzability(
 ) -> pd.DataFrame:
     """Evaluate frozen descriptive analyzability criteria from aggregate rows."""
 
+    _require_frozen_shoe_cohort(geometry, "geometry calibration frame")
+    _validated_baseline_steps(geometry, "geometry calibration frame")
     complete, all_four, valid_shoes = _controlled_coverage_values(controlled)
     controlled_support = common_support[
         common_support["comparison"].isin(_CONTROLLED_SUPPORT_COMPARISONS)
@@ -2099,6 +2263,11 @@ def _write_report(
 
 
 def _publish_reports(root: Path, staging: Path) -> Path:
+    for stale in root.glob(".reports.backup.*"):
+        try:
+            shutil.rmtree(stale)
+        except OSError:
+            pass
     destination = root / "reports"
     backup = root / f".reports.backup.{uuid.uuid4().hex}"
     had_destination = destination.exists()
@@ -2113,13 +2282,24 @@ def _publish_reports(root: Path, staging: Path) -> Path:
             os.replace(backup, destination)
         raise
     if backup.exists():
-        shutil.rmtree(backup)
+        try:
+            shutil.rmtree(backup)
+        except OSError:
+            # The second rename is the commit point. Cleanup is recoverable:
+            # a later publication retries any retained backup before staging.
+            pass
     return destination
 
 
 def _load_analysis_inputs(
     root: Path,
-) -> tuple[Path, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> tuple[
+    Path,
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    _PreflightEvidence,
+]:
     generation = resolve_aggregate_generation(root)
     controlled = pd.read_parquet(
         generation / "controlled_fidelity.parquet"
@@ -2131,14 +2311,34 @@ def _load_analysis_inputs(
         generation / "real_deformation_stress.parquet"
     )
     preflight_path = root / "reports" / "geometry_preflight.parquet"
-    if not preflight_path.is_file():
+    decision_path = root / "reports" / "geometry_preflight.json"
+    if not preflight_path.is_file() or not decision_path.is_file():
         raise ValueError("validated adjacent geometry preflight is required")
+    parquet_bytes = preflight_path.read_bytes()
+    decision_bytes = decision_path.read_bytes()
+    parquet_sha256 = hashlib.sha256(parquet_bytes).hexdigest()
+    try:
+        decision = json.loads(decision_bytes)
+    except json.JSONDecodeError as error:
+        raise ValueError("adjacent geometry preflight decision is invalid") from error
+    if (
+        not isinstance(decision, dict)
+        or decision.get("passed") is not True
+        or decision.get("output_sha256") != parquet_sha256
+    ):
+        raise ValueError("adjacent geometry preflight evidence is not validated")
     return (
         generation,
         controlled,
         geometry,
         stress,
-        pd.read_parquet(preflight_path),
+        _PreflightEvidence(
+            frame=pd.read_parquet(io.BytesIO(parquet_bytes)),
+            parquet_bytes=parquet_bytes,
+            decision_bytes=decision_bytes,
+            parquet_sha256=parquet_sha256,
+            decision_sha256=hashlib.sha256(decision_bytes).hexdigest(),
+        ),
     )
 
 
@@ -2210,6 +2410,7 @@ def _compute_analysis_tables(
 def _render_analysis_snapshot(
     staging: Path,
     *,
+    preflight: _PreflightEvidence,
     tables: dict[str, pd.DataFrame],
     controlled_rows: int,
     geometry_rows: int,
@@ -2218,6 +2419,12 @@ def _render_analysis_snapshot(
     seed: int,
     generation: Path,
 ) -> None:
+    (staging / "geometry_preflight.parquet").write_bytes(
+        preflight.parquet_bytes
+    )
+    (staging / "geometry_preflight.json").write_bytes(
+        preflight.decision_bytes
+    )
     tables_dir = staging / "tables"
     figures_dir = staging / "figures"
     tables_dir.mkdir(parents=True, exist_ok=True)
@@ -2242,6 +2449,8 @@ def _render_analysis_snapshot(
             for suffix in ("csv", "parquet")
         ],
         *[figures_dir / filename for filename in FIGURE_FILENAMES],
+        staging / "geometry_preflight.parquet",
+        staging / "geometry_preflight.json",
     ]
     _write_report(
         staging / "final_research_report.md",
@@ -2272,24 +2481,22 @@ def analyze_adjacent16_run(
         controlled,
         geometry_raw,
         stress_raw,
-        preflight,
+        preflight_evidence,
     ) = _load_analysis_inputs(root)
     tables = _compute_analysis_tables(
         controlled,
         geometry_raw,
         stress_raw,
-        preflight,
+        preflight_evidence.frame,
         bootstrap_repeats=bootstrap_repeats,
         seed=seed,
     )
 
     staging = Path(tempfile.mkdtemp(prefix=".reports.staging.", dir=root))
     try:
-        existing = root / "reports"
-        if existing.exists():
-            shutil.copytree(existing, staging, dirs_exist_ok=True)
         _render_analysis_snapshot(
             staging,
+            preflight=preflight_evidence,
             tables=tables,
             controlled_rows=len(controlled),
             geometry_rows=len(geometry_raw),
