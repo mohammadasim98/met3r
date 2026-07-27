@@ -13,6 +13,7 @@ from torch import nn
 
 from met3r.camera_metadata import CAMERA_MODE_LABEL
 from met3r.features import NAF_REVISION
+from met3r.features import BACKBONE_SPECS
 from met3r.job_registry import JobDefinition, JobRegistry
 from met3r.upper_metric_worker import (
     _StateRecord,
@@ -104,7 +105,8 @@ class _TinyNAF(nn.Module):
         return torch.nn.functional.interpolate(native, output_size, mode="bilinear", align_corners=False)
 
 
-def test_adjacent_controlled_worker_uses_clean_geometry_and_posthoc_storage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("backbone", ["dino_vitb16", "dinov2_vitb14", "dinov3_vitb16"])
+def test_adjacent_controlled_worker_uses_clean_geometry_and_posthoc_storage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backbone: str) -> None:
     """End-to-end q3 sentinel: fixed-base scoring must not touch changed geometry or PCA."""
 
     root = tmp_path / "run"
@@ -113,12 +115,12 @@ def test_adjacent_controlled_worker_uses_clean_geometry_and_posthoc_storage(tmp_
     views = ("40", "41", "42", "0")
     config = {"quartets": [{}], "stage_size": 504, "camera_label": CAMERA_MODE_LABEL, "seed": 42,
               "metric": {"relative_depth_tolerance": .03, "min_overlap_fraction": .08, "confidence_percentile": 10.},
-              "models": {"fake": {"revision": "test"}, "naf_revision": NAF_REVISION},
+              "models": {backbone: {"revision": BACKBONE_SPECS[backbone].revision}, "naf_revision": NAF_REVISION},
               "visualization": {"policy": "posthoc_audit_only"}}
     raw = json.dumps(config).encode(); digest = hashlib.sha256(raw).hexdigest()
     (root / "config/frozen_config.json").write_bytes(raw)
     (root / "run_manifest.json").write_text(json.dumps({"config_sha256": digest}))
-    variants = [{"feature_track": "track", "backbone": "fake", "input_size": 8, "feature_mode": "bilinear", "resolution": value} for value in range(2, 11)]
+    variants = [{"feature_track": "track", "backbone": backbone, "input_size": 8, "feature_mode": "bilinear", "resolution": 2}]
     (root / "manifests/feature_variants.json").write_text(json.dumps(variants))
     rows = []
     for sid, changed, corruption in (("clean", None, "clean"), ("changed", "0", "jpeg")):
@@ -135,15 +137,15 @@ def test_adjacent_controlled_worker_uses_clean_geometry_and_posthoc_storage(tmp_
     np.savez_compressed(geometry / "depth_geometry.npz", depth=np.ones((4,504,504),np.float32), mask=np.ones((4,504,504),bool), confidence=np.ones((4,504,504),np.float32), intrinsics=np.broadcast_to(np.eye(3),(4,3,3)).copy(), extrinsics=np.broadcast_to(np.eye(4),(4,4,4)).copy(), meta__view_ids=np.asarray(views), meta__camera_groups=np.asarray(("upper",)*4), meta__camera_provenance=np.asarray("fixed_precomputed_da3"))
     (geometry / "depth_geometry.json").write_text(json.dumps({"camera_mode": CAMERA_MODE_LABEL, "camera_provenance": "fixed_precomputed_da3", "process_res": 504, "view_ids": list(views), "camera_groups": ["upper"]*4}))
     registry = JobRegistry(root / "registry/jobs.sqlite")
-    keys = [f"track__fake__8__bilinear__{value}" for value in range(2, 11)]
-    payload = {"job_type": "feature", "state_id": "changed", "track": "controlled", "analysis_track": "controlled", "shoe_id": "shoe", "quartet_id": "q3", "state_dir": str((root / "states/changed").resolve()), "config_sha256": digest, "backbone": "fake", "feature_track": "track", "variant_keys": list(reversed(keys)), "geometry_contract": "fixed_base_only"}
+    keys = [f"track__{backbone}__8__bilinear__2"]
+    payload = {"job_type": "feature", "state_id": "changed", "track": "controlled", "analysis_track": "controlled", "shoe_id": "shoe", "quartet_id": "q3", "state_dir": str((root / "states/changed").resolve()), "config_sha256": digest, "backbone": backbone, "feature_track": "track", "variant_keys": list(reversed(keys)), "geometry_contract": "fixed_base_only"}
     registry.register(JobDefinition("wanted", "feature", payload)); registry.register(JobDefinition("other", "feature", payload))
     monkeypatch.setattr("met3r.upper_metric_worker.load_feature_backbone", lambda _: _TinyBackbone())
     monkeypatch.setattr("met3r.upper_metric_worker.load_naf_upsampler", lambda **_: _TinyNAF())
     monkeypatch.setattr("met3r.upper_metric_worker._fit_or_load_pca", lambda *args: (_ for _ in ()).throw(AssertionError("PCA")))
-    assert run_feature_worker(root, "fake", "cpu", job_ids=["wanted"]).completed == 1
+    assert run_feature_worker(root, backbone, "cpu", job_ids=["wanted"]).completed == 1
     frame = pd.read_parquet(root / "metrics/parts/track/wanted.parquet")
-    assert len(frame) == 9 and frame["variant_key"].tolist() == keys
+    assert len(frame) == 1 and frame["variant_key"].tolist() == keys
     assert frame.iloc[0][["s00", "s01"]].nunique() == 1 and frame.iloc[0][["s10", "s11"]].nunique() == 1
     assert frame.iloc[0]["geometry_effect"] == 0 and frame.iloc[0]["interaction"] == 0
     assert frame.iloc[0]["quartet_id"] == "q3" and frame.iloc[0]["baseline_steps"] == 1 and frame.iloc[0]["angular_separation_deg"] == 7.5
