@@ -50,6 +50,21 @@ def _write_state(run_root: Path, state_id: str, *, corruption: str) -> Path:
         Image.fromarray(np.ones((504, 504), dtype=np.uint8) * 255).save(
             state_dir / "masks" / f"{view_id}.png"
         )
+    (state_dir / "images.json").write_text(
+        json.dumps(
+            {
+                "views": [
+                    {
+                        "view_id": view_id,
+                        "image": f"images/{view_id}.png",
+                        "mask": f"masks/{view_id}.png",
+                    }
+                    for view_id in UPPER_VIEWS
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
     (state_dir / "state.json").write_text(
         json.dumps(
             {

@@ -29,7 +29,6 @@ from .da3_depth import (
 from .geometry_perturbations import write_geometry_calibration_artifacts
 from .job_registry import JobRegistry, WorkerSummary, sha256_file
 from .provenance import repository_state
-from .upper_data import UPPER_VIEWS
 from .upper_design import MaterializedState
 
 
@@ -49,6 +48,7 @@ _TRANSIENT_ERRNOS = frozenset(
 class _CameraSet:
     extrinsics: np.ndarray
     intrinsics: np.ndarray
+    view_ids: tuple[str, str, str, str]
 
 
 def _json_object(path: Path) -> Mapping[str, object]:
@@ -79,7 +79,11 @@ def _load_config(run_root: Path) -> tuple[Mapping[str, object], str, str]:
         raise ValueError("run manifest config hash mismatch")
     scope = run_manifest.get("scope")
     if scope not in {"pilot", "full"}:
-        raise ValueError("run manifest scope must be 'pilot' or 'full'")
+        if not isinstance(run_manifest.get("experiment_id"), str):
+            raise ValueError(
+                "run manifest requires a 'pilot'/'full' scope or an experiment ID"
+            )
+        scope = "adjacent16"
     if config.get("stage_size") != _PROCESS_RES:
         raise ValueError("frozen stage_size must be exactly 504")
     models = config.get("models")
@@ -100,12 +104,39 @@ def _read_materialized_state(state_dir: Path) -> MaterializedState:
         raise ValueError(f"materialized state metadata is malformed: {metadata_path}")
     if metadata.get("stage_size") != _PROCESS_RES:
         raise ValueError("materialized state stage_size must be exactly 504")
-    image_paths = tuple(
-        state_dir / "images" / f"{view_id}.png" for view_id in UPPER_VIEWS
-    )
-    mask_paths = tuple(
-        state_dir / "masks" / f"{view_id}.png" for view_id in UPPER_VIEWS
-    )
+    images_manifest_path = state_dir / "images.json"
+    images_manifest = _json_object(images_manifest_path)
+    records = images_manifest.get("views")
+    if not isinstance(records, list) or len(records) != 4:
+        raise ValueError("materialized state images.json must contain exactly four views")
+    view_ids: list[str] = []
+    image_paths: list[Path] = []
+    mask_paths: list[Path] = []
+    for record in records:
+        if not isinstance(record, Mapping):
+            raise ValueError("materialized state images.json view is malformed")
+        view_id = record.get("view_id")
+        if not isinstance(view_id, str) or not view_id:
+            raise ValueError("materialized state images.json view ID is malformed")
+        expected_image = f"images/{view_id}.png"
+        expected_mask = f"masks/{view_id}.png"
+        if record.get("image") != expected_image or record.get("mask") != expected_mask:
+            raise ValueError("materialized state images.json path contract mismatch")
+        view_ids.append(view_id)
+        image_paths.append(state_dir / expected_image)
+        mask_paths.append(state_dir / expected_mask)
+    if len(set(view_ids)) != 4:
+        raise ValueError("materialized state images.json has duplicate view IDs")
+    exact_view_ids = tuple(view_ids)
+    if len(exact_view_ids) != 4:
+        raise AssertionError("four-view state contract was not enforced")
+    for metadata_view_ids in (state.get("view_ids"), metadata.get("view_ids")):
+        if metadata_view_ids is not None:
+            if (
+                not isinstance(metadata_view_ids, list)
+                or tuple(metadata_view_ids) != exact_view_ids
+            ):
+                raise ValueError("materialized state metadata view order mismatch")
     masks: list[np.ndarray] = []
     for image_path, mask_path in zip(image_paths, mask_paths):
         with Image.open(image_path) as image:
@@ -120,14 +151,18 @@ def _read_materialized_state(state_dir: Path) -> MaterializedState:
     return MaterializedState(
         state_id=str(state["state_id"]),
         state_dir=state_dir,
-        image_paths=image_paths,
-        mask_paths=mask_paths,
+        image_paths=tuple(image_paths),
+        mask_paths=tuple(mask_paths),
         masks=np.stack(masks),
         metadata_path=metadata_path,
     )
 
 
-def _load_cameras(path: Path) -> _CameraSet:
+def _load_cameras(
+    path: Path,
+    *,
+    expected_view_ids: tuple[str, str, str, str],
+) -> _CameraSet:
     with np.load(path, allow_pickle=False) as artifact:
         required = {
             "extrinsics",
@@ -150,11 +185,20 @@ def _load_cameras(path: Path) -> _CameraSet:
         raise ValueError(
             f"upper intrinsics have an unexpected shape: {intrinsics.shape}"
         )
-    if view_ids != UPPER_VIEWS:
-        raise ValueError(f"camera view order must be exactly {UPPER_VIEWS}")
+    if view_ids != expected_view_ids:
+        raise ValueError(
+            f"camera view order must match the materialized state: "
+            f"{expected_view_ids}"
+        )
+    if len(set(view_ids)) != 4:
+        raise ValueError("camera artifact has duplicate view IDs")
     if groups != ("upper",) * 4:
         raise ValueError("camera artifact must contain only four upper views")
-    return _CameraSet(extrinsics=extrinsics, intrinsics=intrinsics)
+    return _CameraSet(
+        extrinsics=extrinsics,
+        intrinsics=intrinsics,
+        view_ids=view_ids,
+    )
 
 
 def _homogeneous(extrinsics: np.ndarray) -> np.ndarray:
@@ -171,7 +215,15 @@ def _validate_fixed_camera_contract(
     cameras: _CameraSet,
 ) -> None:
     with np.load(artifact.arrays_path, allow_pickle=False) as arrays:
-        required = {"depth", "confidence", "mask", "extrinsics", "intrinsics"}
+        required = {
+            "depth",
+            "confidence",
+            "mask",
+            "extrinsics",
+            "intrinsics",
+            "meta__view_ids",
+            "meta__camera_groups",
+        }
         missing = required - set(arrays.files)
         if missing:
             raise ValueError(f"depth artifact is missing arrays: {sorted(missing)}")
@@ -202,8 +254,8 @@ def _validate_fixed_camera_contract(
         artifact_views = tuple(
             str(value) for value in arrays["meta__view_ids"].tolist()
         )
-        if artifact_views != UPPER_VIEWS:
-            raise ValueError("depth artifact upper-view order mismatch")
+        if artifact_views != cameras.view_ids:
+            raise ValueError("depth artifact view order mismatch")
         if tuple(
             str(value) for value in arrays["meta__camera_groups"].tolist()
         ) != ("upper",) * 4:
@@ -217,6 +269,10 @@ def _validate_fixed_camera_contract(
         raise ValueError("compact depth metadata must disable processed image storage")
     if metadata.get("process_res") != _PROCESS_RES:
         raise ValueError("depth metadata process_res must be exactly 504")
+    if metadata.get("view_ids") != list(cameras.view_ids):
+        raise ValueError("depth metadata view order mismatch")
+    if metadata.get("camera_groups") != ["upper"] * 4:
+        raise ValueError("depth metadata contains a non-upper camera group")
 
 
 def _output_manifest(paths: tuple[Path, ...]) -> dict[str, object]:
@@ -258,6 +314,7 @@ def _write_full_calibration(
     published_output_dir: Path,
     config: Mapping[str, object],
     config_sha256: str,
+    view_ids: tuple[str, str, str, str],
 ) -> tuple[Path, ...]:
     calibration = config.get("geometry_calibration")
     if not isinstance(calibration, Mapping):
@@ -273,7 +330,7 @@ def _write_full_calibration(
     calibration_root = output_dir / "calibration"
     records: list[dict[str, object]] = []
     paths: list[Path] = []
-    for view_index, view_id in enumerate(UPPER_VIEWS):
+    for view_index, view_id in enumerate(view_ids):
         view_manifest_path = write_geometry_calibration_artifacts(
             artifact.arrays_path,
             calibration_root / view_id,
@@ -326,7 +383,7 @@ def _write_full_calibration(
             ),
             encoding="utf-8",
         )
-    expected_count = len(UPPER_VIEWS) * (
+    expected_count = len(view_ids) * (
         len(rotations) + len(translations) + len(depth_scales) + len(depth_noise)
     )
     if len(records) != expected_count:
@@ -346,7 +403,7 @@ def _write_full_calibration(
                 ),
                 "config_sha256": config_sha256,
                 "seed": seed,
-                "views": list(UPPER_VIEWS),
+                "views": list(view_ids),
                 "artifacts": records,
             },
             indent=2,
@@ -516,7 +573,12 @@ def run_geometry_worker(
         if job is None:
             break
         try:
-            if job.payload.get("job_type") not in {"geometry", "stress_geometry"}:
+            job_type = job.payload.get("job_type")
+            if job_type not in {
+                "geometry",
+                "stress_geometry",
+                "geometry_calibration",
+            }:
                 raise ValueError(
                     "unexpected geometry job type: "
                     f"{job.payload.get('job_type')}"
@@ -535,6 +597,9 @@ def run_geometry_worker(
                 job.payload["output_dir"], root / "geometry", "output_dir"
             )
             state = _read_materialized_state(state_dir)
+            state_view_ids = tuple(path.stem for path in state.image_paths)
+            if len(state_view_ids) != 4 or len(set(state_view_ids)) != 4:
+                raise ValueError("materialized state does not have four unique views")
             if state.state_id != job.payload.get("state_id"):
                 raise ValueError("materialized state ID does not match geometry job")
             state_metadata = _json_object(state.metadata_path)
@@ -548,7 +613,10 @@ def run_geometry_worker(
                 raise ValueError("materialized state shoe does not match geometry job")
             if state_payload.get("track") != job.payload.get("track"):
                 raise ValueError("materialized state track does not match geometry job")
-            cameras = _load_cameras(camera_path)
+            cameras = _load_cameras(
+                camera_path,
+                expected_view_ids=state_view_ids,
+            )
             _recover_uncommitted_install(output_dir)
             staging_dir = _temporary_bundle(output_dir)
             try:
@@ -563,7 +631,7 @@ def run_geometry_worker(
                     camera_provenance="fixed_precomputed_da3",
                     process_res=_PROCESS_RES,
                     foreground_mask=state.masks,
-                    view_ids=UPPER_VIEWS,
+                    view_ids=cameras.view_ids,
                     camera_groups=("upper",) * 4,
                     analysis_tier="primary",
                     source_state=source_state,
@@ -572,9 +640,15 @@ def run_geometry_worker(
                 _validate_fixed_camera_contract(artifact, cameras)
                 staging_paths = [artifact.arrays_path, artifact.metadata_path]
                 if (
-                    scope == "full"
-                    and job.payload.get("job_type") == "geometry"
-                    and state_payload.get("corruption") == "clean"
+                    (
+                        scope == "full"
+                        and job_type == "geometry"
+                        and state_payload.get("corruption") == "clean"
+                    )
+                    or (
+                        job_type == "geometry_calibration"
+                        and job.payload.get("calibration_artifacts") is True
+                    )
                 ):
                     staging_paths.extend(
                         _write_full_calibration(
@@ -583,6 +657,7 @@ def run_geometry_worker(
                             output_dir,
                             config,
                             config_sha256,
+                            cameras.view_ids,
                         )
                     )
                 _output_manifest(tuple(staging_paths))
