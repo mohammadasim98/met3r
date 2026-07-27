@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+from types import SimpleNamespace
 from pathlib import Path
 
 import numpy as np
@@ -22,6 +23,7 @@ from met3r.upper_metric_worker import (
     _validate_adjacent_pair_contract,
     _calibration_records,
     _RunContract,
+    _sensitivity_row,
     run_feature_worker,
 )
 from met3r.known_camera import KnownCameraConfig
@@ -122,6 +124,20 @@ def test_adjacent_calibration_fixture_has_all_frozen_q3_artifacts(tmp_path: Path
     assert len(records) == 68
     assert [record["view_id"] for record in records] == [view for view in clean.view_ids for _ in range(17)]
     assert {view: sum(record["view_id"] == view for record in records) for view in clean.view_ids} == {view: 17 for view in clean.view_ids}
+
+
+def _fake_calibration_result() -> SimpleNamespace:
+    """Match GeometrySensitivityResult fields consumed by _sensitivity_row."""
+    def direction(score: float) -> SimpleNamespace:
+        return SimpleNamespace(score=torch.tensor([score]), overlap_fraction=torch.tensor([.75]), cycle_error_px=torch.tensor([[1., 2.]]), relative_depth_error=torch.tensor([[.1, .2]]), valid_mask=torch.tensor([[True, True]]))
+    return SimpleNamespace(baseline=SimpleNamespace(score=torch.tensor([.8]), first_to_second=direction(.8), second_to_first=direction(.7), abstained=torch.tensor([False])), perturbed=SimpleNamespace(score=torch.tensor([.6]), first_to_second=direction(.6), second_to_first=direction(.5), abstained=torch.tensor([False])), geometry_effect=torch.tensor([-.2]))
+
+
+def test_fake_calibration_result_drives_real_sensitivity_row_schema() -> None:
+    """Catch fake calibration scoring drift from the worker's real row adapter."""
+    row = _sensitivity_row(_fake_calibration_result())
+    assert {"base_score", "perturbed_score", "geometry_effect", "overlap", "abstained", "cycle_error_px_median", "relative_depth_error_median"} <= set(row)
+    assert all(np.isfinite(float(row[name])) for name in ("base_score", "perturbed_score", "geometry_effect", "overlap", "cycle_error_px_median", "relative_depth_error_median"))
 
 
 class _TinyBackbone(nn.Module):
