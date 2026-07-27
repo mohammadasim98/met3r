@@ -191,3 +191,46 @@ def test_geometry_preflight_accepts_canonical_task6_task7_fixture_and_is_idempot
     assert second == first
     assert (root / "reports/geometry_preflight.parquet").read_bytes() == first_bytes
     assert (root / "reports/geometry_preflight.json").read_bytes() == report_bytes
+
+
+@pytest.mark.parametrize("mutation", ("missing", "extra", "mask", "order", "hash", "source"))
+def test_geometry_preflight_rejects_canonical_camera_and_provenance_mutations(
+    tmp_path: Path, mutation: str,
+) -> None:
+    """Catch accepting malformed Task6/Task7 inputs after a canonical preflight."""
+
+    root = _canonical_preflight_run(tmp_path)
+    shoe = next(iter(json.loads(Path("configs/adjacent16_core.json").read_text())["shoes"]))
+    camera = root / "cameras" / shoe / "q0" / "cameras.npz"
+    geometry = root / "geometry" / "calibration" / f"controlled__{shoe}__q0__clean" / "depth_geometry.npz"
+    if mutation in {"missing", "extra", "order"}:
+        with np.load(camera) as artifact:
+            arrays = {name: artifact[name] for name in artifact.files}
+        if mutation == "missing":
+            arrays.pop("mask")
+        elif mutation == "extra":
+            arrays["unexpected"] = np.asarray(1)
+        else:
+            arrays["view_ids"] = arrays["view_ids"][::-1]
+        np.savez_compressed(camera, **arrays)
+    elif mutation == "mask":
+        with np.load(geometry) as artifact:
+            arrays = {name: artifact[name] for name in artifact.files}
+        arrays["mask"] = arrays["mask"].copy()
+        arrays["mask"][0, 0, 0] = False
+        np.savez_compressed(geometry, **arrays)
+    elif mutation == "source":
+        path = camera.parent / "metadata.json"
+        metadata = json.loads(path.read_text())
+        metadata["source_hashes"]["1"]["rgb"] = "f" * 64
+        path.write_text(json.dumps(metadata))
+    else:
+        registry = root / "registry/jobs.sqlite"
+        with sqlite3.connect(registry) as connection:
+            connection.execute("UPDATE jobs SET output_manifest_json=? WHERE job_id LIKE ?", (json.dumps({"files": [{"path": str(geometry), "sha256": "0" * 64}]}), "%q0__clean"))
+
+    report = validate_adjacent16_geometry_preflight(root)
+
+    assert report.passed is False
+    assert report.pair_units == 0
+    assert report.failed_checks == ("input_validation",)
