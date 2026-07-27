@@ -187,6 +187,34 @@ def test_independent_frozen_fixture_passes_the_real_final_gate(tmp_path: Path) -
     assert changed_provenance["metric_input_sha256"] != provenance["metric_input_sha256"]
 
 
+def test_controlled_complete_series_uses_adjacent_whole_series_threshold(tmp_path: Path) -> None:
+    """Catch rounding the 9,216-series 80% threshold or treating missing as zero."""
+
+    fixture = _final_gate_fixture(tmp_path)
+    root = fixture["root"]
+    path = fixture["metrics"]["controlled"]
+    frame = pd.read_parquet(path)
+    key = ["shoe_id", "quartet_id", "pair_id", "changed_view", "corruption", "variant_key"]
+    groups = list(frame.loc[frame.corruption != "clean"].groupby(key, sort=True).groups.values())
+    assert len(groups) == 9216
+    for index, rows in enumerate(groups[:1843]):
+        row = next(iter(rows))
+        if index == 0:
+            frame.loc[row, "score"] = float("nan")
+        else:
+            frame.loc[row, "abstained"] = True
+    frame.to_parquet(path, index=False)
+    passing = validate_adjacent16_final_gate(root)
+    assert passing.controlled_complete_series_coverage == pytest.approx(7373 / 9216)
+    assert "controlled_complete_series" not in passing.failed_checks
+    row = next(iter(groups[1843]))
+    frame.loc[row, "abstained"] = True
+    frame.to_parquet(path, index=False)
+    failing = validate_adjacent16_final_gate(root)
+    assert failing.controlled_complete_series_coverage == pytest.approx(7372 / 9216)
+    assert "controlled_complete_series" in failing.failed_checks
+
+
 def _frozen_config(root: Path) -> None:
     (root / "config").mkdir(parents=True)
     source = Path("configs/adjacent16_core.json")
