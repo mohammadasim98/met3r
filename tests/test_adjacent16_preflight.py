@@ -216,7 +216,8 @@ def test_geometry_preflight_accepts_canonical_task6_task7_fixture_and_is_idempot
     np.savez_compressed(geometry, **arrays)
     with sqlite3.connect(root / "registry/jobs.sqlite") as connection:
         geometry_json = geometry.with_suffix(".json")
-        connection.execute("UPDATE jobs SET output_manifest_json=? WHERE job_id LIKE ?", (json.dumps({"files": [{"path": str(path.resolve()), "sha256": sha256_file(path)} for path in (geometry, geometry_json)]}), "%q0__clean"))
+        job_id = f"geometry__geometry_calibration__controlled__{shoe}__q0__clean"
+        connection.execute("UPDATE jobs SET output_manifest_json=? WHERE job_id = ?", (json.dumps({"files": [{"path": str(path.resolve()), "sha256": sha256_file(path)} for path in (geometry, geometry_json)]}), job_id))
     changed = validate_adjacent16_geometry_preflight(root)
     changed_provenance = json.loads((root / "reports/geometry_preflight.json").read_text())
     assert changed.passed is True
