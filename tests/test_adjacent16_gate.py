@@ -157,6 +157,38 @@ def _final_gate_fixture(tmp_path: Path) -> dict[str, object]:
     return {"root": root, "contract": contract, "design": design, "registry": registry, "metrics": metrics}
 
 
+_SUPPORT_FIELDS = ("shoe_id", "quartet_id", "pair_id", "changed_view", "corruption", "severity")
+
+
+def _variant_support_keys(frame: pd.DataFrame, variant: str) -> set[tuple[object, ...]]:
+    rows = frame.loc[frame.variant_key == variant, list(_SUPPORT_FIELDS)]
+    keys = {tuple(row) for row in rows.itertuples(index=False, name=None)}
+    assert len(rows) == len(keys) == 2592
+    return keys
+
+
+def _abstain_variant_support_keys(
+    frame: pd.DataFrame,
+    variant: str,
+    support_keys: set[tuple[object, ...]],
+) -> None:
+    variant_rows = frame.loc[frame.variant_key == variant]
+    rows_by_key = {
+        tuple(row[field] for field in _SUPPORT_FIELDS): index
+        for index, row in variant_rows.iterrows()
+    }
+    assert len(rows_by_key) == 2592
+    assert support_keys <= rows_by_key.keys()
+    frame.loc[[rows_by_key[key] for key in support_keys], "abstained"] = True
+
+
+def _nonclean_support_keys(frame: pd.DataFrame, variant: str) -> list[tuple[object, ...]]:
+    keys = _variant_support_keys(frame, variant)
+    nonclean = sorted(key for key in keys if key[4] != "clean")
+    assert len(nonclean) == 2496
+    return nonclean
+
+
 def test_independent_frozen_fixture_passes_the_real_final_gate(tmp_path: Path) -> None:
     """Catch divergence between compact fixture data and final-gate production contracts."""
 
@@ -267,6 +299,116 @@ def test_all_four_shoe_primary_cells_use_normalized_pair_boundaries(tmp_path: Pa
     assert failing.all_four_shoe_primary_cell_rate == pytest.approx(1843 / 2304)
     assert failing.passed is False
     assert "all_four_shoe_primary_cells" in failing.failed_checks
+
+
+def test_common_support_four_b37_backbones_uses_intersection_over_union(tmp_path: Path) -> None:
+    """Catch a directional-overlap mean in the four-backbone comparison."""
+
+    fixture = _final_gate_fixture(tmp_path)
+    root = fixture["root"]
+    path = fixture["metrics"]["controlled"]
+    assert isinstance(root, Path)
+    frame = pd.read_parquet(path)
+    b37 = frame.loc[
+        (frame.feature_mode == "bilinear") & (frame.resolution == 37),
+        ["backbone", "variant_key"],
+    ].drop_duplicates("variant_key")
+    assert len(b37) == 4
+    target = b37.loc[b37.backbone == "dino_vitb16", "variant_key"].item()
+    missing = _nonclean_support_keys(frame, target)
+
+    _abstain_variant_support_keys(frame, target, set(missing[:777]))
+    frame.to_parquet(path, index=False)
+    passing = validate_adjacent16_final_gate(root)
+    assert passing.minimum_common_support_retention == pytest.approx(1815 / 2592)
+    assert passing.controlled_complete_series_coverage > .80
+    assert passing.all_four_shoe_primary_cell_rate > .80
+    assert passing.passed is True
+    assert "common_support_retention" not in passing.failed_checks
+
+    _abstain_variant_support_keys(frame, target, {missing[777]})
+    frame.to_parquet(path, index=False)
+    failing = validate_adjacent16_final_gate(root)
+    assert failing.minimum_common_support_retention == pytest.approx(1814 / 2592)
+    assert failing.controlled_complete_series_coverage > .80
+    assert failing.all_four_shoe_primary_cell_rate > .80
+    assert failing.passed is False
+    assert failing.failed_checks == ("common_support_retention",)
+
+
+def test_common_support_five_l_bilinear_resolutions_uses_disjoint_missing_keys(tmp_path: Path) -> None:
+    """Catch a five-way support calculation that omits one resolution or averages overlaps."""
+
+    fixture = _final_gate_fixture(tmp_path)
+    root = fixture["root"]
+    path = fixture["metrics"]["controlled"]
+    assert isinstance(root, Path)
+    frame = pd.read_parquet(path)
+    l_bilinear = frame.loc[
+        (frame.backbone == "dinov3_vitl16_pixal3d") & (frame.feature_mode == "bilinear"),
+        ["resolution", "variant_key"],
+    ].drop_duplicates("variant_key").sort_values("resolution")
+    assert tuple(l_bilinear.resolution) == (37, 74, 148, 296, 592)
+    variants = tuple(l_bilinear.variant_key)
+    missing = _nonclean_support_keys(frame, variants[0])
+    assert all(set(_nonclean_support_keys(frame, variant)) == set(missing) for variant in variants[1:])
+    chunks = (set(missing[:156]), set(missing[156:312]), set(missing[312:467]), set(missing[467:622]), set(missing[622:777]))
+    assert len(set().union(*chunks)) == 777
+    for variant, chunk in zip(variants, chunks, strict=True):
+        _abstain_variant_support_keys(frame, variant, chunk)
+    frame.to_parquet(path, index=False)
+    passing = validate_adjacent16_final_gate(root)
+    assert passing.minimum_common_support_retention == pytest.approx(1815 / 2592)
+    assert passing.controlled_complete_series_coverage > .80
+    assert passing.all_four_shoe_primary_cell_rate > .80
+    assert passing.passed is True
+    assert "common_support_retention" not in passing.failed_checks
+
+    _abstain_variant_support_keys(frame, variants[-1], {missing[777]})
+    frame.to_parquet(path, index=False)
+    failing = validate_adjacent16_final_gate(root)
+    assert failing.minimum_common_support_retention == pytest.approx(1814 / 2592)
+    assert failing.controlled_complete_series_coverage > .80
+    assert failing.all_four_shoe_primary_cell_rate > .80
+    assert failing.passed is False
+    assert failing.failed_checks == ("common_support_retention",)
+
+
+def test_common_support_naf_bilinear_pair_uses_intersection_over_union(tmp_path: Path) -> None:
+    """Catch one directional NAF-vs-bilinear overlap being treated as the pair result."""
+
+    fixture = _final_gate_fixture(tmp_path)
+    root = fixture["root"]
+    path = fixture["metrics"]["controlled"]
+    assert isinstance(root, Path)
+    frame = pd.read_parquet(path)
+    pair = frame.loc[
+        (frame.backbone == "dinov3_vitl16_pixal3d") & (frame.resolution == 74),
+        ["feature_mode", "variant_key"],
+    ].drop_duplicates("variant_key")
+    assert set(pair.feature_mode) == {"bilinear", "naf_normal_guide"}
+    naf = pair.loc[pair.feature_mode == "naf_normal_guide", "variant_key"].item()
+    bilinear = pair.loc[pair.feature_mode == "bilinear", "variant_key"].item()
+    missing = _nonclean_support_keys(frame, naf)
+    assert set(_nonclean_support_keys(frame, bilinear)) == set(missing)
+
+    _abstain_variant_support_keys(frame, naf, set(missing[:777]))
+    frame.to_parquet(path, index=False)
+    passing = validate_adjacent16_final_gate(root)
+    assert passing.minimum_common_support_retention == pytest.approx(1815 / 2592)
+    assert passing.controlled_complete_series_coverage > .80
+    assert passing.all_four_shoe_primary_cell_rate > .80
+    assert passing.passed is True
+    assert "common_support_retention" not in passing.failed_checks
+
+    _abstain_variant_support_keys(frame, naf, {missing[777]})
+    frame.to_parquet(path, index=False)
+    failing = validate_adjacent16_final_gate(root)
+    assert failing.minimum_common_support_retention == pytest.approx(1814 / 2592)
+    assert failing.controlled_complete_series_coverage > .80
+    assert failing.all_four_shoe_primary_cell_rate > .80
+    assert failing.passed is False
+    assert failing.failed_checks == ("common_support_retention",)
 
 
 def _frozen_config(root: Path) -> None:
