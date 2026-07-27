@@ -29,10 +29,12 @@ from .adjacent16_data import (
     Adjacent16Manifest,
     AdjacentShoeRecord,
     AdjacentViewRecord,
+    _stress_record,
     camera_azimuths,
 )
 from .adjacent16_design import Adjacent16Design, build_adjacent16_design
 from .camera_metadata import CAMERA_MODE_LABEL
+from .deformation_audit import DeformationQuality, _strict_json_equal
 from .geometry import confidence_percentile_mask
 from .job_registry import sha256_file
 from .known_camera import KnownCameraConfig, score_symmetric_geometry_support
@@ -167,8 +169,16 @@ class _ManifestViewEvidence:
     orbit_position: int
     source_path: Path
     source_mask_path: Path
+    stress_path: Path | None
+    stress_mask_path: Path | None
+    deformation_json_path: Path | None
+    metrics_json_path: Path | None
+    task_json_path: Path | None
     source_sha256: str
     source_mask_sha256: str
+    stress_sha256: str | None
+    stress_mask_sha256: str | None
+    quality: DeformationQuality | None
     processed_image_correlation: float
     camera_azimuth_deg: float
 
@@ -244,6 +254,17 @@ def _tree_hash(root: Path, paths: Sequence[Path]) -> str:
     digest = hashlib.sha256()
     for path in sorted(paths):
         digest.update(str(path.relative_to(root)).encode("utf-8"))
+        digest.update(bytes.fromhex(sha256_file(path)))
+    return digest.hexdigest()
+
+
+def _artifact_set_hash(paths: Sequence[Path]) -> str:
+    resolved = tuple(sorted((path.resolve() for path in paths), key=str))
+    if len(resolved) != len(set(resolved)):
+        raise ValueError("provenance artifact paths must be unique")
+    digest = hashlib.sha256()
+    for path in resolved:
+        digest.update(str(path).encode("utf-8"))
         digest.update(bytes.fromhex(sha256_file(path)))
     return digest.hexdigest()
 
@@ -402,6 +423,8 @@ def _canonical_source_path(value: object, *, label: str) -> Path:
 def _source_manifest(
     root: Path,
     contract: Adjacent16Contract,
+    *,
+    require_stress: bool,
 ) -> Mapping[tuple[str, str], tuple[_ManifestViewEvidence, ...]]:
     path = root / "manifests" / "adjacent16_manifest.json"
     raw = json.loads(path.read_text(encoding="utf-8"))
@@ -512,6 +535,90 @@ def _source_manifest(
             with Image.open(source_mask_path) as image:
                 if image.size != (source_size, source_size):
                     raise ValueError("adjacent source mask dimensions differ")
+            stress_path = stress_mask_path = None
+            deformation_json_path = metrics_json_path = task_json_path = None
+            stress_sha256 = stress_mask_sha256 = None
+            quality = None
+            if require_stress:
+                stress_root = contract.stress_root.expanduser().resolve()
+                if str(stress_root) != str(contract.stress_root):
+                    raise ValueError("frozen stress root must be an absolute canonical path")
+                stress = _stress_record(
+                    stress_root,
+                    shoe_id=shoe_id,
+                    quartet_id=quartet_id,
+                    view_id=view_id,
+                    require_stress=True,
+                )
+                (
+                    expected_stress_path,
+                    expected_stress_mask_path,
+                    expected_deformation_json_path,
+                    expected_metrics_json_path,
+                    expected_task_json_path,
+                    expected_stress_sha256,
+                    expected_stress_mask_sha256,
+                    expected_quality,
+                ) = stress
+                expected_paths = (
+                    ("stress_path", expected_stress_path, "stress RGB"),
+                    ("stress_mask_path", expected_stress_mask_path, "stress mask"),
+                    (
+                        "deformation_json_path",
+                        expected_deformation_json_path,
+                        "stress deformation metadata",
+                    ),
+                    (
+                        "metrics_json_path",
+                        expected_metrics_json_path,
+                        "stress deformation metrics",
+                    ),
+                    ("task_json_path", expected_task_json_path, "stress task"),
+                )
+                validated_paths: list[Path] = []
+                for field, expected_path, label in expected_paths:
+                    if expected_path is None:
+                        raise ValueError(f"{label} is missing from strict stress parsing")
+                    actual_path = _canonical_source_path(
+                        raw_view.get(field), label=label
+                    )
+                    if actual_path != expected_path.resolve():
+                        raise ValueError(f"{label} path differs from the canonical stress artifact")
+                    validated_paths.append(actual_path)
+                (
+                    stress_path,
+                    stress_mask_path,
+                    deformation_json_path,
+                    metrics_json_path,
+                    task_json_path,
+                ) = validated_paths
+                if (
+                    raw_view.get("stress_sha256") != expected_stress_sha256
+                    or raw_view.get("stress_mask_sha256")
+                    != expected_stress_mask_sha256
+                ):
+                    raise ValueError("adjacent stress content hash validation failed")
+                raw_quality = raw_view.get("quality")
+                expected_quality_json = (
+                    asdict(expected_quality)
+                    if expected_quality is not None
+                    else None
+                )
+                if (
+                    expected_quality is None
+                    or not isinstance(raw_quality, Mapping)
+                    or not _strict_json_equal(raw_quality, expected_quality_json)
+                    or expected_quality.status != "ok"
+                    or expected_quality.task_status != "ok"
+                    or not expected_quality.semantic_gate
+                    or not expected_quality.preservation_gate
+                    or not expected_quality.camera_preserved
+                    or not expected_quality.outsole_preserved
+                ):
+                    raise ValueError("adjacent stress audit preservation failed")
+                stress_sha256 = expected_stress_sha256
+                stress_mask_sha256 = expected_stress_mask_sha256
+                quality = expected_quality
             evidence = _ManifestViewEvidence(
                 shoe_id=shoe_id,
                 camera_dataset_id=str(camera_dataset_id),
@@ -520,8 +627,16 @@ def _source_manifest(
                 orbit_position=orbit_position,
                 source_path=source_path,
                 source_mask_path=source_mask_path,
+                stress_path=stress_path,
+                stress_mask_path=stress_mask_path,
+                deformation_json_path=deformation_json_path,
+                metrics_json_path=metrics_json_path,
+                task_json_path=task_json_path,
                 source_sha256=source_sha256,
                 source_mask_sha256=source_mask_sha256,
+                stress_sha256=stress_sha256,
+                stress_mask_sha256=stress_mask_sha256,
+                quality=quality,
                 processed_image_correlation=float(correlation),
                 camera_azimuth_deg=float(azimuth),
             )
@@ -812,7 +927,7 @@ def validate_adjacent16_geometry_preflight(run_root: str | Path) -> GeometryPref
     try:
         contract, config_sha256 = _load_contract(root)
         registry = _registry_rows(root)
-        source_manifest = _source_manifest(root, contract)
+        source_manifest = _source_manifest(root, contract, require_stress=False)
         pair_metadata = _clean_pair_metadata(root, contract, source_manifest)
         clean_jobs = [
             row for row in registry
@@ -1340,7 +1455,7 @@ def _actual_primary_rows(frame: pd.DataFrame) -> dict[tuple[object, ...], Mappin
 
 
 def _frozen_design(root: Path, contract: Adjacent16Contract) -> Adjacent16Design:
-    source = _source_manifest(root, contract)
+    source = _source_manifest(root, contract, require_stress=True)
     shoes: list[AdjacentShoeRecord] = []
     for shoe_id, camera_dataset_id in contract.raw["shoes"].items():
         views: list[AdjacentViewRecord] = []
@@ -1358,18 +1473,18 @@ def _frozen_design(root: Path, contract: Adjacent16Contract) -> Adjacent16Design
                         orbit_position=record.orbit_position,
                         source_path=record.source_path,
                         source_mask_path=record.source_mask_path,
-                        stress_path=None,
-                        stress_mask_path=None,
-                        deformation_json_path=None,
-                        metrics_json_path=None,
-                        task_json_path=None,
+                        stress_path=record.stress_path,
+                        stress_mask_path=record.stress_mask_path,
+                        deformation_json_path=record.deformation_json_path,
+                        metrics_json_path=record.metrics_json_path,
+                        task_json_path=record.task_json_path,
                         processed_image_correlation=record.processed_image_correlation,
                         camera_azimuth_deg=record.camera_azimuth_deg,
                         source_sha256=record.source_sha256,
                         source_mask_sha256=record.source_mask_sha256,
-                        stress_sha256=None,
-                        stress_mask_sha256=None,
-                        quality=None,
+                        stress_sha256=record.stress_sha256,
+                        stress_mask_sha256=record.stress_mask_sha256,
+                        quality=record.quality,
                     )
                 )
         shoes.append(
@@ -1472,6 +1587,13 @@ _CALIBRATION_IDENTITY_FIELDS = (
     "perturbation_kind",
     "magnitude",
     *_METRIC_IDENTITY_FIELDS[15:],
+)
+_STRESS_METRIC_QUALITY_FIELDS = (
+    "semantic_gate",
+    "preservation_gate",
+    "camera_preserved",
+    "outsole_preserved",
+    "fit_relation",
 )
 
 
@@ -1593,6 +1715,61 @@ def _validate_metric_keys(
         actual = {tuple(row.get(field) for field in fields) for row in frame.to_dict("records")}
         if len(actual) != len(frame) or actual != wanted:
             return False
+    return _validate_stress_metric_quality(root, frames["stress"], contract)
+
+
+def _validate_stress_metric_quality(
+    root: Path,
+    stress_frame: pd.DataFrame,
+    contract: Adjacent16Contract,
+) -> bool:
+    """Bind every worker-emitted stress quality value to its audited source view."""
+
+    source = _source_manifest(root, contract, require_stress=True)
+    quality_by_view: dict[tuple[str, str], DeformationQuality] = {}
+    for records in source.values():
+        for record in records:
+            key = (record.shoe_id, record.view_id)
+            if key in quality_by_view or record.quality is None:
+                return False
+            quality_by_view[key] = record.quality
+    required_quality_columns = {
+        f"{prefix}_{field}"
+        for prefix in ("first", "second")
+        for field in _STRESS_METRIC_QUALITY_FIELDS
+    }
+    if not required_quality_columns <= set(stress_frame):
+        return False
+    for row in stress_frame.to_dict("records"):
+        shoe_id = row.get("shoe_id")
+        first_view = row.get("first_view")
+        second_view = row.get("second_view")
+        if not all(
+            isinstance(value, str)
+            for value in (shoe_id, first_view, second_view)
+        ):
+            return False
+        for prefix, view_id in (
+            ("first", first_view),
+            ("second", second_view),
+        ):
+            quality = quality_by_view.get((shoe_id, view_id))
+            if quality is None:
+                return False
+            for field in _STRESS_METRIC_QUALITY_FIELDS:
+                actual_value = row.get(f"{prefix}_{field}")
+                expected_value = getattr(quality, field)
+                if isinstance(expected_value, bool):
+                    if (
+                        not isinstance(actual_value, (bool, np.bool_))
+                        or bool(actual_value) != expected_value
+                    ):
+                        return False
+                elif (
+                    not isinstance(actual_value, str)
+                    or actual_value != expected_value
+                ):
+                    return False
     return True
 
 
@@ -1715,8 +1892,21 @@ def validate_adjacent16_final_gate(run_root: str | Path) -> Adjacent16FinalGateR
         if support_retention < float(contract.raw["analyzability"]["minimum_common_support_retention"]):
             failures.add("common_support_retention")
         stress = frames["stress"]
-        stress_fields = {"abstained", "s11_first_to_second_overlap", "s11_second_to_first_overlap"}
-        if not stress_fields <= set(stress) or stress.empty:
+        stress_fields = {
+            "abstained",
+            "s11_first_to_second_overlap",
+            "s11_second_to_first_overlap",
+            *(
+                f"{prefix}_{field}"
+                for prefix in ("first", "second")
+                for field in _STRESS_METRIC_QUALITY_FIELDS
+            ),
+        }
+        if (
+            not stress_fields <= set(stress)
+            or stress.empty
+            or not _validate_stress_metric_quality(root, stress, contract)
+        ):
             failures.add("stress_evidence")
         else:
             stress_rate = sum(
@@ -1743,7 +1933,15 @@ def validate_adjacent16_final_gate(run_root: str | Path) -> Adjacent16FinalGateR
         stress_symmetric_pass_rate=stress_rate, raw_feature_artifacts=raw_features,
         unexplained_jobs=unexplained, failed_checks=tuple(sorted(failures)),
     )
-    provenance: dict[str, object] = {"config_sha256": None, "registry_sha256": None, "manifest_sha256": None, "metric_input_sha256": None, "output_sha256": None}
+    provenance: dict[str, object] = {
+        "config_sha256": None,
+        "registry_sha256": None,
+        "manifest_sha256": None,
+        "adjacent_manifest_sha256": None,
+        "stress_audit_sha256": None,
+        "metric_input_sha256": None,
+        "output_sha256": None,
+    }
     try:
         config_path = root / "config" / "frozen_config.json"
         provenance["config_sha256"] = sha256_file(config_path)
@@ -1753,8 +1951,35 @@ def validate_adjacent16_final_gate(run_root: str | Path) -> Adjacent16FinalGateR
             for row in _registry_rows(root)
         ]
         provenance["registry_sha256"] = hashlib.sha256(json.dumps(logical, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-        manifests = [root / "manifests" / name for name in ("image_states.jsonl", "pair_conditions.jsonl", "feature_variants.json")]
+        adjacent_manifest = root / "manifests" / "adjacent16_manifest.json"
+        manifests = [
+            adjacent_manifest,
+            *[
+                root / "manifests" / name
+                for name in (
+                    "image_states.jsonl",
+                    "pair_conditions.jsonl",
+                    "feature_variants.json",
+                )
+            ],
+        ]
         provenance["manifest_sha256"] = _tree_hash(root, manifests)
+        provenance["adjacent_manifest_sha256"] = sha256_file(adjacent_manifest)
+        source = _source_manifest(root, contract, require_stress=True)
+        audit_paths = [
+            path
+            for records in source.values()
+            for record in records
+            for path in (
+                record.deformation_json_path,
+                record.metrics_json_path,
+                record.task_json_path,
+            )
+            if path is not None
+        ]
+        if len(audit_paths) != 192:
+            raise ValueError("final provenance requires all 192 stress audit artifacts")
+        provenance["stress_audit_sha256"] = _artifact_set_hash(audit_paths)
         tables = [root / "metrics" / name for name in _TRACK_FILES.values()]
         provenance["metric_input_sha256"] = _tree_hash(root, tables)
         provenance["output_sha256"] = hashlib.sha256(json.dumps(_json_safe(asdict(report)), sort_keys=True, separators=(",", ":")).encode()).hexdigest()

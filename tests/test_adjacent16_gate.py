@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +12,10 @@ import pandas as pd
 from PIL import Image
 
 from met3r.adjacent16_gate import (
+    _registry_rows,
+    _source_manifest,
+    _validate_metric_keys,
+    _validate_registry_graph,
     validate_adjacent16_final_gate,
     validate_timed_runtime_projection,
     write_timed_sentinel_manifest,
@@ -21,10 +25,36 @@ from met3r.adjacent16_contract import load_adjacent16_contract
 from met3r.adjacent16_data import Adjacent16Manifest, AdjacentShoeRecord, AdjacentViewRecord
 from met3r.adjacent16_design import build_adjacent16_design
 from met3r.adjacent16_prepare import _write_manifests, register_adjacent16_jobs
+from met3r.deformation_audit import DeformationQuality
+from tests.helpers_adjacent16 import write_valid_stress
+
+
+@pytest.fixture(autouse=True)
+def _relocate_frozen_gate_roots(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep production-shaped gate artifacts inside each pytest run root."""
+
+    def load_local_contract(path: str | Path) -> object:
+        contract = load_adjacent16_contract(path)
+        run_root = Path(path).resolve().parent.parent
+        return replace(
+            contract,
+            reconstruction_root=(run_root / "reconstruction").resolve(),
+            stress_root=(run_root / "inputs" / "stress").resolve(),
+            output_root=run_root,
+        )
+
+    monkeypatch.setattr(
+        "met3r.adjacent16_gate.load_adjacent16_contract", load_local_contract
+    )
 
 
 def _write_frozen_manifest_fixture(root: Path) -> tuple[tuple[Path, ...], object, object]:
-    contract = load_adjacent16_contract("configs/adjacent16_core.json")
+    contract = replace(
+        load_adjacent16_contract("configs/adjacent16_core.json"),
+        reconstruction_root=(root / "reconstruction").resolve(),
+        stress_root=(root / "inputs" / "stress").resolve(),
+        output_root=root.resolve(),
+    )
     positions = {view: index for index, view in enumerate(contract.camera_order)}
     shoes = []
     root.mkdir(parents=True, exist_ok=True)
@@ -42,27 +72,53 @@ def _write_frozen_manifest_fixture(root: Path) -> tuple[tuple[Path, ...], object
                     "RGB", (1080, 1080), (int(view), shoe_index * 60, 127)
                 ).save(source)
                 Image.new("L", (1080, 1080), 128 + serial).save(mask)
+                write_valid_stress(
+                    contract.stress_root,
+                    shoe,
+                    quartet.quartet_id,
+                    view,
+                )
+                stress_dir = (
+                    contract.stress_root
+                    / shoe
+                    / quartet.quartet_id
+                    / f"view_{view}"
+                    / "deformation"
+                )
+                stress = stress_dir / "deformed.png"
+                stress_mask = stress_dir / "deformed_mask.png"
                 views.append(
                     AdjacentViewRecord(
-                        shoe,
-                        camera_dataset_id,
-                        quartet.quartet_id,
-                        view,
-                        positions[view],
-                        source.resolve(),
-                        mask.resolve(),
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        1.0,
-                        float((positions[view] * 7.5) % 360.0),
-                        sha256_file(source),
-                        sha256_file(mask),
-                        None,
-                        None,
-                        None,
+                        shoe_id=shoe,
+                        camera_dataset_id=camera_dataset_id,
+                        quartet_id=quartet.quartet_id,
+                        view_id=view,
+                        orbit_position=positions[view],
+                        source_path=source.resolve(),
+                        source_mask_path=mask.resolve(),
+                        stress_path=stress.resolve(),
+                        stress_mask_path=stress_mask.resolve(),
+                        deformation_json_path=(stress_dir / "deformation.json").resolve(),
+                        metrics_json_path=(stress_dir / "metrics.json").resolve(),
+                        task_json_path=(stress_dir / "task.json").resolve(),
+                        processed_image_correlation=1.0,
+                        camera_azimuth_deg=float(
+                            (positions[view] * 7.5) % 360.0
+                        ),
+                        source_sha256=sha256_file(source),
+                        source_mask_sha256=sha256_file(mask),
+                        stress_sha256=sha256_file(stress),
+                        stress_mask_sha256=sha256_file(stress_mask),
+                        quality=DeformationQuality(
+                            status="ok",
+                            selected_attempt_id="attempt_01",
+                            semantic_gate=True,
+                            preservation_gate=True,
+                            camera_preserved=True,
+                            outsole_preserved=True,
+                            fit_relation="equivalent",
+                            task_status="ok",
+                        ),
                     )
                 )
         shoes.append(AdjacentShoeRecord(shoe, camera_dataset_id, tuple(views)))
@@ -76,6 +132,165 @@ def _write_frozen_manifest_fixture(root: Path) -> tuple[tuple[Path, ...], object
     pair_path = manifests / "pair_conditions.jsonl"
     variant_path = manifests / "feature_variants.json"
     return (state_path, pair_path, variant_path), contract, design
+
+
+def _registry_graph_fixture(tmp_path: Path) -> tuple[Path, object, object]:
+    root = tmp_path / "run"
+    _paths, contract, design = _write_frozen_manifest_fixture(root)
+    registry = JobRegistry(root / "registry" / "jobs.sqlite")
+    register_adjacent16_jobs(registry, root, design, "a" * 64)
+    rows = _registry_rows(root)
+    assert _validate_registry_graph(root, contract, "a" * 64, rows) is True
+    return root, contract, rows
+
+
+def test_registry_graph_rejects_mutated_stress_paths_and_hashes(
+    tmp_path: Path,
+) -> None:
+    """Catch runtime/final graph validation discarding stress file identity."""
+
+    root, contract, rows = _registry_graph_fixture(tmp_path)
+    path = root / "manifests" / "adjacent16_manifest.json"
+    original = path.read_bytes()
+    mutations = (
+        "stress_path",
+        "stress_mask_path",
+        "deformation_json_path",
+        "metrics_json_path",
+        "task_json_path",
+        "stress_sha256",
+        "stress_mask_sha256",
+    )
+    for field in mutations:
+        manifest = json.loads(original)
+        manifest["shoes"][0]["views"][0][field] = (
+            "0" * 64
+            if field.endswith("sha256")
+            else str((root / f"does-not-exist-{field}").resolve())
+        )
+        path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        assert (
+            _validate_registry_graph(root, contract, "a" * 64, rows) is False
+        ), field
+    path.write_bytes(original)
+    manifest = json.loads(original)
+    artifact = Path(manifest["shoes"][0]["views"][0]["stress_path"])
+    artifact_bytes = artifact.read_bytes()
+    artifact.unlink()
+    assert _validate_registry_graph(root, contract, "a" * 64, rows) is False
+    artifact.write_bytes(artifact_bytes)
+    assert _validate_registry_graph(root, contract, "a" * 64, rows) is True
+
+
+def test_source_manifest_keeps_clean_preflight_independent_of_stress_evidence(
+    tmp_path: Path,
+) -> None:
+    """Catch stress-required runtime validation leaking into clean preflight."""
+
+    root, contract, _rows = _registry_graph_fixture(tmp_path)
+    path = root / "manifests" / "adjacent16_manifest.json"
+    manifest = json.loads(path.read_text())
+    manifest["shoes"][0]["views"][0]["stress_path"] = str(
+        (root / "does-not-exist.png").resolve()
+    )
+    path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+    clean = _source_manifest(root, contract, require_stress=False)
+
+    assert len(clean) == 16
+    assert sum(len(records) for records in clean.values()) == 64
+    with pytest.raises(ValueError):
+        _source_manifest(root, contract, require_stress=True)
+
+
+def test_registry_graph_rejects_stress_dimensions_audits_and_manifest_quality(
+    tmp_path: Path,
+) -> None:
+    """Catch runtime/final validation accepting failed or detached audits."""
+
+    root, contract, rows = _registry_graph_fixture(tmp_path)
+    manifest_path = root / "manifests" / "adjacent16_manifest.json"
+    manifest_bytes = manifest_path.read_bytes()
+    view = json.loads(manifest_bytes)["shoes"][0]["views"][0]
+
+    for label, artifact_field, mode, size in (
+        ("stress-rgb-size", "stress_path", "RGB", (1079, 1080)),
+        ("stress-mask-size", "stress_mask_path", "L", (1080, 1079)),
+    ):
+        artifact = Path(view[artifact_field])
+        original = artifact.read_bytes()
+        Image.new(mode, size).save(artifact)
+        assert (
+            _validate_registry_graph(root, contract, "a" * 64, rows) is False
+        ), label
+        artifact.write_bytes(original)
+
+    audit_mutations = (
+        ("deformation-status", "deformation_json_path", ("status",), "failed"),
+        ("task-status", "task_json_path", ("status",), "failed"),
+        (
+            "semantic-gate",
+            "deformation_json_path",
+            ("attempts", 0, "semantic", "passes_gate"),
+            False,
+        ),
+        (
+            "preservation-gate",
+            "deformation_json_path",
+            ("attempts", 0, "preservation", "passes_gate"),
+            False,
+        ),
+        (
+            "camera-preserved",
+            "deformation_json_path",
+            ("attempts", 0, "semantic", "camera_preserved"),
+            False,
+        ),
+        (
+            "outsole-preserved",
+            "deformation_json_path",
+            ("attempts", 0, "semantic", "outsole_preserved"),
+            False,
+        ),
+        (
+            "selected-attempt",
+            "deformation_json_path",
+            ("selected_attempt_id",),
+            "missing",
+        ),
+        (
+            "fit-relation",
+            "deformation_json_path",
+            ("attempts", 0, "comparison", "relation"),
+            "fabricated",
+        ),
+        (
+            "metrics-cross-check",
+            "metrics_json_path",
+            ("after", "fit_score"),
+            999.0,
+        ),
+    )
+    for label, field, keys, replacement in audit_mutations:
+        artifact = Path(view[field])
+        original = artifact.read_bytes()
+        payload = json.loads(original)
+        target = payload
+        for key in keys[:-1]:
+            target = target[key]
+        target[keys[-1]] = replacement
+        artifact.write_text(json.dumps(payload))
+        assert (
+            _validate_registry_graph(root, contract, "a" * 64, rows) is False
+        ), label
+        artifact.write_bytes(original)
+
+    manifest = json.loads(manifest_bytes)
+    manifest["shoes"][0]["views"][0]["quality"]["semantic_gate"] = False
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    assert _validate_registry_graph(root, contract, "a" * 64, rows) is False
+    manifest_path.write_bytes(manifest_bytes)
+    assert _validate_registry_graph(root, contract, "a" * 64, rows) is True
 
 
 def test_independent_frozen_manifest_fixture_is_exact_and_byte_stable(tmp_path: Path) -> None:
@@ -98,6 +313,23 @@ def test_independent_frozen_manifest_fixture_is_exact_and_byte_stable(tmp_path: 
     assert len({row["source_mask_path"] for row in source_views}) == 64
     assert len({row["source_sha256"] for row in source_views}) == 64
     assert len({row["source_mask_sha256"] for row in source_views}) == 64
+    assert Path(source_manifest["stress_root"]).is_relative_to(tmp_path / "one")
+    assert all(
+        all(
+            row[field] is not None
+            for field in (
+                "stress_path",
+                "stress_mask_path",
+                "deformation_json_path",
+                "metrics_json_path",
+                "task_json_path",
+                "stress_sha256",
+                "stress_mask_sha256",
+                "quality",
+            )
+        )
+        for row in source_views
+    )
     assert len(states) == 864
     assert sum(row["track"] == "controlled" for row in states) == 848
     assert sum(row["track"] == "stress" for row in states) == 16
@@ -172,13 +404,60 @@ def _metric_row(
         "s11": .8,
         "s11_first_to_second_overlap": .8,
         "s11_second_to_first_overlap": .8,
+        **{
+            f"{prefix}_{field}": None
+            for prefix in ("first", "second")
+            for field in (
+                "semantic_gate",
+                "preservation_gate",
+                "camera_preserved",
+                "outsole_preserved",
+                "fit_relation",
+            )
+        },
         **extra,
     }
 
 
 def _write_frozen_metric_tables(root: Path, contract: object, design: object, config_hash: str) -> dict[str, Path]:
     controlled = [_metric_row(asdict(condition), variant, config_hash, analysis_track="controlled") for condition in design.controlled_conditions for variant in design.feature_variants]
-    stress = [_metric_row(asdict(condition), variant, config_hash, analysis_track="stress") for condition in design.stress_conditions for variant in design.feature_variants]
+    source_manifest = json.loads(
+        (root / "manifests" / "adjacent16_manifest.json").read_text()
+    )
+    quality_by_view = {
+        (shoe["shoe_id"], view["view_id"]): view["quality"]
+        for shoe in source_manifest["shoes"]
+        for view in shoe["views"]
+    }
+    stress = []
+    for condition in design.stress_conditions:
+        record = asdict(condition)
+        quality_columns = {
+            f"{prefix}_{field}": quality_by_view[
+                condition.shoe_id, view_id
+            ][field]
+            for prefix, view_id in (
+                ("first", condition.first_view),
+                ("second", condition.second_view),
+            )
+            for field in (
+                "semantic_gate",
+                "preservation_gate",
+                "camera_preserved",
+                "outsole_preserved",
+                "fit_relation",
+            )
+        }
+        for variant in design.feature_variants:
+            stress.append(
+                _metric_row(
+                    record,
+                    variant,
+                    config_hash,
+                    analysis_track="stress",
+                    **quality_columns,
+                )
+            )
     calibration_variants = [variant for variant in design.feature_variants if variant.key in contract.geometry_calibration_variant_keys]
     calibration = []
     kind_map = {"rotation": "rotation_degrees", "relative_translation": "relative_translation", "depth_scale": "depth_scale", "relative_depth_noise": "relative_depth_noise_std"}
@@ -215,6 +494,60 @@ def test_independent_metric_fixture_has_all_frozen_rows_and_unique_keys(tmp_path
     assert set(controlled.loc[controlled.corruption == "identity_swap", "severity"]) == {1.0}
     assert set(controlled.variant_key) == {variant.key for variant in design.feature_variants}
     assert set(calibration.perturbation_kind) == {"rotation", "relative_translation", "depth_scale", "relative_depth_noise"}
+    assert stress[
+        [
+            "first_semantic_gate",
+            "first_preservation_gate",
+            "first_camera_preserved",
+            "first_outsole_preserved",
+            "second_semantic_gate",
+            "second_preservation_gate",
+            "second_camera_preserved",
+            "second_outsole_preserved",
+        ]
+    ].to_numpy(dtype=bool).all()
+    assert set(stress["first_fit_relation"]) == set(stress["second_fit_relation"]) == {
+        "equivalent"
+    }
+
+
+def test_metric_validation_rejects_stress_quality_that_differs_from_source_view(
+    tmp_path: Path,
+) -> None:
+    """Catch final validation accepting worker quality detached from its audit."""
+
+    root = tmp_path / "run"
+    _paths, contract, design = _write_frozen_manifest_fixture(root)
+    tables = _write_frozen_metric_tables(root, contract, design, "a" * 64)
+    frames = {
+        track: pd.read_parquet(path)
+        for track, path in tables.items()
+    }
+    assert _validate_metric_keys(root, frames, contract) is True
+
+    row = frames["stress"].index[0]
+    columns = tuple(
+        f"{prefix}_{field}"
+        for prefix in ("first", "second")
+        for field in (
+            "semantic_gate",
+            "preservation_gate",
+            "camera_preserved",
+            "outsole_preserved",
+            "fit_relation",
+        )
+    )
+    for column in columns:
+        original = frames["stress"].loc[row, column]
+        frames["stress"].loc[row, column] = (
+            "worsened" if column.endswith("fit_relation") else not bool(original)
+        )
+        assert _validate_metric_keys(root, frames, contract) is False, column
+        frames["stress"].loc[row, column] = original
+    missing = dict(frames)
+    missing["stress"] = frames["stress"].drop(columns=["second_fit_relation"])
+    assert _validate_metric_keys(root, missing, contract) is False
+    assert _validate_metric_keys(root, frames, contract) is True
 
 
 def _final_gate_fixture(tmp_path: Path) -> dict[str, object]:
@@ -330,17 +663,36 @@ def test_independent_frozen_fixture_passes_the_real_final_gate(tmp_path: Path) -
     report_path = root / "reports" / "adjacent16_final_gate.json"
     first_bytes = report_path.read_bytes()
     provenance = json.loads(first_bytes)
-    assert all(provenance[name] for name in ("config_sha256", "registry_sha256", "manifest_sha256", "metric_input_sha256", "output_sha256"))
+    assert all(
+        provenance[name]
+        for name in (
+            "config_sha256",
+            "registry_sha256",
+            "manifest_sha256",
+            "adjacent_manifest_sha256",
+            "stress_audit_sha256",
+            "metric_input_sha256",
+            "output_sha256",
+        )
+    )
     assert validate_adjacent16_final_gate(root) == report
     assert report_path.read_bytes() == first_bytes
     controlled_path = fixture["metrics"]["controlled"]
     controlled = pd.read_parquet(controlled_path)
     controlled.loc[0, "score"] = .81
     controlled.to_parquet(controlled_path, index=False)
+    source_manifest = json.loads(
+        (root / "manifests" / "adjacent16_manifest.json").read_text()
+    )
+    task_path = Path(source_manifest["shoes"][0]["views"][0]["task_json_path"])
+    task_path.write_text(
+        json.dumps(json.loads(task_path.read_text()), indent=2, sort_keys=True) + "\n"
+    )
     changed = validate_adjacent16_final_gate(root)
     changed_provenance = json.loads(report_path.read_text())
     assert changed.passed is True
     assert changed_provenance["metric_input_sha256"] != provenance["metric_input_sha256"]
+    assert changed_provenance["stress_audit_sha256"] != provenance["stress_audit_sha256"]
 
 
 def test_controlled_complete_series_uses_adjacent_whole_series_threshold(tmp_path: Path) -> None:
