@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import torch
+from PIL import Image
 
 import met3r.adjacent16_gate as adjacent16_gate
 from met3r.adjacent16_gate import validate_adjacent16_geometry_preflight
@@ -136,36 +137,49 @@ def _canonical_preflight_run(tmp_path: Path) -> Path:
     (root / "run_manifest.json").write_text(json.dumps({"experiment_id": "20260727_adjacent16_core_v1", "config_sha256": config_hash}))
     raw = json.loads(config)
     registry = JobRegistry(root / "registry/jobs.sqlite")
-    source = root / "source.rgb"
-    source.write_bytes(b"canonical-source")
-    source_hash = sha256_file(source)
     conditions: list[dict[str, object]] = []
+    records: list[dict[str, object]] = []
     views_by_q = {item["quartet_id"]: item["view_ids"] for item in raw["quartets"]}
     mask = np.ones((4, 504, 504), dtype=bool)
     depth = np.ones((4, 504, 504), dtype=np.float32)
     confidence = np.broadcast_to(np.linspace(0.0, 1.0, 504, dtype=np.float32), (4, 504, 504)).copy()
     for shoe in raw["shoes"]:
         for quartet, views in views_by_q.items():
+            source_records: dict[str, dict[str, object]] = {}
+            for position, view in enumerate(views):
+                rgb = root / "sources" / shoe / quartet / f"{view}.png"
+                source_mask = root / "sources" / shoe / quartet / f"{view}.mask.png"
+                rgb.parent.mkdir(parents=True, exist_ok=True)
+                Image.new("RGB", (1080, 1080), (int(view) % 255, position * 31, 127)).save(rgb)
+                Image.new("L", (1080, 1080), 255).save(source_mask)
+                item = {"shoe_id": shoe, "quartet_id": quartet, "view_id": view, "orbit_position": position,
+                        "source_rgb_path": str(rgb.resolve()), "source_mask_path": str(source_mask.resolve()),
+                        "source_rgb_sha256": sha256_file(rgb), "source_mask_sha256": sha256_file(source_mask),
+                        "camera_azimuth_deg": float(position * 7.5), "processed_correlation": 1.0}
+                records.append(item)
+                source_records[view] = item
             camera_dir = root / "cameras" / shoe / quartet
             camera_dir.mkdir(parents=True)
             extrinsics = np.broadcast_to(np.eye(4), (4, 4, 4)).copy()
             intrinsics = np.broadcast_to(np.array([[504.0, 0.0, 251.5], [0.0, 504.0, 251.5], [0.0, 0.0, 1.0]]), (4, 3, 3)).copy()
             np.savez_compressed(camera_dir / "cameras.npz", extrinsics=extrinsics, intrinsics=intrinsics, mask=mask, view_ids=np.asarray(views), camera_groups=np.asarray(["upper"] * 4))
-            (camera_dir / "images.json").write_text(json.dumps([str(source)] * 4))
-            (camera_dir / "metadata.json").write_text(json.dumps({"camera_mode": "fixed/precomputed DA3 cameras (not calibrated GT)", "camera_provenance": "dense_camera_outputs", "camera_groups": ["upper"] * 4, "view_ids": views, "source_hashes": {view: {"rgb": source_hash, "mask": "0" * 64} for view in views}}))
+            (camera_dir / "images.json").write_text(json.dumps([source_records[view]["source_rgb_path"] for view in views]))
+            (camera_dir / "metadata.json").write_text(json.dumps({"camera_mode": "fixed/precomputed DA3 cameras (not calibrated GT)", "camera_provenance": "dense_camera_outputs", "camera_groups": ["upper"] * 4, "view_ids": views, "source_hashes": {view: {"rgb": source_records[view]["source_rgb_sha256"], "mask": source_records[view]["source_mask_sha256"]} for view in views}}))
             state = f"controlled__{shoe}__{quartet}__clean"
             output = root / "geometry" / "calibration" / state
             output.mkdir(parents=True)
             np.savez_compressed(output / "depth_geometry.npz", depth=depth, confidence=confidence, mask=mask, extrinsics=extrinsics, intrinsics=intrinsics, meta__artifact_type=np.asarray("fixed_camera_depth"), meta__camera_provenance=np.asarray("fixed_precomputed_da3"), meta__view_ids=np.asarray(views), meta__camera_groups=np.asarray(["upper"] * 4))
+            (output / "depth_geometry.json").write_text("{}")
             payload = {"job_type": "geometry_calibration", "shoe_id": shoe, "quartet_id": quartet, "config_sha256": config_hash, "camera_path": str((camera_dir / "cameras.npz").resolve()), "output_dir": str(output.resolve())}
             job_id = f"geometry__geometry_calibration__{state}"
             registry.register(JobDefinition(job_id, "geometry", payload))
             with sqlite3.connect(registry.path) as connection:
-                connection.execute("UPDATE jobs SET state='completed', output_manifest_json=? WHERE job_id=?", (json.dumps({"files": [{"path": str((output / "depth_geometry.npz").resolve()), "sha256": sha256_file(output / "depth_geometry.npz")}]}), job_id))
+                connection.execute("UPDATE jobs SET state='completed', output_manifest_json=? WHERE job_id=?", (json.dumps({"files": [{"path": str(path.resolve()), "sha256": sha256_file(path)} for path in (output / "depth_geometry.npz", output / "depth_geometry.json")]}), job_id))
             for first_index, first in enumerate(views):
                 for second in views[first_index + 1:]:
                     conditions.append({"track": "controlled", "shoe_id": shoe, "quartet_id": quartet, "pair_id": f"{shoe}__{quartet}__{first}__{second}", "first_view": first, "second_view": second, "baseline_steps": 1, "angular_separation_deg": 7.5, "changed_view": None, "corruption": "clean", "severity": 0.0})
     (root / "manifests").mkdir(parents=True)
+    (root / "manifests/adjacent16_manifest.json").write_text(json.dumps(records, sort_keys=True))
     (root / "manifests/pair_conditions.jsonl").write_text("".join(json.dumps(row) + "\n" for row in conditions))
     return root
 
@@ -201,7 +215,8 @@ def test_geometry_preflight_accepts_canonical_task6_task7_fixture_and_is_idempot
     arrays["confidence"][0, 0, 0] = 0.123
     np.savez_compressed(geometry, **arrays)
     with sqlite3.connect(root / "registry/jobs.sqlite") as connection:
-        connection.execute("UPDATE jobs SET output_manifest_json=? WHERE job_id LIKE ?", (json.dumps({"files": [{"path": str(geometry.resolve()), "sha256": sha256_file(geometry)}]}), "%q0__clean"))
+        geometry_json = geometry.with_suffix(".json")
+        connection.execute("UPDATE jobs SET output_manifest_json=? WHERE job_id LIKE ?", (json.dumps({"files": [{"path": str(path.resolve()), "sha256": sha256_file(path)} for path in (geometry, geometry_json)]}), "%q0__clean"))
     changed = validate_adjacent16_geometry_preflight(root)
     changed_provenance = json.loads((root / "reports/geometry_preflight.json").read_text())
     assert changed.passed is True
