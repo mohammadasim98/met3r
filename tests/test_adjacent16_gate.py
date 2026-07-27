@@ -919,7 +919,7 @@ def test_runtime_projection_rejects_missing_ambiguous_or_unclassifiable_sentinel
             connection.execute("UPDATE jobs SET payload_json=?, payload_hash=? WHERE job_id=?", (canonical, hashlib.sha256(canonical.encode()).hexdigest(), target))
     report = validate_timed_runtime_projection(root)
     assert report.passed is False
-    assert report.failed_checks == ("runtime_validation",)
+    assert report.failed_checks == ("runtime_graph",)
 
 
 def test_final_gate_reports_missing_inputs_as_failed_evidence(tmp_path: Path) -> None:
