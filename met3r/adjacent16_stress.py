@@ -215,10 +215,11 @@ def _run_one_task(
                 environment = os.environ.copy()
                 environment["CUDA_VISIBLE_DEVICES"] = str(task.physical_gpu)
                 with gpu_claim:
-                    completed = subprocess.run(
-                        command, cwd=_BYTESIZE_RECONSTRUCTION, env=environment,
-                        text=True, capture_output=True, check=False,
-                    )
+                    with _machine_gpu_claim(task.physical_gpu):
+                        completed = subprocess.run(
+                            command, cwd=_BYTESIZE_RECONSTRUCTION, env=environment,
+                            text=True, capture_output=True, check=False,
+                        )
                 shutil.copy2(task.mask_path, staging / "source_mask.png")
                 accepted, acceptance = _accepted(staging, completed.returncode)
                 record = _task_record(task, fingerprint, command, outer_attempt, acceptance, completed.returncode, run_id)
@@ -286,12 +287,19 @@ def _promote(staging: Path, output_dir: Path, task: StressTask, fingerprint: str
     if not output_dir.exists():
         os.replace(staging, output_dir)
         return
-    _rename_exchange(staging, output_dir)
-    # Exchange leaves the old canonical at staging, where it can be retained
-    # immutably instead of being deleted after a successful replacement.
     archive = output_dir.parent / "superseded_accepted" / fingerprint / f"run_{run_id}"
     archive.parent.mkdir(parents=True, exist_ok=True)
+    # Move the candidate into its final immutable archive slot *before* the
+    # one commit operation.  After exchange, that same slot already contains
+    # the old accepted directory; there is no fallible post-commit move.
     os.replace(staging, archive)
+    try:
+        _rename_exchange(archive, output_dir)
+    except Exception:
+        # Exchange has not committed: old canonical is still canonical.  Put
+        # the candidate back where the caller's rejected archive path expects.
+        os.replace(archive, staging)
+        raise
 
 
 def _archive_rejected(
@@ -369,6 +377,10 @@ def _implementation_hash() -> str:
 
 
 def _bytesize_fingerprint() -> Mapping[str, object]:
+    return _bytesize_fingerprint_impl()
+
+
+def _bytesize_fingerprint_impl() -> Mapping[str, object]:
     def git(*args: str) -> str:
         process = subprocess.Popen(
             ["git", "-C", str(_BYTESIZE_RECONSTRUCTION), *args],
@@ -378,17 +390,30 @@ def _bytesize_fingerprint() -> Mapping[str, object]:
         if process.returncode:
             raise RuntimeError(f"cannot fingerprint ByteSize: {stderr.strip()}")
         return stdout
-    untracked = git("ls-files", "--others", "--exclude-standard", "-z").split("\0")
+    top_level = Path(git("rev-parse", "--show-toplevel").strip()).resolve()
+
+    def top_git(*args: str) -> str:
+        process = subprocess.Popen(
+            ["git", "-C", str(top_level), *args],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        stdout, stderr = process.communicate()
+        if process.returncode:
+            raise RuntimeError(f"cannot fingerprint ByteSize: {stderr.strip()}")
+        return stdout
+
+    untracked = top_git("ls-files", "--others", "--exclude-standard", "-z").split("\0")
     untracked_hashes = {
-        name: _sha256(_BYTESIZE_RECONSTRUCTION / name)
-        for name in untracked if name and (_BYTESIZE_RECONSTRUCTION / name).is_file()
+        name: _sha256(top_level / name)
+        for name in untracked if name and (top_level / name).is_file()
     }
-    status = git("status", "--porcelain=v1")
+    status = top_git("status", "--porcelain=v1")
     return {
-        "repository": str(_BYTESIZE_RECONSTRUCTION), "head": git("rev-parse", "HEAD").strip(),
+        "repository": str(top_level), "reconstruction": str(_BYTESIZE_RECONSTRUCTION.resolve()),
+        "head": top_git("rev-parse", "HEAD").strip(),
         "dirty": bool(status), "status_porcelain_v1": status.splitlines(),
-        "unstaged_binary_diff_sha256": hashlib.sha256(git("diff", "--no-ext-diff", "--binary").encode()).hexdigest(),
-        "staged_binary_diff_sha256": hashlib.sha256(git("diff", "--cached", "--no-ext-diff", "--binary").encode()).hexdigest(),
+        "unstaged_binary_diff_sha256": hashlib.sha256(top_git("diff", "--no-ext-diff", "--binary").encode()).hexdigest(),
+        "staged_binary_diff_sha256": hashlib.sha256(top_git("diff", "--cached", "--no-ext-diff", "--binary").encode()).hexdigest(),
         "untracked_file_sha256": untracked_hashes,
         "last_view_match_tree_sha256": _tree_hash(_BYTESIZE_RECONSTRUCTION / "last_view_match"),
         "shoe_deform_tree_sha256": _tree_hash(_BYTESIZE_RECONSTRUCTION / "shoe_deform"),
@@ -543,6 +568,21 @@ def _output_claim(output_dir: Path):
                 yield
             finally:
                 fcntl.flock(claim.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def _machine_gpu_claim(physical_gpu: int):
+    """Machine-global physical-GPU exclusion held only for shoe_deform."""
+
+    import fcntl
+
+    claim_path = Path("/tmp") / f"met3r-adjacent16-physical-gpu-{physical_gpu}.lock"
+    with claim_path.open("a+") as claim:
+        fcntl.flock(claim.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(claim.fileno(), fcntl.LOCK_UN)
 
 
 def _rename_exchange(first: Path, second: Path) -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -328,6 +329,98 @@ def test_gpu_queues_allow_at_most_one_subprocess_per_physical_gpu(
     tasks = tuple(_task(tmp_path, index) for index in range(8))
     assert run_stress_tasks(tasks, max_parallel=4, max_outer_attempts=1)["accepted"] == 8
     assert maximum == {"0": 1, "1": 1, "2": 1, "3": 1}
+
+
+def test_machine_gpu_claim_serializes_independent_invocations(tmp_path: Path, monkeypatch) -> None:
+    first = _task(tmp_path / "first", 0)
+    second = _task(tmp_path / "second", 0)
+    active = 0
+    maximum = 0
+    state_lock = threading.Lock()
+
+    def fake_run(args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal active, maximum
+        with state_lock:
+            active += 1
+            maximum = max(maximum, active)
+        time.sleep(0.08)
+        _accepted_artifacts(Path(args[args.index("--output-dir") + 1]))
+        with state_lock:
+            active -= 1
+        class Result: returncode = 0
+        return Result()
+
+    monkeypatch.setattr("met3r.adjacent16_stress.subprocess.run", fake_run)
+    threads = [threading.Thread(target=run_stress_tasks, args=((task,),), kwargs={"max_outer_attempts": 1}) for task in (first, second)]
+    for thread in threads: thread.start()
+    for thread in threads: thread.join()
+    assert maximum == 1
+
+
+def test_bytesize_fingerprint_uses_git_toplevel_and_all_repo_changes(tmp_path: Path, monkeypatch) -> None:
+    import met3r.adjacent16_stress as stress
+    original = stress._bytesize_fingerprint_impl
+    repository = tmp_path / "repo"
+    reconstruction = repository / "Reconstruction"
+    (reconstruction / "last_view_match").mkdir(parents=True)
+    (reconstruction / "shoe_deform").mkdir()
+    (reconstruction / "last_view_match/render.py").write_text("render = 1\n")
+    (reconstruction / "shoe_deform/__init__.py").write_text("shoe = 1\n")
+    tracked = reconstruction / "tracked.txt"
+    tracked.write_text("base\n")
+    for args in (("init",), ("config", "user.email", "test@example.invalid"), ("config", "user.name", "Test"), ("add", "."), ("commit", "-m", "base")):
+        subprocess.run(["git", *args], cwd=repository, check=True, capture_output=True, text=True)
+    monkeypatch.setattr(stress, "_BYTESIZE_RECONSTRUCTION", reconstruction)
+
+    baseline = original()
+    tracked.write_text("unstaged\n")
+    unstaged = original()
+    subprocess.run(["git", "add", "Reconstruction/tracked.txt"], cwd=repository, check=True)
+    staged = original()
+    parent_untracked = repository / "parent-untracked.txt"
+    parent_untracked.write_text("one\n")
+    untracked_one = original()
+    parent_untracked.write_text("two\n")
+    untracked_two = original()
+
+    assert baseline["repository"] == str(repository.resolve())
+    assert baseline != unstaged != staged
+    assert untracked_one != untracked_two
+    assert untracked_two["untracked_file_sha256"]["parent-untracked.txt"]
+
+
+def test_exchange_commits_old_accepted_directory_without_post_exchange_move(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import met3r.adjacent16_stress as stress
+
+    output = tmp_path / "deformation"
+    staging = tmp_path / ".staging"
+    output.mkdir()
+    staging.mkdir()
+    (output / "task.json").write_text(json.dumps({"status": "accepted", "old": True}))
+    (staging / "task.json").write_text(json.dumps({"status": "accepted", "new": True}))
+    real_exchange = stress._rename_exchange
+    exchanged = False
+    real_replace = stress.os.replace
+
+    def mark_exchange(left, right):  # type: ignore[no-untyped-def]
+        nonlocal exchanged
+        real_exchange(left, right)
+        exchanged = True
+
+    def fail_after_exchange(left, right):  # type: ignore[no-untyped-def]
+        if exchanged:
+            raise AssertionError("post-exchange move must not occur")
+        real_replace(left, right)
+
+    monkeypatch.setattr(stress, "_rename_exchange", mark_exchange)
+    monkeypatch.setattr(stress.os, "replace", fail_after_exchange)
+    stress._promote(staging, output, _task(tmp_path), "fingerprint", "run")
+
+    assert json.loads((output / "task.json").read_text())["new"] is True
+    archived = output.parent / "superseded_accepted/fingerprint/run_run/task.json"
+    assert json.loads(archived.read_text())["old"] is True
 
 
 @pytest.mark.parametrize("field", ("camera", "background", "crop"))
