@@ -254,21 +254,48 @@ def _valid_output_manifest(row: _RegistryRow, root: Path) -> bool:
     if not isinstance(files, list) or not files:
         return False
     seen: set[Path] = set()
+    output_dir = row.payload.get("output_dir")
+    job_type = row.payload.get("job_type")
+    feature_track = row.payload.get("feature_track")
+    expected: set[Path] = set()
+    if job_type in {"stress_geometry", "geometry_calibration"}:
+        if not isinstance(output_dir, str):
+            return False
+        base = Path(output_dir).resolve()
+        expected = {base / "depth_geometry.npz", base / "depth_geometry.json"}
+    elif job_type in {"feature", "stress", "geometry_calibration_feature"}:
+        track = "geometry_calibration" if job_type == "geometry_calibration_feature" else feature_track
+        if not isinstance(track, str):
+            return False
+        expected = {root / "metrics" / "parts" / track / f"{row.job_id}.parquet"}
+    else:
+        return False
     for entry in files:
         if not isinstance(entry, Mapping):
             return False
-        raw_path, expected = entry.get("path"), entry.get("sha256")
-        if not isinstance(raw_path, str) or not isinstance(expected, str) or len(expected) != 64:
+        raw_path, expected_hash = entry.get("path"), entry.get("sha256")
+        if not isinstance(raw_path, str) or not isinstance(expected_hash, str) or len(expected_hash) != 64:
             return False
         path = Path(raw_path).resolve()
         try:
             path.relative_to(root)
         except ValueError:
             return False
-        if path in seen or not path.is_file() or sha256_file(path) != expected:
+        if path in seen or not path.is_file() or sha256_file(path) != expected_hash:
             return False
+        if job_type in {"stress_geometry", "geometry_calibration"}:
+            try:
+                path.relative_to(base)
+            except ValueError:
+                return False
+        elif path not in expected:
+            visual = root / "visualizations" / row.job_id
+            try:
+                path.relative_to(visual)
+            except ValueError:
+                return False
         seen.add(path)
-    return True
+    return expected <= seen
 
 
 def _elapsed_seconds(row: _RegistryRow) -> float:
@@ -668,8 +695,9 @@ def write_timed_sentinel_manifest(run_root: str | Path) -> Path:
         if backup is not None:
             shutil.rmtree(backup)
     except Exception:
-        if destination.exists() and backup is not None and backup.exists():
-            shutil.rmtree(destination)
+        if backup is not None and backup.exists():
+            if destination.exists():
+                shutil.rmtree(destination)
             backup.rename(destination)
         raise
     finally:
@@ -710,10 +738,16 @@ def validate_timed_runtime_projection(run_root: str | Path) -> RuntimeProjection
     fixed_hours = 2.0
     class_seconds: dict[tuple[str, str], float] = {}
     try:
-        contract, _ = _load_contract(root)
+        contract, config_sha256 = _load_contract(root)
         rows = _registry_rows(root)
+        counts: dict[str, int] = defaultdict(int)
+        for row in rows:
+            counts[row.phase] += 1
+        if dict(counts) != _EXPECTED_REGISTRY_COUNTS or len(rows) != sum(_EXPECTED_REGISTRY_COUNTS.values()) or not _validate_registry_graph(root, contract, config_sha256, rows):
+            failures.add("runtime_graph")
+            raise ValueError("runtime registry differs from frozen graph")
         selected = _sentinel_jobs(root, contract, rows)
-        if any(row.state != "completed" for row in selected):
+        if any(row.state != "completed" or not _valid_output_manifest(row, root) for row in selected):
             failures.add("sentinel_job_state")
             raise ValueError("sentinel jobs must all be completed")
         states = _state_index(root)
@@ -722,7 +756,7 @@ def validate_timed_runtime_projection(run_root: str | Path) -> RuntimeProjection
         if len(class_seconds) != 13:
             raise ValueError("sentinel durations are unclassified or duplicated")
         geometry = [row for row in rows if row.phase == "geometry"]
-        if len(geometry) != _EXPECTED_REGISTRY_COUNTS["geometry"] or any(row.state != "completed" for row in geometry):
+        if len(geometry) != _EXPECTED_REGISTRY_COUNTS["geometry"] or any(row.state != "completed" or not _valid_output_manifest(row, root) for row in geometry):
             failures.add("geometry_job_state")
             raise ValueError("all frozen geometry jobs must complete before projection")
         for row in geometry:

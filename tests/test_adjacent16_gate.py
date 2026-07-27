@@ -151,11 +151,31 @@ def _final_gate_fixture(tmp_path: Path) -> dict[str, object]:
     marker.write_text("ok\n")
     registry = JobRegistry(root / "registry/jobs.sqlite")
     register_adjacent16_jobs(registry, root, design, digest)
-    marker_hash = __import__("hashlib").sha256(marker.read_bytes()).hexdigest()
+    _materialize_owned_outputs(root, registry)
     with sqlite3.connect(registry.path) as connection:
-        connection.execute("UPDATE jobs SET state='completed', attempts=1, output_manifest_json=?", (json.dumps({"files": [{"path": str(marker.resolve()), "sha256": marker_hash}]}),))
+        connection.execute("UPDATE jobs SET state='completed', attempts=1")
     metrics = _write_frozen_metric_tables(root, contract, design, digest)
     return {"root": root, "contract": contract, "design": design, "registry": registry, "metrics": metrics}
+
+
+def _materialize_owned_outputs(root: Path, registry: JobRegistry) -> None:
+    """Create lightweight, job-owned fixture outputs and matching manifests."""
+    with sqlite3.connect(registry.path) as connection:
+        rows = connection.execute("SELECT job_id, phase, payload_json FROM jobs").fetchall()
+        for job_id, phase, raw_payload in rows:
+            payload = json.loads(raw_payload)
+            if phase == "geometry":
+                directory = Path(payload["output_dir"])
+                paths = (directory / "depth_geometry.npz", directory / "depth_geometry.json")
+            else:
+                track = "geometry_calibration" if payload["job_type"] == "geometry_calibration_feature" else payload["feature_track"]
+                paths = (root / "metrics" / "parts" / track / f"{job_id}.parquet",)
+            files = []
+            for path in paths:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(job_id.encode())
+                files.append({"path": str(path.resolve()), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
+            connection.execute("UPDATE jobs SET output_manifest_json=? WHERE job_id=?", (json.dumps({"files": files}), job_id))
 
 
 _SUPPORT_FIELDS = ("shoe_id", "quartet_id", "pair_id", "changed_view", "corruption", "severity")
@@ -566,6 +586,19 @@ def test_final_gate_reports_exact_relative_raw_feature_artifact_paths(tmp_path: 
     assert report.raw_feature_artifacts == tuple(sorted(f"reports/{name}" for name in names))
 
 
+def test_final_gate_rejects_another_jobs_valid_output_part(tmp_path: Path) -> None:
+    fixture = _final_gate_fixture(tmp_path)
+    root = fixture["root"]
+    with sqlite3.connect(root / "registry" / "jobs.sqlite") as connection:
+        first, second = connection.execute("SELECT job_id, output_manifest_json FROM jobs WHERE phase='feature' ORDER BY job_id LIMIT 2").fetchall()
+        manifest = json.loads(second[1])
+        manifest["files"][0]["path"] = json.loads(first[1])["files"][0]["path"]
+        manifest["files"][0]["sha256"] = json.loads(first[1])["files"][0]["sha256"]
+        connection.execute("UPDATE jobs SET output_manifest_json=? WHERE job_id=?", (json.dumps(manifest), second[0]))
+    report = validate_adjacent16_final_gate(root)
+    assert "registry_output_hashes" in report.failed_checks
+
+
 def _frozen_config(root: Path) -> None:
     (root / "config").mkdir(parents=True)
     source = Path("configs/adjacent16_core.json")
@@ -649,6 +682,24 @@ def test_timed_sentinel_manifest_selects_exactly_the_registered_thirteen_jobs(
     assert not (directory / "stale.json").exists()
 
 
+def test_timed_sentinel_manifest_restores_old_tree_when_staging_rename_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _frozen_config(tmp_path)
+    _register_sentinel_jobs(tmp_path)
+    directory = write_timed_sentinel_manifest(tmp_path)
+    original = {path.name: path.read_bytes() for path in directory.iterdir()}
+    real_rename = Path.rename
+    def fail_staging(self: Path, target: Path) -> Path:
+        if self.name.startswith(".timed_sentinel.staging."):
+            raise OSError("forced staging rename failure")
+        return real_rename(self, target)
+    monkeypatch.setattr(Path, "rename", fail_staging)
+    with pytest.raises(OSError, match="forced staging"):
+        write_timed_sentinel_manifest(tmp_path)
+    assert {path.name: path.read_bytes() for path in directory.iterdir()} == original
+    assert not list(directory.parent.glob(".timed_sentinel.backup.*"))
+    assert not list(directory.parent.glob(".timed_sentinel.staging.*"))
+
+
 def test_runtime_projection_rejects_pending_or_untimed_sentinel_jobs(
     tmp_path: Path,
 ) -> None:
@@ -712,6 +763,7 @@ def test_production_runtime_fixture_persists_the_frozen_sentinel_projection(tmp_
     _paths, contract, design = _write_frozen_manifest_fixture(root)
     registry = JobRegistry(root / "registry" / "jobs.sqlite")
     register_adjacent16_jobs(registry, root, design, digest)
+    _materialize_owned_outputs(root, registry)
     assert registry.counts_by_phase() == {"feature": 3472, "geometry": 32}
 
     shoe = next(iter(contract.raw["shoes"]))
@@ -794,6 +846,7 @@ def _runtime_failure_fixture(tmp_path: Path, *, l_changed_seconds: float = 2.0) 
     _paths, _contract, design = _write_frozen_manifest_fixture(root)
     registry = JobRegistry(root / "registry" / "jobs.sqlite")
     register_adjacent16_jobs(registry, root, design, digest)
+    _materialize_owned_outputs(root, registry)
     ids = tuple(job_id for path in sorted(write_timed_sentinel_manifest(root).glob("*.json")) for job_id in json.loads(path.read_text())["job_ids"])
     start = "2026-01-01T00:00:00+00:00"
     with sqlite3.connect(registry.path) as connection:
