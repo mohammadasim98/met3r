@@ -18,6 +18,7 @@ from met3r.adjacent16_contract import load_adjacent16_contract
 from met3r.adjacent16_data import Adjacent16Manifest, AdjacentShoeRecord, AdjacentViewRecord
 from met3r.adjacent16_design import build_adjacent16_design
 from met3r.adjacent16_prepare import register_adjacent16_jobs
+from met3r.adjacent16_gate import validate_adjacent16_final_gate
 
 
 def _write_frozen_manifest_fixture(root: Path) -> tuple[tuple[Path, ...], object, object]:
@@ -134,6 +135,35 @@ def test_independent_metric_fixture_has_all_frozen_rows_and_unique_keys(tmp_path
     assert set(controlled.loc[controlled.corruption == "identity_swap", "severity"]) == {1.0}
     assert set(controlled.variant_key) == {variant.key for variant in design.feature_variants}
     assert set(calibration.perturbation_kind) == {"rotation", "relative_translation", "depth_scale", "relative_depth_noise"}
+
+
+def test_independent_frozen_fixture_passes_the_real_final_gate(tmp_path: Path) -> None:
+    """Catch divergence between compact fixture data and final-gate production contracts."""
+
+    root = tmp_path / "run"
+    config = Path("configs/adjacent16_core.json").read_bytes()
+    (root / "config").mkdir(parents=True)
+    (root / "config/frozen_config.json").write_bytes(config)
+    digest = __import__("hashlib").sha256(config).hexdigest()
+    (root / "run_manifest.json").write_text(json.dumps({"experiment_id": "20260727_adjacent16_core_v1", "config_sha256": digest}))
+    _paths, contract, design = _write_frozen_manifest_fixture(root)
+    marker = root / "reports" / "marker"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("ok\n")
+    registry = JobRegistry(root / "registry/jobs.sqlite")
+    register_adjacent16_jobs(registry, root, design, digest)
+    marker_hash = __import__("hashlib").sha256(marker.read_bytes()).hexdigest()
+    with sqlite3.connect(registry.path) as connection:
+        connection.execute("UPDATE jobs SET state='completed', attempts=1, output_manifest_json=?", (json.dumps({"files": [{"path": str(marker.resolve()), "sha256": marker_hash}]}),))
+    _write_frozen_metric_tables(root, contract, design, digest)
+
+    report = validate_adjacent16_final_gate(root)
+
+    assert report.passed is True
+    assert report.actual_rows == report.expected_rows == {"controlled": 31104, "geometry_calibration": 6528, "stress": 1152, "total": 38784}
+    assert report.controlled_complete_series_coverage == report.all_four_shoe_primary_cell_rate == 1.0
+    assert report.minimum_common_support_retention == report.stress_symmetric_pass_rate == 1.0
+    assert report.failed_checks == report.unexplained_jobs == report.raw_feature_artifacts == ()
 
 
 def _frozen_config(root: Path) -> None:
