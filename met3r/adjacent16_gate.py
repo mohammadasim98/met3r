@@ -1119,5 +1119,27 @@ def validate_adjacent16_final_gate(run_root: str | Path) -> Adjacent16FinalGateR
         stress_symmetric_pass_rate=stress_rate, raw_feature_artifacts=raw_features,
         unexplained_jobs=unexplained, failed_checks=tuple(sorted(failures)),
     )
-    _atomic_json(_json_safe(asdict(report)), root / "reports" / "adjacent16_final_gate.json")
+    provenance: dict[str, object] = {"config_sha256": None, "registry_sha256": None, "manifest_sha256": None, "metric_input_sha256": None, "output_sha256": None}
+    try:
+        config_path = root / "config" / "frozen_config.json"
+        provenance["config_sha256"] = sha256_file(config_path)
+        logical = [
+            {"job_id": row.job_id, "phase": row.phase, "state": row.state,
+             "payload_hash": row.payload_hash, "output_manifest": row.output_manifest}
+            for row in _registry_rows(root)
+        ]
+        provenance["registry_sha256"] = hashlib.sha256(json.dumps(logical, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        manifests = [root / "manifests" / name for name in ("image_states.jsonl", "pair_conditions.jsonl", "feature_variants.json")]
+        provenance["manifest_sha256"] = _tree_hash(root, manifests)
+        tables = [root / "metrics" / name for name in _TRACK_FILES.values()]
+        provenance["metric_input_sha256"] = _tree_hash(root, tables)
+        provenance["output_sha256"] = hashlib.sha256(json.dumps(_json_safe(asdict(report)), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    except (OSError, ValueError, TypeError, json.JSONDecodeError, sqlite3.Error):
+        failures.add("report_provenance")
+        report = Adjacent16FinalGateReport(**{**asdict(report), "passed": False, "failed_checks": tuple(sorted(failures))})
+    destination = root / "reports" / "adjacent16_final_gate.json"
+    payload = _json_safe({**asdict(report), **provenance})
+    _atomic_json(payload, destination)
+    if json.loads(destination.read_text(encoding="utf-8")) != payload:
+        raise RuntimeError("final gate report readback differs from persisted decision")
     return report

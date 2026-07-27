@@ -164,6 +164,20 @@ def test_independent_frozen_fixture_passes_the_real_final_gate(tmp_path: Path) -
     assert report.controlled_complete_series_coverage == report.all_four_shoe_primary_cell_rate == 1.0
     assert report.minimum_common_support_retention == report.stress_symmetric_pass_rate == 1.0
     assert report.failed_checks == report.unexplained_jobs == report.raw_feature_artifacts == ()
+    report_path = root / "reports" / "adjacent16_final_gate.json"
+    first_bytes = report_path.read_bytes()
+    provenance = json.loads(first_bytes)
+    assert all(provenance[name] for name in ("config_sha256", "registry_sha256", "manifest_sha256", "metric_input_sha256", "output_sha256"))
+    assert validate_adjacent16_final_gate(root) == report
+    assert report_path.read_bytes() == first_bytes
+    controlled_path = root / "metrics" / "controlled_fidelity.parquet"
+    controlled = pd.read_parquet(controlled_path)
+    controlled.loc[0, "score"] = .81
+    controlled.to_parquet(controlled_path, index=False)
+    changed = validate_adjacent16_final_gate(root)
+    changed_provenance = json.loads(report_path.read_text())
+    assert changed.passed is True
+    assert changed_provenance["metric_input_sha256"] != provenance["metric_input_sha256"]
 
 
 def _frozen_config(root: Path) -> None:
