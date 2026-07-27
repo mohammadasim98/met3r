@@ -22,8 +22,10 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
+from PIL import Image
 
 from .adjacent16_contract import Adjacent16Contract, load_adjacent16_contract
+from .adjacent16_data import camera_azimuths
 from .camera_metadata import CAMERA_MODE_LABEL
 from .geometry import confidence_percentile_mask
 from .job_registry import sha256_file
@@ -49,6 +51,33 @@ _FEATURE_CLASS_COUNTS = {
     "dinov3_vitb16": {"clean": 16, "changed": 832, "stress": 16, "calibration": 0},
     "dinov3_vitl16_pixal3d": {"clean": 16, "changed": 832, "stress": 16, "calibration": 16},
 }
+_ADJACENT_MANIFEST_KEYS = frozenset(
+    {"reconstruction_root", "stress_root", "shoes"}
+)
+_ADJACENT_SHOE_KEYS = frozenset({"shoe_id", "camera_dataset_id", "views"})
+_ADJACENT_VIEW_KEYS = frozenset(
+    {
+        "shoe_id",
+        "camera_dataset_id",
+        "quartet_id",
+        "view_id",
+        "orbit_position",
+        "source_path",
+        "source_mask_path",
+        "stress_path",
+        "stress_mask_path",
+        "deformation_json_path",
+        "metrics_json_path",
+        "task_json_path",
+        "processed_image_correlation",
+        "camera_azimuth_deg",
+        "source_sha256",
+        "source_mask_sha256",
+        "stress_sha256",
+        "stress_mask_sha256",
+        "quality",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -97,6 +126,21 @@ class _RegistryRow:
     finished_at: str | None
     output_manifest: Mapping[str, object] | None
     error: str | None
+
+
+@dataclass(frozen=True)
+class _ManifestViewEvidence:
+    shoe_id: str
+    camera_dataset_id: str
+    quartet_id: str
+    view_id: str
+    orbit_position: int
+    source_path: Path
+    source_mask_path: Path
+    source_sha256: str
+    source_mask_sha256: str
+    processed_image_correlation: float
+    camera_azimuth_deg: float
 
 
 def _atomic_bytes(content: bytes, destination: Path) -> Path:
@@ -314,15 +358,188 @@ def _elapsed_seconds(row: _RegistryRow) -> float:
     return seconds
 
 
-def _camera_arrays(root: Path, row: _RegistryRow) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, tuple[str, ...]]:
+def _canonical_source_path(value: object, *, label: str) -> Path:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{label} must be a non-empty path")
+    path = Path(value)
+    if not path.is_absolute() or str(path.resolve()) != value:
+        raise ValueError(f"{label} must be an absolute canonical path")
+    if not path.is_file():
+        raise ValueError(f"{label} does not exist")
+    return path
+
+
+def _source_manifest(
+    root: Path,
+    contract: Adjacent16Contract,
+) -> Mapping[tuple[str, str], tuple[_ManifestViewEvidence, ...]]:
+    path = root / "manifests" / "adjacent16_manifest.json"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, Mapping) or frozenset(raw) != _ADJACENT_MANIFEST_KEYS:
+        raise ValueError("adjacent source manifest has an unexpected top-level schema")
+    if (
+        raw.get("reconstruction_root") != str(contract.reconstruction_root)
+        or raw.get("stress_root") != str(contract.stress_root)
+    ):
+        raise ValueError("adjacent source manifest roots differ from the frozen contract")
+    raw_shoes = raw.get("shoes")
+    expected_shoes = contract.raw.get("shoes")
+    if not isinstance(raw_shoes, list) or not isinstance(expected_shoes, Mapping):
+        raise ValueError("adjacent source manifest shoes are malformed")
+    if len(raw_shoes) != len(expected_shoes):
+        raise ValueError("adjacent source manifest shoe count differs")
+
+    orbit_positions = {
+        view_id: position for position, view_id in enumerate(contract.camera_order)
+    }
+    expected_views = tuple(
+        (quartet.quartet_id, view_id)
+        for quartet in contract.quartets
+        for view_id in quartet.view_ids
+    )
+    by_unit: dict[tuple[str, str], tuple[_ManifestViewEvidence, ...]] = {}
+    source_paths: set[Path] = set()
+    source_mask_paths: set[Path] = set()
+    source_hashes: set[str] = set()
+    source_mask_hashes: set[str] = set()
+    source_size = contract.raw.get("source_size")
+    minimum_correlation = (
+        contract.raw.get("preflight", {}).get("minimum_processed_image_correlation")
+        if isinstance(contract.raw.get("preflight"), Mapping)
+        else None
+    )
+    if not isinstance(source_size, int) or not isinstance(
+        minimum_correlation, (int, float)
+    ):
+        raise ValueError("frozen source validation thresholds are malformed")
+
+    for raw_shoe, (shoe_id, camera_dataset_id) in zip(
+        raw_shoes, expected_shoes.items(), strict=True
+    ):
+        if (
+            not isinstance(raw_shoe, Mapping)
+            or frozenset(raw_shoe) != _ADJACENT_SHOE_KEYS
+            or raw_shoe.get("shoe_id") != shoe_id
+            or raw_shoe.get("camera_dataset_id") != camera_dataset_id
+        ):
+            raise ValueError("adjacent source shoe record differs from the contract")
+        raw_views = raw_shoe.get("views")
+        if not isinstance(raw_views, list) or len(raw_views) != len(expected_views):
+            raise ValueError("adjacent source shoe views are malformed")
+        grouped: dict[str, list[_ManifestViewEvidence]] = defaultdict(list)
+        for raw_view, (quartet_id, view_id) in zip(
+            raw_views, expected_views, strict=True
+        ):
+            if (
+                not isinstance(raw_view, Mapping)
+                or frozenset(raw_view) != _ADJACENT_VIEW_KEYS
+                or raw_view.get("shoe_id") != shoe_id
+                or raw_view.get("camera_dataset_id") != camera_dataset_id
+                or raw_view.get("quartet_id") != quartet_id
+                or raw_view.get("view_id") != view_id
+            ):
+                raise ValueError("adjacent source view record differs from the contract")
+            orbit_position = raw_view.get("orbit_position")
+            if (
+                isinstance(orbit_position, bool)
+                or not isinstance(orbit_position, int)
+                or orbit_position != orbit_positions[view_id]
+            ):
+                raise ValueError("adjacent source orbit position differs from the contract")
+            correlation = raw_view.get("processed_image_correlation")
+            azimuth = raw_view.get("camera_azimuth_deg")
+            if (
+                isinstance(correlation, bool)
+                or not isinstance(correlation, (int, float))
+                or not math.isfinite(float(correlation))
+                or float(correlation) < float(minimum_correlation)
+                or isinstance(azimuth, bool)
+                or not isinstance(azimuth, (int, float))
+                or not math.isfinite(float(azimuth))
+                or not 0.0 <= float(azimuth) < 360.0
+            ):
+                raise ValueError("adjacent source camera evidence is malformed")
+            source_path = _canonical_source_path(
+                raw_view.get("source_path"), label="source RGB"
+            )
+            source_mask_path = _canonical_source_path(
+                raw_view.get("source_mask_path"), label="source mask"
+            )
+            source_sha256 = raw_view.get("source_sha256")
+            source_mask_sha256 = raw_view.get("source_mask_sha256")
+            if (
+                not isinstance(source_sha256, str)
+                or len(source_sha256) != 64
+                or sha256_file(source_path) != source_sha256
+                or not isinstance(source_mask_sha256, str)
+                or len(source_mask_sha256) != 64
+                or sha256_file(source_mask_path) != source_mask_sha256
+            ):
+                raise ValueError("adjacent source content hash validation failed")
+            with Image.open(source_path) as image:
+                if image.mode != "RGB" or image.size != (source_size, source_size):
+                    raise ValueError("adjacent source RGB dimensions or mode differ")
+            with Image.open(source_mask_path) as image:
+                if image.size != (source_size, source_size):
+                    raise ValueError("adjacent source mask dimensions differ")
+            evidence = _ManifestViewEvidence(
+                shoe_id=shoe_id,
+                camera_dataset_id=str(camera_dataset_id),
+                quartet_id=quartet_id,
+                view_id=view_id,
+                orbit_position=orbit_position,
+                source_path=source_path,
+                source_mask_path=source_mask_path,
+                source_sha256=source_sha256,
+                source_mask_sha256=source_mask_sha256,
+                processed_image_correlation=float(correlation),
+                camera_azimuth_deg=float(azimuth),
+            )
+            grouped[quartet_id].append(evidence)
+            source_paths.add(source_path)
+            source_mask_paths.add(source_mask_path)
+            source_hashes.add(source_sha256)
+            source_mask_hashes.add(source_mask_sha256)
+        for quartet in contract.quartets:
+            records = tuple(grouped.get(quartet.quartet_id, ()))
+            if tuple(record.view_id for record in records) != quartet.view_ids:
+                raise ValueError("adjacent source quartet order differs")
+            by_unit[shoe_id, quartet.quartet_id] = records
+
+    expected_source_count = len(expected_shoes) * len(expected_views)
+    if not all(
+        len(values) == expected_source_count
+        for values in (
+            source_paths,
+            source_mask_paths,
+            source_hashes,
+            source_mask_hashes,
+        )
+    ):
+        raise ValueError("adjacent source paths and hashes must be globally unique")
+    return by_unit
+
+
+def _camera_arrays(
+    root: Path,
+    row: _RegistryRow,
+    records: Sequence[_ManifestViewEvidence],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, tuple[str, ...]]:
     raw_camera = row.payload.get("camera_path")
     if not isinstance(raw_camera, str):
         raise ValueError("geometry job has no camera path")
     camera_path = Path(raw_camera).resolve()
-    try:
-        camera_path.relative_to(root / "cameras")
-    except ValueError as error:
-        raise ValueError("geometry camera path escapes run root") from error
+    if len(records) != 4:
+        raise ValueError("camera source binding requires four manifest records")
+    expected_camera_path = (
+        root
+        / "cameras"
+        / records[0].shoe_id
+        / records[0].quartet_id
+        / "cameras.npz"
+    )
+    if camera_path != expected_camera_path:
+        raise ValueError("geometry camera path differs from the source manifest unit")
     camera_root = camera_path.parent
     if {
         path.name for path in camera_root.iterdir() if path.is_file()
@@ -349,23 +566,51 @@ def _camera_arrays(root: Path, row: _RegistryRow) -> tuple[np.ndarray, np.ndarra
     ):
         raise ValueError("camera artifact is malformed")
     source_hashes = metadata.get("source_hashes")
+    expected_views = tuple(record.view_id for record in records)
     if (
         metadata.get("camera_mode") != CAMERA_MODE_LABEL
         or metadata.get("camera_provenance") != "dense_camera_outputs"
         or metadata.get("camera_groups") != ["upper"] * 4
         or metadata.get("view_ids") != list(view_ids)
         or not isinstance(source_hashes, Mapping)
+        or frozenset(source_hashes) != frozenset(expected_views)
+        or view_ids != expected_views
+        or images != [str(record.source_path) for record in records]
     ):
         raise ValueError("camera metadata provenance differs from frozen artifact")
-    for view_id, raw_image in zip(view_ids, images, strict=True):
-        record = source_hashes.get(view_id)
+    expected_camera_masks: list[np.ndarray] = []
+    for manifest_record, raw_image in zip(records, images, strict=True):
+        record = source_hashes.get(manifest_record.view_id)
         if (
             not isinstance(raw_image, str) or not isinstance(record, Mapping)
-            or not isinstance(record.get("rgb"), str) or len(str(record.get("rgb"))) != 64
-            or not isinstance(record.get("mask"), str) or len(str(record.get("mask"))) != 64
-            or not Path(raw_image).is_file() or sha256_file(raw_image) != record.get("rgb")
+            or frozenset(record) != {"rgb", "mask"}
+            or record.get("rgb") != manifest_record.source_sha256
+            or record.get("mask") != manifest_record.source_mask_sha256
         ):
             raise ValueError("camera source hash validation failed")
+        with Image.open(manifest_record.source_mask_path) as image:
+            expected_camera_masks.append(
+                np.asarray(
+                    image.convert("L").resize(
+                        (504, 504), Image.Resampling.NEAREST
+                    )
+                )
+                > 127
+            )
+    if not np.array_equal(camera_mask, np.stack(expected_camera_masks)):
+        raise ValueError("camera masks differ from resized source masks")
+    derived_azimuths = camera_azimuths(extrinsics)
+    expected_azimuths = np.asarray(
+        [record.camera_azimuth_deg for record in records], dtype=np.float64
+    )
+    azimuth_error = np.abs(
+        (derived_azimuths - expected_azimuths + 180.0) % 360.0 - 180.0
+    )
+    if (
+        not np.all(azimuth_error <= 1e-5)
+        or len({tuple(np.asarray(pose).reshape(-1)) for pose in extrinsics}) != 4
+    ):
+        raise ValueError("camera extrinsics differ from manifest azimuth evidence")
     raw_output = row.payload.get("output_dir")
     if not isinstance(raw_output, str):
         raise ValueError("geometry job has no output path")
@@ -389,6 +634,7 @@ def _camera_arrays(root: Path, row: _RegistryRow) -> tuple[np.ndarray, np.ndarra
         artifact_intrinsics = np.asarray(geometry["intrinsics"])
         artifact_views = tuple(str(item) for item in np.asarray(geometry["meta__view_ids"]).tolist())
         artifact_groups = tuple(str(item) for item in np.asarray(geometry["meta__camera_groups"]).tolist())
+        artifact_type = str(np.asarray(geometry["meta__artifact_type"]).item())
         provenance = str(np.asarray(geometry["meta__camera_provenance"]).item())
     if (
         depth.shape != (4, 504, 504) or confidence.shape != depth.shape or mask.shape != depth.shape
@@ -397,6 +643,7 @@ def _camera_arrays(root: Path, row: _RegistryRow) -> tuple[np.ndarray, np.ndarra
         or not np.array_equal(artifact_extrinsics, extrinsics)
         or not np.array_equal(artifact_intrinsics, intrinsics)
         or artifact_views != view_ids or artifact_groups != ("upper",) * 4
+        or artifact_type != "fixed_camera_depth"
         or provenance != "fixed_precomputed_da3"
     ):
         raise ValueError("geometry/camera provenance validation failed")
@@ -459,14 +706,34 @@ def _score_preflight_pair(
 def _clean_pair_metadata(
     root: Path,
     contract: Adjacent16Contract,
+    source_manifest: Mapping[
+        tuple[str, str], tuple[_ManifestViewEvidence, ...]
+    ],
 ) -> Mapping[tuple[str, str, str], tuple[int, float]]:
     records: dict[tuple[str, str, str], tuple[int, float]] = {}
-    expected = {
-        (shoe, quartet.quartet_id, f"{shoe}__{quartet.quartet_id}__{first}__{second}")
-        for shoe in contract.raw["shoes"]
-        for quartet in contract.quartets
-        for first, second in itertools.combinations(quartet.view_ids, 2)
-    }
+    expected: dict[tuple[str, str, str], tuple[str, str, int, float]] = {}
+    for shoe in contract.raw["shoes"]:
+        for quartet in contract.quartets:
+            manifest_views = source_manifest.get((shoe, quartet.quartet_id))
+            if manifest_views is None:
+                raise ValueError("source manifest is missing a clean pair unit")
+            for first, second in itertools.combinations(manifest_views, 2):
+                raw_steps = abs(first.orbit_position - second.orbit_position)
+                steps = min(raw_steps, len(contract.camera_order) - raw_steps)
+                raw_angle = abs(
+                    first.camera_azimuth_deg - second.camera_azimuth_deg
+                )
+                angle = min(raw_angle, 360.0 - raw_angle)
+                pair_id = (
+                    f"{shoe}__{quartet.quartet_id}__"
+                    f"{first.view_id}__{second.view_id}"
+                )
+                expected[shoe, quartet.quartet_id, pair_id] = (
+                    first.view_id,
+                    second.view_id,
+                    steps,
+                    angle,
+                )
     for line in (root / "manifests" / "pair_conditions.jsonl").read_text(encoding="utf-8").splitlines():
         if not line:
             continue
@@ -475,16 +742,31 @@ def _clean_pair_metadata(
             continue
         key = tuple(row.get(field) for field in ("shoe_id", "quartet_id", "pair_id"))
         steps, angle = row.get("baseline_steps"), row.get("angular_separation_deg")
+        expected_row = expected.get(key)
         if (
-            key not in expected or key in records or isinstance(steps, bool)
-            or not isinstance(steps, int) or steps not in {1, 2, 3}
+            expected_row is None
+            or key in records
+            or row.get("first_view") != expected_row[0]
+            or row.get("second_view") != expected_row[1]
+            or isinstance(steps, bool)
+            or not isinstance(steps, int)
+            or steps != expected_row[2]
             or isinstance(angle, bool) or not isinstance(angle, (int, float))
-            or not math.isfinite(float(angle)) or float(angle) <= 0
+            or not math.isfinite(float(angle))
+            or not math.isclose(
+                float(angle), expected_row[3], rel_tol=0.0, abs_tol=1e-9
+            )
         ):
             raise ValueError("clean pair manifest is malformed")
         records[key] = (steps, float(angle))
-    if set(records) != expected:
+    if set(records) != set(expected):
         raise ValueError("clean pair manifest is incomplete or contains extra rows")
+    step_counts = {
+        step: sum(1 for value in records.values() if value[0] == step)
+        for step in (1, 2, 3)
+    }
+    if step_counts != {1: 48, 2: 32, 3: 16}:
+        raise ValueError("clean pair manifest step distribution differs")
     return records
 
 
@@ -500,7 +782,8 @@ def validate_adjacent16_geometry_preflight(run_root: str | Path) -> GeometryPref
     try:
         contract, config_sha256 = _load_contract(root)
         registry = _registry_rows(root)
-        pair_metadata = _clean_pair_metadata(root, contract)
+        source_manifest = _source_manifest(root, contract)
+        pair_metadata = _clean_pair_metadata(root, contract, source_manifest)
         clean_jobs = [
             row for row in registry
             if row.phase == "geometry" and row.payload.get("job_type") == "geometry_calibration"
@@ -522,7 +805,12 @@ def validate_adjacent16_geometry_preflight(run_root: str | Path) -> GeometryPref
         if set(by_unit) != expected_units:
             raise ValueError("clean geometry registry units are incomplete")
         for (shoe_id, quartet_id), row in sorted(by_unit.items()):
-            depth, confidence, mask, intrinsics, extrinsics, views = _camera_arrays(root, row)
+            manifest_records = source_manifest.get((shoe_id, quartet_id))
+            if manifest_records is None:
+                raise ValueError("geometry unit is absent from source manifest")
+            depth, confidence, mask, intrinsics, extrinsics, views = _camera_arrays(
+                root, row, manifest_records
+            )
             expected_views = next(item.view_ids for item in contract.quartets if item.quartet_id == quartet_id)
             if views != expected_views:
                 raise ValueError("camera view order differs from frozen quartet")
@@ -560,6 +848,7 @@ def validate_adjacent16_geometry_preflight(run_root: str | Path) -> GeometryPref
         _atomic_parquet(table, root / "reports" / "geometry_preflight.parquet")
         artifact_hash = _tree_hash(root, [
             root / "config" / "frozen_config.json", root / "run_manifest.json",
+            root / "manifests" / "adjacent16_manifest.json",
             root / "manifests" / "pair_conditions.jsonl",
             *(root / "cameras").glob("*/*/*"), *(root / "geometry").glob("**/depth_geometry.npz"),
         ])
