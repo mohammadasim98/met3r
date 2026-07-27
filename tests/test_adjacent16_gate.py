@@ -16,9 +16,10 @@ from met3r.job_registry import JobDefinition, JobRegistry
 from met3r.adjacent16_contract import load_adjacent16_contract
 from met3r.adjacent16_data import Adjacent16Manifest, AdjacentShoeRecord, AdjacentViewRecord
 from met3r.adjacent16_design import build_adjacent16_design
+from met3r.adjacent16_prepare import register_adjacent16_jobs
 
 
-def _write_frozen_manifest_fixture(root: Path) -> tuple[Path, ...]:
+def _write_frozen_manifest_fixture(root: Path) -> tuple[tuple[Path, ...], object, object]:
     contract = load_adjacent16_contract("configs/adjacent16_core.json")
     positions = {view: index for index, view in enumerate(contract.camera_order)}
     shoes = []
@@ -38,14 +39,14 @@ def _write_frozen_manifest_fixture(root: Path) -> tuple[Path, ...]:
     state_path.write_text("".join(json.dumps(asdict(item), sort_keys=True) + "\n" for item in states))
     pair_path.write_text("".join(json.dumps(asdict(item), sort_keys=True) + "\n" for item in (*design.controlled_conditions, *design.stress_conditions)))
     variant_path.write_text(json.dumps([asdict(item) for item in design.feature_variants], sort_keys=True))
-    return state_path, pair_path, variant_path
+    return (state_path, pair_path, variant_path), contract, design
 
 
 def test_independent_frozen_manifest_fixture_is_exact_and_byte_stable(tmp_path: Path) -> None:
     """Catch test fixtures that silently shrink the frozen manifest design."""
 
-    first = _write_frozen_manifest_fixture(tmp_path / "one")
-    second = _write_frozen_manifest_fixture(tmp_path / "two")
+    first, _contract, _design = _write_frozen_manifest_fixture(tmp_path / "one")
+    second, _contract2, _design2 = _write_frozen_manifest_fixture(tmp_path / "two")
     states = [json.loads(line) for line in first[0].read_text().splitlines()]
     pairs = [json.loads(line) for line in first[1].read_text().splitlines()]
 
@@ -61,6 +62,32 @@ def test_independent_frozen_manifest_fixture_is_exact_and_byte_stable(tmp_path: 
     assert json.loads(first[2].read_text()) == json.loads(second[2].read_text())
     assert first[0].read_bytes() == second[0].read_bytes()
     assert first[1].read_bytes() == second[1].read_bytes()
+
+
+def test_independent_manifest_design_registers_the_exact_production_job_graph(tmp_path: Path) -> None:
+    """Catch a fixture graph that diverges from production registration payloads."""
+
+    _paths, contract, design = _write_frozen_manifest_fixture(tmp_path / "run")
+    root = tmp_path / "run"
+    marker = root / "reports" / "completed.marker"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("fixture\n")
+    registry = JobRegistry(root / "registry/jobs.sqlite")
+    register_adjacent16_jobs(registry, root, design, "a" * 64)
+    with sqlite3.connect(registry.path) as connection:
+        connection.execute("UPDATE jobs SET state='completed', attempts=1, started_at='2026-01-01T00:00:00+00:00', finished_at='2026-01-01T00:00:01+00:00', output_manifest_json=?", (json.dumps({"files": [{"path": str(marker.resolve()), "sha256": __import__("hashlib").sha256(marker.read_bytes()).hexdigest()}]}),))
+        rows = connection.execute("SELECT job_id, phase, state, attempts, payload_json FROM jobs").fetchall()
+    payloads = [json.loads(row[4]) for row in rows]
+    assert len(rows) == 3504
+    assert {row[1] for row in rows} == {"geometry", "feature"}
+    assert sum(row[1] == "geometry" for row in rows) == 32
+    assert sum(row[1] == "feature" for row in rows) == 3472
+    assert all(row[2] == "completed" and row[3] == 1 for row in rows)
+    assert len({row[0] for row in rows}) == 3504
+    assert all(payload["config_sha256"] == "a" * 64 for payload in payloads)
+    assert sum(payload["job_type"] == "geometry_calibration_feature" for payload in payloads) == 16
+    assert sum(payload["job_type"] == "stress" for payload in payloads) == 64
+    assert all(payload["geometry_contract"] in {"fixed_base_only", "base_plus_adaptive"} for payload in payloads)
 
 
 def _frozen_config(root: Path) -> None:
