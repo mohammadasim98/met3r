@@ -96,8 +96,10 @@ def _run_paths_payload(config_path: Path, run_root: Path) -> dict[str, str]:
     }
 
 
-def _persist_run_paths(config_path: Path, run_root: Path) -> Mapping[str, str]:
-    payload = _run_paths_payload(config_path, run_root)
+def _publish_run_paths(
+    run_root: Path,
+    payload: Mapping[str, str],
+) -> Mapping[str, str]:
     destination = run_root.expanduser().resolve() / "config" / "run_paths.json"
     content = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -137,13 +139,143 @@ def _persist_run_paths(config_path: Path, run_root: Path) -> Mapping[str, str]:
     return payload
 
 
+def _persist_run_paths(config_path: Path, run_root: Path) -> Mapping[str, str]:
+    return _publish_run_paths(
+        run_root,
+        _run_paths_payload(config_path, run_root),
+    )
+
+
+def _persist_frozen_config_hash(run_root: Path, digest: str) -> None:
+    destination = run_root / "config" / "frozen_config.sha256"
+    content = f"{digest}\n".encode("ascii")
+    if destination.exists():
+        if destination.read_bytes() != content:
+            raise ValueError("persisted frozen config hash differs")
+        return
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".frozen_config.",
+        suffix=".tmp",
+        dir=destination.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, destination)
+        except FileExistsError:
+            if destination.read_bytes() != content:
+                raise ValueError("persisted frozen config hash differs")
+        directory_fd = os.open(destination.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _legacy_run_paths(run_root: Path) -> Mapping[str, str]:
+    root = run_root.expanduser().resolve()
+    frozen = root / "config" / "frozen_config.json"
+    hash_path = root / "config" / "frozen_config.sha256"
+    run_manifest_path = root / "run_manifest.json"
+    source_manifest_path = root / "manifests" / "adjacent16_manifest.json"
+    try:
+        content = frozen.read_bytes()
+        digest = hashlib.sha256(content).hexdigest()
+        if hash_path.read_text(encoding="ascii") != f"{digest}\n":
+            raise ValueError("frozen config hash file differs")
+        contract = load_adjacent16_contract(frozen)
+        expected_stress = (root / "inputs" / "stress").resolve()
+        if (
+            Path(contract.output_root).expanduser().resolve() != root
+            or Path(contract.stress_root).expanduser().resolve() != expected_stress
+        ):
+            raise ValueError("frozen config roots differ from legacy run root")
+        run_manifest = json.loads(run_manifest_path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(run_manifest, Mapping)
+            or run_manifest.get("experiment_id") != contract.experiment_id
+            or run_manifest.get("config_sha256") != digest
+        ):
+            raise ValueError("legacy run manifest differs from frozen config")
+        source = json.loads(source_manifest_path.read_text(encoding="utf-8"))
+        expected_shoes = contract.raw.get("shoes")
+        if (
+            not isinstance(source, Mapping)
+            or frozenset(source) != frozenset(
+                {"reconstruction_root", "stress_root", "shoes"}
+            )
+            or source.get("reconstruction_root")
+            != str(Path(contract.reconstruction_root).expanduser().resolve())
+            or source.get("stress_root") != str(expected_stress)
+            or not isinstance(expected_shoes, Mapping)
+            or not isinstance(source.get("shoes"), list)
+            or len(source["shoes"]) != len(expected_shoes)
+        ):
+            raise ValueError("legacy source manifest roots or shoes differ")
+        expected_views = tuple(
+            (quartet.quartet_id, view_id)
+            for quartet in contract.quartets
+            for view_id in quartet.view_ids
+        )
+        for shoe, (shoe_id, camera_dataset_id) in zip(
+            source["shoes"],
+            expected_shoes.items(),
+            strict=True,
+        ):
+            if (
+                not isinstance(shoe, Mapping)
+                or shoe.get("shoe_id") != shoe_id
+                or shoe.get("camera_dataset_id") != camera_dataset_id
+                or not isinstance(shoe.get("views"), list)
+                or len(shoe["views"]) != len(expected_views)
+            ):
+                raise ValueError("legacy source shoe metadata differs")
+            for view, (quartet_id, view_id) in zip(
+                shoe["views"],
+                expected_views,
+                strict=True,
+            ):
+                if (
+                    not isinstance(view, Mapping)
+                    or view.get("shoe_id") != shoe_id
+                    or view.get("camera_dataset_id") != camera_dataset_id
+                    or view.get("quartet_id") != quartet_id
+                    or view.get("view_id") != view_id
+                ):
+                    raise ValueError("legacy source view metadata differs")
+        payload = {
+            "config_sha256": digest,
+            "output_root": str(root),
+            "stress_root": str(expected_stress),
+        }
+    except (
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+        json.JSONDecodeError,
+    ) as error:
+        raise ValueError(
+            "legacy run-path recovery failed; restore authoritative frozen "
+            "config/hash and prepared run/source metadata"
+        ) from error
+    return _publish_run_paths(root, payload)
+
+
 def _validated_run_paths(run_root: Path) -> Mapping[str, str] | None:
     root = run_root.expanduser().resolve()
     destination = root / "config" / "run_paths.json"
     frozen = root / "config" / "frozen_config.json"
     if not destination.is_file():
         if frozen.is_file():
-            raise ValueError("prepared adjacent run is missing persisted run paths")
+            return _legacy_run_paths(root)
         return None
     try:
         payload = json.loads(destination.read_text(encoding="utf-8"))
@@ -209,7 +341,7 @@ def _validate_prepared_paths(
     run_root: Path,
     prepared_config_sha256: str,
 ) -> None:
-    payload = _persist_run_paths(config_path, run_root)
+    payload = _run_paths_payload(config_path, run_root)
     frozen = run_root / "config" / "frozen_config.json"
     if (
         not frozen.is_file()
@@ -235,6 +367,8 @@ def _validate_prepared_paths(
         or source_manifest.get("stress_root") != payload["stress_root"]
     ):
         raise ValueError("persisted adjacent run metadata differs from run paths")
+    _persist_frozen_config_hash(run_root, payload["config_sha256"])
+    _publish_run_paths(run_root, payload)
 
 
 def _registry_counts(path: Path) -> dict[str, dict[str, int]]:
@@ -324,8 +458,6 @@ def _prepare_stress(
     max_parallel: int,
     max_outer_attempts: int,
 ) -> Mapping[str, object]:
-    if run_root is not None:
-        _persist_run_paths(config_path, run_root)
     contract: Adjacent16Contract = load_adjacent16_contract(config_path)
     effective_root = Path(
         run_root if run_root is not None else contract.output_root
@@ -472,7 +604,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.output_root is not None
             else contract.output_root
         ).expanduser().resolve()
-        paths = _persist_run_paths(args.config, run_root)
+        paths = _run_paths_payload(args.config, run_root)
+        if (run_root / "config" / "run_paths.json").exists():
+            _publish_run_paths(run_root, paths)
         prepared = prepare_adjacent16_run(
             args.config,
             output_root=run_root,

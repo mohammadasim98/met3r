@@ -293,6 +293,203 @@ def test_temp_run_override_uses_one_persisted_stress_root_across_stress_and_prep
     }
 
 
+def test_invalid_initial_config_does_not_poison_corrected_stress_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from met3r.adjacent16_cli import main
+
+    config = tmp_path / "config.json"
+    config.write_text("invalid", encoding="utf-8")
+    run_root = tmp_path / "run"
+    contract = SimpleNamespace(
+        output_root=run_root,
+        stress_root=run_root / "inputs" / "stress",
+        physical_gpus=(0, 1, 2, 3),
+    )
+
+    def load(path: Path) -> SimpleNamespace:
+        if path.read_text(encoding="utf-8") == "invalid":
+            raise ValueError("invalid frozen contract")
+        return contract
+
+    monkeypatch.setattr("met3r.adjacent16_cli.load_adjacent16_contract", load)
+    monkeypatch.setattr(
+        "met3r.adjacent16_cli.replace",
+        lambda value, **changes: SimpleNamespace(**{**vars(value), **changes}),
+    )
+    monkeypatch.setattr(
+        "met3r.adjacent16_cli.build_adjacent16_manifest",
+        lambda actual, require_stress: object(),
+    )
+    monkeypatch.setattr(
+        "met3r.adjacent16_cli.render_stress_references",
+        lambda actual, manifest: (),
+    )
+    monkeypatch.setattr(
+        "met3r.adjacent16_cli.build_stress_tasks",
+        lambda actual, manifest, references: (),
+    )
+    monkeypatch.setattr(
+        "met3r.adjacent16_cli.run_stress_tasks",
+        lambda tasks, **kwargs: {"accepted": 0, "rejected": 0, "tasks": {}},
+    )
+
+    with pytest.raises(ValueError, match="invalid frozen contract"):
+        main(["prepare-stress", str(config), "--run-root", str(run_root)])
+    assert not (run_root / "config" / "run_paths.json").exists()
+
+    config.write_text("corrected", encoding="utf-8")
+    assert main(["prepare-stress", str(config), "--run-root", str(run_root)]) == 0
+    assert (
+        json.loads((run_root / "config" / "run_paths.json").read_text())[
+            "config_sha256"
+        ]
+        == hashlib.sha256(config.read_bytes()).hexdigest()
+    )
+
+
+def _legacy_run(
+    run_root: Path,
+    *,
+    consistent: bool,
+) -> SimpleNamespace:
+    config = run_root / "config" / "frozen_config.json"
+    config.parent.mkdir(parents=True)
+    config.write_bytes(b'{"legacy":"adjacent16"}\n')
+    digest = hashlib.sha256(config.read_bytes()).hexdigest()
+    (config.parent / "frozen_config.sha256").write_text(
+        f"{digest}\n",
+        encoding="utf-8",
+    )
+    stress_root = run_root / "inputs" / "stress"
+    reconstruction_root = run_root / "reconstruction"
+    (run_root / "run_manifest.json").write_text(
+        json.dumps(
+            {
+                "experiment_id": "20260727_adjacent16_core_v1",
+                "config_sha256": digest if consistent else "0" * 64,
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifests = run_root / "manifests"
+    manifests.mkdir()
+    views = [
+        {
+            "shoe_id": "shoe-a",
+            "camera_dataset_id": "Camera A",
+            "quartet_id": "q0",
+            "view_id": view_id,
+        }
+        for view_id in ("0", "1", "2", "3")
+    ]
+    (manifests / "adjacent16_manifest.json").write_text(
+        json.dumps(
+            {
+                "reconstruction_root": str(reconstruction_root),
+                "stress_root": str(
+                    stress_root if consistent else run_root / "wrong-stress"
+                ),
+                "shoes": [
+                    {
+                        "shoe_id": "shoe-a",
+                        "camera_dataset_id": "Camera A",
+                        "views": views,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return SimpleNamespace(
+        experiment_id="20260727_adjacent16_core_v1",
+        output_root=run_root.resolve(),
+        stress_root=stress_root.resolve(),
+        reconstruction_root=reconstruction_root.resolve(),
+        physical_gpus=(0, 1, 2, 3),
+        raw={"shoes": {"shoe-a": "Camera A"}},
+        quartets=(SimpleNamespace(quartet_id="q0", view_ids=("0", "1", "2", "3")),),
+    )
+
+
+def test_production_shaped_legacy_run_atomically_migrates_before_later_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from met3r.adjacent16_cli import main
+
+    run_root = tmp_path / "legacy-run"
+    contract = _legacy_run(run_root, consistent=True)
+    calls: list[Path] = []
+    monkeypatch.setattr(
+        "met3r.adjacent16_cli.load_adjacent16_contract",
+        lambda path: contract,
+    )
+    monkeypatch.setattr(
+        "met3r.adjacent16_cli.run_feature_worker",
+        lambda root, backbone, device: calls.append(Path(root))
+        or WorkerSummary(completed=0, abstained=0, failed=0),
+    )
+
+    assert main(
+        [
+            "feature-worker",
+            str(run_root),
+            "--backbone",
+            "dino_vitb16",
+            "--device",
+            "cuda:0",
+        ]
+    ) == 0
+
+    sidecar = run_root / "config" / "run_paths.json"
+    assert json.loads(sidecar.read_text(encoding="utf-8")) == {
+        "config_sha256": hashlib.sha256(
+            (run_root / "config" / "frozen_config.json").read_bytes()
+        ).hexdigest(),
+        "output_root": str(run_root.resolve()),
+        "stress_root": str((run_root / "inputs" / "stress").resolve()),
+    }
+    assert not list(sidecar.parent.glob(".run_paths.*.tmp"))
+    assert calls == [run_root.resolve()]
+
+
+def test_inconsistent_legacy_metadata_fails_recovery_without_sidecar(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from met3r.adjacent16_cli import main
+
+    run_root = tmp_path / "legacy-run"
+    contract = _legacy_run(run_root, consistent=False)
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "met3r.adjacent16_cli.load_adjacent16_contract",
+        lambda path: contract,
+    )
+    monkeypatch.setattr(
+        "met3r.adjacent16_cli.run_feature_worker",
+        lambda *args: calls.append("worker"),
+    )
+
+    with pytest.raises(ValueError, match="legacy run-path recovery failed"):
+        main(
+            [
+                "feature-worker",
+                str(run_root),
+                "--backbone",
+                "dino_vitb16",
+                "--device",
+                "cuda:0",
+            ]
+        )
+
+    assert not (run_root / "config" / "run_paths.json").exists()
+    assert not list((run_root / "config").glob(".run_paths.*.tmp"))
+    assert calls == []
+
+
 def test_run_path_sidecar_rejects_rerun_drift_before_stress_work(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -317,7 +514,15 @@ def test_run_path_sidecar_rejects_rerun_drift_before_stress_work(
     calls: list[str] = []
     monkeypatch.setattr(
         "met3r.adjacent16_cli.load_adjacent16_contract",
-        lambda path: calls.append("stress-work"),
+        lambda path: SimpleNamespace(
+            output_root=run_root,
+            stress_root=run_root / "inputs" / "stress",
+            physical_gpus=(0, 1, 2, 3),
+        ),
+    )
+    monkeypatch.setattr(
+        "met3r.adjacent16_cli.build_adjacent16_manifest",
+        lambda *args, **kwargs: calls.append("stress-work"),
     )
 
     with pytest.raises(ValueError, match="persisted run paths differ"):
