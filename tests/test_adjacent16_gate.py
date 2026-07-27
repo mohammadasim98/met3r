@@ -215,6 +215,60 @@ def test_controlled_complete_series_uses_adjacent_whole_series_threshold(tmp_pat
     assert "controlled_complete_series" in failing.failed_checks
 
 
+def test_all_four_shoe_primary_cells_use_normalized_pair_boundaries(tmp_path: Path) -> None:
+    """Require all shoes for a normalized physical cell at the exact 80% boundary."""
+
+    fixture = _final_gate_fixture(tmp_path)
+    root = fixture["root"]
+    contract = fixture["contract"]
+    path = fixture["metrics"]["controlled"]
+    assert isinstance(root, Path)
+
+    complete = validate_adjacent16_final_gate(root)
+    assert complete.passed is True
+    assert complete.all_four_shoe_primary_cell_rate == 1.0
+
+    frame = pd.read_parquet(path)
+    key = ["shoe_id", "quartet_id", "pair_id", "changed_view", "corruption", "variant_key"]
+    groups = frame.loc[frame.corruption != "clean"].groupby(key, sort=True).groups
+    expected_shoes = set(contract.raw["shoes"])
+    physical_shoes: dict[tuple[object, ...], set[str]] = {}
+    target_series: list[tuple[tuple[object, ...], int]] = []
+    target_shoe = sorted(expected_shoes)[0]
+    for series, rows in groups.items():
+        shoe, quartet, pair_id, placement, corruption, variant = series
+        pair_parts = str(pair_id).split("__")
+        assert pair_parts[:2] == [shoe, quartet]
+        physical = (quartet, pair_parts[-2], pair_parts[-1], placement, corruption, variant)
+        physical_shoes.setdefault(physical, set()).add(shoe)
+        if shoe == target_shoe:
+            target_series.append((physical, next(iter(rows))))
+    assert len(groups) == 9216
+    assert len(physical_shoes) == len(target_series) == 2304
+    assert all(shoes == expected_shoes for shoes in physical_shoes.values())
+
+    target_series.sort()
+    for _physical, row in target_series[:460]:
+        frame.loc[row, "abstained"] = True
+    frame.to_parquet(path, index=False)
+    passing = validate_adjacent16_final_gate(root)
+    assert passing.controlled_complete_series_coverage == pytest.approx((9216 - 460) / 9216)
+    assert passing.controlled_complete_series_coverage > .80
+    assert passing.all_four_shoe_primary_cell_rate == pytest.approx(1844 / 2304)
+    assert passing.passed is True
+    assert "all_four_shoe_primary_cells" not in passing.failed_checks
+
+    _physical, row = target_series[460]
+    frame.loc[row, "abstained"] = True
+    frame.to_parquet(path, index=False)
+    failing = validate_adjacent16_final_gate(root)
+    assert failing.controlled_complete_series_coverage == pytest.approx((9216 - 461) / 9216)
+    assert failing.controlled_complete_series_coverage > .80
+    assert failing.all_four_shoe_primary_cell_rate == pytest.approx(1843 / 2304)
+    assert failing.passed is False
+    assert "all_four_shoe_primary_cells" in failing.failed_checks
+
+
 def _frozen_config(root: Path) -> None:
     (root / "config").mkdir(parents=True)
     source = Path("configs/adjacent16_core.json")
