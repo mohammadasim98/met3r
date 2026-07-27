@@ -14,14 +14,17 @@ from torch import nn
 from met3r.camera_metadata import CAMERA_MODE_LABEL
 from met3r.features import NAF_REVISION
 from met3r.features import BACKBONE_SPECS
-from met3r.job_registry import JobDefinition, JobRegistry
+from met3r.job_registry import JobDefinition, JobRegistry, sha256_file
 from met3r.upper_metric_worker import (
     _StateRecord,
     _clean_state_for_shoe,
     _load_state_index,
     _validate_adjacent_pair_contract,
+    _calibration_records,
+    _RunContract,
     run_feature_worker,
 )
+from met3r.known_camera import KnownCameraConfig
 
 
 def test_state_index_and_clean_lookup_keep_quartets_separate(tmp_path: Path) -> None:
@@ -92,6 +95,33 @@ def test_adjacent_contract_rejects_same_quartet_with_reordered_views() -> None:
         assert "view order" in str(error)
     else:
         raise AssertionError("reordered state was accepted")
+
+
+def _write_adjacent_calibration_fixture(root: Path) -> tuple[_RunContract, _StateRecord]:
+    """Build the exact 4 x 17 q3 calibration-manifest shape used by the worker."""
+    views = ("40", "41", "42", "0")
+    values = {"rotation": [0.25, 0.5, 1.0, 2.0, 5.0], "relative_translation": [0.0025, 0.005, 0.01, 0.02], "depth_scale": [1.01, 1.02, 1.05, 1.1], "relative_depth_noise": [0.005, 0.01, 0.02, 0.05]}
+    config = {"geometry_calibration": {"rotation_degrees": values["rotation"], "relative_translation": values["relative_translation"], "depth_scale": values["depth_scale"], "relative_depth_noise_std": values["relative_depth_noise"]}}
+    directory = root / "geometry" / "calibration" / "clean"; directory.mkdir(parents=True)
+    base = directory / "depth_geometry.npz"; base.write_bytes(b"base")
+    records = []
+    for index, view in enumerate(views):
+        for kind, magnitudes in values.items():
+            for magnitude in magnitudes:
+                path = directory / view / f"{kind}_{magnitude}" / "geometry.npz"; path.parent.mkdir(parents=True); path.write_bytes(b"geometry")
+                records.append({"condition_id": f"{kind}_{magnitude}", "kind": kind, "magnitude": magnitude, "path": str(path.resolve()), "view_index": index, "view_id": view, "sha256": sha256_file(path)})
+    (directory / "calibration_manifest.json").write_text(json.dumps({"artifact_type": "upper_geometry_calibration", "base_geometry": str(base.resolve()), "config_sha256": "config", "seed": 42, "views": list(views), "artifacts": records}))
+    contract = _RunContract(root, config, "config", "full", KnownCameraConfig(.03, .08), 10., "test", "posthoc_audit_only")
+    return contract, _StateRecord("clean", "controlled", "shoe", "q3", views, None, "clean", 0., root / "states" / "clean")
+
+
+def test_adjacent_calibration_fixture_has_all_frozen_q3_artifacts(tmp_path: Path) -> None:
+    """Catch an incomplete/reordered frozen perturbation matrix before worker use."""
+    contract, clean = _write_adjacent_calibration_fixture(tmp_path)
+    records = _calibration_records(contract, clean)
+    assert len(records) == 68
+    assert [record["view_id"] for record in records] == [view for view in clean.view_ids for _ in range(17)]
+    assert {view: sum(record["view_id"] == view for record in records) for view in clean.view_ids} == {view: 17 for view in clean.view_ids}
 
 
 class _TinyBackbone(nn.Module):

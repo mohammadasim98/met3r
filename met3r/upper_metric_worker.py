@@ -1418,8 +1418,11 @@ def _calibration_records(
         raise ValueError("geometry calibration seed mismatch")
     if tuple(manifest.get("views", ())) != clean_state.view_ids:
         raise ValueError("geometry calibration view order mismatch")
-    expected_base = (calibration_root if contract.visualization_policy == "posthoc_audit_only"
-                     else contract.root / "geometry" / clean_state.state_id / "depth_geometry.npz").resolve()
+    expected_base = (
+        calibration_root / "depth_geometry.npz"
+        if contract.visualization_policy == "posthoc_audit_only"
+        else contract.root / "geometry" / clean_state.state_id / "depth_geometry.npz"
+    ).resolve()
     if Path(str(manifest.get("base_geometry", ""))).resolve() != expected_base:
         raise ValueError("geometry calibration base path mismatch")
     raw_records = manifest.get("artifacts")
