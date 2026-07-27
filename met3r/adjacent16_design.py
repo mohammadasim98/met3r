@@ -124,7 +124,10 @@ def _pair_rows(
                 track=state.track,
                 shoe_id=state.shoe_id,
                 quartet_id=state.quartet_id,
-                pair_id=f"{state.quartet_id}__{first.view_id}__{second.view_id}",
+                pair_id=(
+                    f"{state.shoe_id}__{state.quartet_id}__"
+                    f"{first.view_id}__{second.view_id}"
+                ),
                 first_view=first.view_id,
                 second_view=second.view_id,
                 baseline_steps=steps,

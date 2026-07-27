@@ -88,12 +88,20 @@ def test_pair_conditions_preserve_measured_baselines_and_quartet_ids(dense_manif
     for row in (*design.controlled_conditions, *design.stress_conditions):
         first = by_shoe_view[row.shoe_id, row.first_view]
         second = by_shoe_view[row.shoe_id, row.second_view]
-        assert row.pair_id == f"{row.quartet_id}__{row.first_view}__{row.second_view}"
+        assert row.pair_id == (
+            f"{row.shoe_id}__{row.quartet_id}__{row.first_view}__{row.second_view}"
+        )
         assert (row.baseline_steps, row.angular_separation_deg) == pytest.approx(
             pair_baseline(first, second)
         )
     assert any(row.angular_separation_deg == pytest.approx(8.0) for row in design.stress_conditions)
-    assert len({row.pair_id for row in design.stress_conditions}) == 24
+    physical_pairs = {
+        (row.shoe_id, row.quartet_id, row.first_view, row.second_view)
+        for row in design.stress_conditions
+    }
+    assert len(physical_pairs) == 96
+    assert len({row.pair_id for row in design.stress_conditions}) == len(physical_pairs)
+    assert len({row.pair_id for row in design.controlled_conditions}) == len(physical_pairs)
 
 
 def test_identity_donors_and_transformation_values_are_state_deterministic(dense_manifest) -> None:
