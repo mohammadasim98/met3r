@@ -7,8 +7,10 @@ import itertools
 import json
 import math
 import os
+import shutil
 import sqlite3
 import tempfile
+import uuid
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -23,6 +25,7 @@ import torch
 
 from .adjacent16_contract import Adjacent16Contract, load_adjacent16_contract
 from .camera_metadata import CAMERA_MODE_LABEL
+from .geometry import confidence_percentile_mask
 from .job_registry import sha256_file
 from .known_camera import KnownCameraConfig, score_symmetric_geometry_support
 
@@ -258,7 +261,7 @@ def _elapsed_seconds(row: _RegistryRow) -> float:
     return seconds
 
 
-def _camera_arrays(root: Path, row: _RegistryRow) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, tuple[str, ...]]:
+def _camera_arrays(root: Path, row: _RegistryRow) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, tuple[str, ...]]:
     raw_camera = row.payload.get("camera_path")
     if not isinstance(raw_camera, str):
         raise ValueError("geometry job has no camera path")
@@ -277,15 +280,17 @@ def _camera_arrays(root: Path, row: _RegistryRow) -> tuple[np.ndarray, np.ndarra
     if not isinstance(metadata, Mapping) or not isinstance(images, list) or len(images) != 4:
         raise ValueError("camera metadata is malformed")
     with np.load(camera_path, allow_pickle=False) as camera:
-        required = {"extrinsics", "intrinsics", "view_ids", "camera_groups"}
+        required = {"extrinsics", "intrinsics", "mask", "view_ids", "camera_groups"}
         if set(camera.files) != required:
             raise ValueError("camera artifact set differs from frozen contract")
         extrinsics = np.asarray(camera["extrinsics"])
         intrinsics = np.asarray(camera["intrinsics"])
+        camera_mask = np.asarray(camera["mask"], dtype=bool)
         view_ids = tuple(str(item) for item in np.asarray(camera["view_ids"]).tolist())
         groups = tuple(str(item) for item in np.asarray(camera["camera_groups"]).tolist())
     if (
         extrinsics.shape != (4, 4, 4) or intrinsics.shape != (4, 3, 3)
+        or camera_mask.shape != (4, 504, 504)
         or len(view_ids) != 4 or len(set(view_ids)) != 4 or groups != ("upper",) * 4
         or not np.isfinite(extrinsics).all() or not np.isfinite(intrinsics).all()
     ):
@@ -325,6 +330,7 @@ def _camera_arrays(root: Path, row: _RegistryRow) -> tuple[np.ndarray, np.ndarra
         if not required <= set(geometry.files):
             raise ValueError("geometry artifact is incomplete")
         depth = np.asarray(geometry["depth"])
+        confidence = np.asarray(geometry["confidence"])
         mask = np.asarray(geometry["mask"], dtype=bool)
         artifact_extrinsics = np.asarray(geometry["extrinsics"])
         artifact_intrinsics = np.asarray(geometry["intrinsics"])
@@ -332,15 +338,16 @@ def _camera_arrays(root: Path, row: _RegistryRow) -> tuple[np.ndarray, np.ndarra
         artifact_groups = tuple(str(item) for item in np.asarray(geometry["meta__camera_groups"]).tolist())
         provenance = str(np.asarray(geometry["meta__camera_provenance"]).item())
     if (
-        depth.shape != mask.shape or depth.shape[0] != 4 or depth.ndim != 3
+        depth.shape != (4, 504, 504) or confidence.shape != depth.shape or mask.shape != depth.shape
         or not np.isfinite(depth).all() or (depth <= 0).any()
+        or not np.isfinite(confidence).all() or not np.array_equal(mask, camera_mask)
         or not np.array_equal(artifact_extrinsics, extrinsics)
         or not np.array_equal(artifact_intrinsics, intrinsics)
         or artifact_views != view_ids or artifact_groups != ("upper",) * 4
         or provenance != "fixed_precomputed_da3"
     ):
         raise ValueError("geometry/camera provenance validation failed")
-    return depth, mask, intrinsics, extrinsics, view_ids
+    return depth, confidence, mask, intrinsics, extrinsics, view_ids
 
 
 def _median_masked(value: torch.Tensor, mask: torch.Tensor) -> float:
@@ -348,6 +355,52 @@ def _median_masked(value: torch.Tensor, mask: torch.Tensor) -> float:
     if selected.numel() == 0:
         return float("nan")
     return float(selected.detach().float().median().cpu().item())
+
+
+def _confidence_mask(confidence: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    selected = confidence[mask]
+    if selected.numel() == 0 or not torch.isfinite(selected).all():
+        raise ValueError("geometry confidence evidence is empty or non-finite")
+    retained, _ = confidence_percentile_mask(mask.unsqueeze(0), confidence.unsqueeze(0), percentile=10.0)
+    retained = retained[0]
+    if not retained.any():
+        raise ValueError("confidence percentile removed all foreground evidence")
+    return retained
+
+
+def _score_preflight_pair(
+    depth: torch.Tensor,
+    confidence: torch.Tensor,
+    mask: torch.Tensor,
+    intrinsics: torch.Tensor,
+    extrinsics: torch.Tensor,
+    first_index: int,
+    second_index: int,
+) -> Mapping[str, float | bool]:
+    """Score one confidence-filtered geometry pair under the frozen 10th percentile."""
+
+    first_mask = _confidence_mask(confidence[first_index], mask[first_index]).unsqueeze(0)
+    second_mask = _confidence_mask(confidence[second_index], mask[second_index]).unsqueeze(0)
+    support = score_symmetric_geometry_support(
+        depth[first_index : first_index + 1].float(), depth[second_index : second_index + 1].float(),
+        intrinsics[first_index : first_index + 1].float(), intrinsics[second_index : second_index + 1].float(),
+        extrinsics[first_index : first_index + 1].float(), extrinsics[second_index : second_index + 1].float(),
+        first_mask=first_mask, second_mask=second_mask,
+        config=KnownCameraConfig(min_overlap_fraction=0.08),
+    )
+    forward = float(support.first_to_second.overlap_fraction.item())
+    backward = float(support.second_to_first.overlap_fraction.item())
+    minimum = min(forward, backward)
+    return {
+        "first_to_second_overlap": forward,
+        "second_to_first_overlap": backward,
+        "minimum_directional_overlap": minimum,
+        "overlap_asymmetry": abs(forward - backward),
+        "common_valid_fraction": minimum,
+        "cycle_error_px_median": _median_masked(support.first_to_second.cycle_error_px, support.first_to_second.valid_mask),
+        "relative_depth_error_median": _median_masked(support.first_to_second.relative_depth_error, support.first_to_second.valid_mask),
+        "symmetric_pass": bool(not support.abstained.item() and minimum >= 0.08),
+    }
 
 
 def _clean_pair_metadata(
@@ -414,31 +467,19 @@ def validate_adjacent16_geometry_preflight(run_root: str | Path) -> GeometryPref
         if set(by_unit) != expected_units:
             raise ValueError("clean geometry registry units are incomplete")
         for (shoe_id, quartet_id), row in sorted(by_unit.items()):
-            depth, mask, intrinsics, extrinsics, views = _camera_arrays(root, row)
+            depth, confidence, mask, intrinsics, extrinsics, views = _camera_arrays(root, row)
             expected_views = next(item.view_ids for item in contract.quartets if item.quartet_id == quartet_id)
             if views != expected_views:
                 raise ValueError("camera view order differs from frozen quartet")
             for first_index, second_index in itertools.combinations(range(4), 2):
-                support = score_symmetric_geometry_support(
-                    torch.from_numpy(depth[first_index : first_index + 1]).float(),
-                    torch.from_numpy(depth[second_index : second_index + 1]).float(),
-                    torch.from_numpy(intrinsics[first_index : first_index + 1]).float(),
-                    torch.from_numpy(intrinsics[second_index : second_index + 1]).float(),
-                    torch.from_numpy(extrinsics[first_index : first_index + 1]).float(),
-                    torch.from_numpy(extrinsics[second_index : second_index + 1]).float(),
-                    first_mask=torch.from_numpy(mask[first_index : first_index + 1]),
-                    second_mask=torch.from_numpy(mask[second_index : second_index + 1]),
-                    config=KnownCameraConfig(min_overlap_fraction=0.08),
+                scored = _score_preflight_pair(
+                    torch.from_numpy(depth), torch.from_numpy(confidence), torch.from_numpy(mask),
+                    torch.from_numpy(intrinsics), torch.from_numpy(extrinsics), first_index, second_index,
                 )
-                forward = float(support.first_to_second.overlap_fraction.item())
-                backward = float(support.second_to_first.overlap_fraction.item())
-                minimum = min(forward, backward)
                 first_view, second_view = views[first_index], views[second_index]
                 pair_id = f"{shoe_id}__{quartet_id}__{first_view}__{second_view}"
                 steps, angle = pair_metadata[shoe_id, quartet_id, pair_id]
-                values = (forward, backward, minimum)
-                cycle = (_median_masked(support.first_to_second.cycle_error_px, support.first_to_second.valid_mask), _median_masked(support.second_to_first.cycle_error_px, support.second_to_first.valid_mask))
-                depth_error = (_median_masked(support.first_to_second.relative_depth_error, support.first_to_second.valid_mask), _median_masked(support.second_to_first.relative_depth_error, support.second_to_first.valid_mask))
+                values = tuple(float(scored[name]) for name in ("first_to_second_overlap", "second_to_first_overlap", "minimum_directional_overlap", "cycle_error_px_median", "relative_depth_error_median"))
                 if not all(math.isfinite(value) for value in values):
                     raise ValueError("preflight overlap is non-finite")
                 rows.append({
@@ -446,12 +487,7 @@ def validate_adjacent16_geometry_preflight(run_root: str | Path) -> GeometryPref
                     "pair_id": pair_id,
                     "first_view": first_view, "second_view": second_view,
                     "baseline_steps": steps, "angular_separation_deg": angle,
-                    "first_to_second_overlap": forward, "second_to_first_overlap": backward,
-                    "minimum_directional_overlap": minimum, "overlap_asymmetry": abs(forward - backward),
-                    "common_valid_fraction": minimum,
-                    "cycle_error_px_median": float(np.nanmean(cycle)) if any(math.isfinite(item) for item in cycle) else float("nan"),
-                    "relative_depth_error_median": float(np.nanmean(depth_error)) if any(math.isfinite(item) for item in depth_error) else float("nan"),
-                    "symmetric_pass": bool(not support.abstained.item() and minimum >= 0.20),
+                    **scored,
                 })
         if len(rows) != 96 or set(rows[0]) != set(_PREFLIGHT_COLUMNS):
             raise ValueError("geometry preflight table does not contain exactly 96 canonical rows")
@@ -515,7 +551,10 @@ def _sentinel_class(row: _RegistryRow, states: Mapping[str, Mapping[str, object]
     if job_type == "geometry_calibration_feature":
         return "calibration"
     if job_type == "feature":
-        return "clean" if row.payload.get("corruption") == "clean" else "changed"
+        state_id = row.payload.get("state_id")
+        state = states.get(state_id) if isinstance(state_id, str) else None
+        corruption = state.get("corruption") if state is not None else row.payload.get("corruption")
+        return "clean" if corruption == "clean" else "changed"
     raise ValueError("sentinel job has no frozen feature class")
 
 
@@ -529,14 +568,16 @@ def _sentinel_jobs(root: Path, contract: Adjacent16Contract, rows: Sequence[_Reg
     def field(row: _RegistryRow, name: str) -> object:
         state_id = row.payload.get("state_id")
         state = states.get(state_id) if isinstance(state_id, str) else None
-        return row.payload.get(name, state.get(name) if state is not None else None)
+        if state is not None and name in {"track", "corruption", "severity", "changed_view", "shoe_id", "quartet_id"}:
+            return state.get(name)
+        return row.payload.get(name)
 
     backbones = tuple(dict.fromkeys(variant.backbone for variant in contract.feature_variants))
     selected: list[_RegistryRow] = []
     for backbone in backbones:
         predicates = (
             ("clean", {"job_type": "feature", "track": "controlled", "corruption": "clean"}),
-            ("changed", {"job_type": "feature", "track": "controlled", "corruption": "translation", "severity": 0.2}),
+            ("changed", {"job_type": "feature", "track": "controlled", "corruption": "translation", "severity": 0.2, "changed_view": "1"}),
             ("stress", {"job_type": "stress", "track": "stress"}),
         )
         for expected_class, predicate in predicates:
@@ -563,13 +604,40 @@ def write_timed_sentinel_manifest(run_root: str | Path) -> Path:
     grouped: dict[str, list[str]] = defaultdict(list)
     for row in selected:
         grouped[str(row.payload["backbone"])].append(row.job_id)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=f".{destination.name}.staging.", dir=destination.parent))
     hashes: dict[str, str] = {}
     for backbone, job_ids in sorted(grouped.items()):
-        path = destination / f"{backbone}.json"
+        path = staging / f"{backbone}.json"
         _atomic_json({"backbone": backbone, "config_sha256": config_sha256, "job_ids": job_ids}, path)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload != {"backbone": backbone, "config_sha256": config_sha256, "job_ids": job_ids}:
+            shutil.rmtree(staging)
+            raise ValueError("staged timed sentinel manifest failed readback")
         hashes[path.name] = sha256_file(path)
+    expected_names = {f"{backbone}.json" for backbone in grouped}
+    if {path.name for path in staging.iterdir()} != expected_names:
+        shutil.rmtree(staging)
+        raise ValueError("staged timed sentinel manifest file set is incomplete")
+    backup: Path | None = None
+    try:
+        if destination.exists():
+            backup = destination.with_name(f".{destination.name}.backup.{uuid.uuid4().hex}")
+            destination.rename(backup)
+        staging.rename(destination)
+        if backup is not None:
+            shutil.rmtree(backup)
+    except Exception:
+        if destination.exists() and backup is not None and backup.exists():
+            shutil.rmtree(destination)
+            backup.rename(destination)
+        raise
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
     _atomic_json({
         "config_sha256": config_sha256,
+        "registry_sha256": sha256_file(root / "registry" / "jobs.sqlite"),
         "sentinel_job_ids": [row.job_id for row in selected],
         "files": hashes,
     }, root / "reports" / "timed_sentinel_manifest.json")
@@ -592,14 +660,17 @@ def validate_timed_runtime_projection(run_root: str | Path) -> RuntimeProjection
         if any(row.state != "completed" for row in selected):
             failures.add("sentinel_job_state")
             raise ValueError("sentinel jobs must all be completed")
+        states = _state_index(root)
         for row in selected:
-            class_seconds[str(row.payload["backbone"]), _sentinel_class(row, _state_index(root))] = _elapsed_seconds(row)
+            class_seconds[str(row.payload["backbone"]), _sentinel_class(row, states)] = _elapsed_seconds(row)
         if len(class_seconds) != 13:
             raise ValueError("sentinel durations are unclassified or duplicated")
         geometry = [row for row in rows if row.phase == "geometry"]
         if len(geometry) != _EXPECTED_REGISTRY_COUNTS["geometry"] or any(row.state != "completed" for row in geometry):
             failures.add("geometry_job_state")
             raise ValueError("all frozen geometry jobs must complete before projection")
+        for row in geometry:
+            _elapsed_seconds(row)
         starts = [datetime.fromisoformat(str(row.started_at)) for row in geometry]
         finishes = [datetime.fromisoformat(str(row.finished_at)) for row in geometry]
         if any(item.tzinfo is None for item in (*starts, *finishes)):
@@ -645,8 +716,13 @@ def _raw_feature_artifacts(root: Path) -> tuple[str, ...]:
         if not path.is_file():
             continue
         lower = path.name.lower()
-        if lower in {"features.npz", "features.npy"} or path.suffix.lower() in {".pt", ".pth"}:
-            found.append(str(path.relative_to(root)))
+        relative = path.relative_to(root)
+        if (
+            relative.parts and relative.parts[0] == "features"
+        ) or lower in {"features.npz", "features.npy", "embedding.npy"} or path.suffix.lower() in {
+            ".pt", ".pth", ".npy", ".safetensors", ".bin",
+        }:
+            found.append(str(relative))
             continue
         if path.suffix.lower() == ".npz":
             try:
@@ -702,21 +778,46 @@ def _expected_controlled_series(
         for item in variants
     ):
         raise ValueError("feature variant manifest is malformed")
-    series: set[tuple[str, str, str, str, str, str]] = set()
-    rows: set[tuple[str, str, str, str, str, str, float]] = set()
+    expected_conditions: set[tuple[object, ...]] = set()
+    changed_conditions: set[tuple[object, ...]] = set()
+    for shoe in contract.raw["shoes"]:
+        for quartet in contract.quartets:
+            pairs = tuple(itertools.combinations(quartet.view_ids, 2))
+            for first, second in pairs:
+                pair_id = f"{shoe}__{quartet.quartet_id}__{first}__{second}"
+                expected_conditions.add(("controlled", shoe, quartet.quartet_id, pair_id, first, second, None, "clean", 0.0))
+            for corruption, strengths in contract.raw["corruptions"].items():
+                for severity in strengths:
+                    for changed in quartet.view_ids:
+                        for first, second in pairs:
+                            if changed not in {first, second}:
+                                continue
+                            pair_id = f"{shoe}__{quartet.quartet_id}__{first}__{second}"
+                            record = ("controlled", shoe, quartet.quartet_id, pair_id, first, second, changed, corruption, float(severity))
+                            expected_conditions.add(record)
+                            changed_conditions.add(record)
+    actual_conditions: set[tuple[object, ...]] = set()
     for condition in conditions:
-        if not isinstance(condition, Mapping) or condition.get("track") != "controlled" or condition.get("corruption") == "clean":
+        if not isinstance(condition, Mapping) or condition.get("track") != "controlled":
             continue
-        values = tuple(condition.get(key) for key in ("shoe_id", "quartet_id", "pair_id", "changed_view", "corruption"))
-        if not all(isinstance(value, str) and value for value in values) or not isinstance(condition.get("severity"), (int, float)):
-            raise ValueError("controlled condition manifest is malformed")
+        severity = condition.get("severity")
+        if isinstance(severity, bool) or not isinstance(severity, (int, float)):
+            raise ValueError("controlled condition severity is malformed")
+        actual_conditions.add(tuple(condition.get(field) for field in (
+            "track", "shoe_id", "quartet_id", "pair_id", "first_view", "second_view", "changed_view", "corruption",
+        )) + (float(severity),))
+    controlled_count = sum(isinstance(condition, Mapping) and condition.get("track") == "controlled" for condition in conditions)
+    if actual_conditions != expected_conditions or len(actual_conditions) != controlled_count:
+        raise ValueError("controlled condition manifest differs from frozen protocol")
+    series: set[tuple[str, str, str, str, str, str]] = set()
+    rows: set[tuple[str, str, str, str, str, float, str]] = set()
+    for _track, shoe, quartet, pair_id, _first, _second, changed, corruption, severity in changed_conditions:
+        assert isinstance(shoe, str) and isinstance(quartet, str) and isinstance(pair_id, str)
+        assert isinstance(changed, str) and isinstance(corruption, str) and isinstance(severity, float)
         for variant in variants:
             key = "__".join(str(variant[field]) for field in ("feature_track", "backbone", "input_size", "feature_mode", "resolution"))
-            unit = (*values, key)
-            series.add(unit)
-            rows.add((*values, float(condition["severity"]), key))
-    if not series or not rows:
-        raise ValueError("controlled condition manifest is empty")
+            series.add((shoe, quartet, pair_id, changed, corruption, key))
+            rows.add((shoe, quartet, pair_id, changed, corruption, severity, key))
     variant_keys = {
         "__".join(str(item[field]) for field in ("feature_track", "backbone", "input_size", "feature_mode", "resolution"))
         for item in variants
@@ -749,6 +850,109 @@ def _actual_primary_rows(frame: pd.DataFrame) -> dict[tuple[object, ...], Mappin
     return indexed
 
 
+def _frozen_states(contract: Adjacent16Contract) -> tuple[Mapping[str, object], ...]:
+    shoes = tuple(contract.raw["shoes"])
+    states: list[Mapping[str, object]] = []
+    for shoe_index, shoe in enumerate(shoes):
+        donor = shoes[(shoe_index + 1) % len(shoes)]
+        for quartet in contract.quartets:
+            states.append({"state_id": f"controlled__{shoe}__{quartet.quartet_id}__clean", "track": "controlled", "shoe_id": shoe, "quartet_id": quartet.quartet_id, "view_ids": list(quartet.view_ids), "changed_view": None, "corruption": "clean", "severity": 0.0, "direction": 1, "seed": 0, "donor_shoe_id": None, "donor_view": None})
+            for corruption, strengths in contract.raw["corruptions"].items():
+                for raw_severity in strengths:
+                    severity = float(raw_severity)
+                    for changed in quartet.view_ids:
+                        seed_text = f"42|{shoe}|{quartet.quartet_id}|{changed}|{corruption}|{severity:.6f}".encode()
+                        seed = int.from_bytes(hashlib.sha256(seed_text).digest()[:4], "big")
+                        direction = 1 if seed % 2 else -1
+                        states.append({"state_id": f"controlled__{shoe}__{quartet.quartet_id}__view_{changed}__{corruption}__{severity:.6f}__{direction:+d}", "track": "controlled", "shoe_id": shoe, "quartet_id": quartet.quartet_id, "view_ids": list(quartet.view_ids), "changed_view": changed, "corruption": corruption, "severity": severity, "direction": direction, "seed": seed, "donor_shoe_id": donor if corruption == "identity_swap" else None, "donor_view": changed if corruption == "identity_swap" else None})
+            seed_text = f"42|{shoe}|{quartet.quartet_id}|all|deformed|{1.0:.6f}".encode()
+            states.append({"state_id": f"stress__{shoe}__{quartet.quartet_id}__deformed", "track": "stress", "shoe_id": shoe, "quartet_id": quartet.quartet_id, "view_ids": list(quartet.view_ids), "changed_view": None, "corruption": "deformed", "severity": 1.0, "direction": 1, "seed": int.from_bytes(hashlib.sha256(seed_text).digest()[:4], "big"), "donor_shoe_id": None, "donor_view": None})
+    return tuple(states)
+
+
+def _validate_registry_graph(root: Path, contract: Adjacent16Contract, config_sha256: str, rows: Sequence[_RegistryRow]) -> bool:
+    states = _frozen_states(contract)
+    expected_state_map = {str(state["state_id"]): state for state in states}
+    state_path = root / "manifests" / "image_states.jsonl"
+    try:
+        actual_states = [json.loads(line) for line in state_path.read_text(encoding="utf-8").splitlines() if line]
+    except (OSError, json.JSONDecodeError):
+        return False
+    actual_state_map = {str(item.get("state_id")): item for item in actual_states if isinstance(item, Mapping)}
+    if len(actual_state_map) != len(actual_states) or actual_state_map != expected_state_map:
+        return False
+    variants_by_backbone: dict[str, list[str]] = defaultdict(list)
+    for variant in contract.feature_variants:
+        variants_by_backbone[variant.backbone].append(variant.key)
+    expected: dict[str, tuple[str, Mapping[str, object]]] = {}
+
+    def base(state: Mapping[str, object], analysis_track: str) -> dict[str, object]:
+        return {"state_id": state["state_id"], "track": state["track"], "analysis_track": analysis_track, "shoe_id": state["shoe_id"], "quartet_id": state["quartet_id"], "state_dir": str((root / "states" / str(state["state_id"])).resolve()), "camera_path": str((root / "cameras" / str(state["shoe_id"]) / str(state["quartet_id"]) / "cameras.npz").resolve()), "config_sha256": config_sha256}
+
+    for state in states:
+        if state["track"] == "controlled":
+            for backbone, keys in sorted(variants_by_backbone.items()):
+                job_id = f"feature__controlled__{state['state_id']}__{backbone}__user_37_grid_track"
+                expected[job_id] = ("feature", {**base(state, "controlled"), "job_type": "feature", "backbone": backbone, "feature_track": "user_37_grid_track", "variant_keys": keys, "geometry_contract": "fixed_base_only", "output_dir": str((root / "features" / "controlled" / str(state["state_id"]) / backbone).resolve())})
+        else:
+            geometry_id = f"geometry__stress__{state['state_id']}"
+            expected[geometry_id] = ("geometry", {**base(state, "stress"), "job_type": "stress_geometry", "geometry_contract": "base_plus_adaptive", "output_dir": str((root / "geometry" / "stress" / str(state["state_id"])).resolve())})
+            for backbone, keys in sorted(variants_by_backbone.items()):
+                job_id = f"feature__stress__{state['state_id']}__{backbone}__user_37_grid_track"
+                expected[job_id] = ("feature", {**base(state, "stress"), "job_type": "stress", "backbone": backbone, "feature_track": "user_37_grid_track", "variant_keys": keys, "geometry_contract": "base_plus_adaptive", "output_dir": str((root / "features" / "stress" / str(state["state_id"]) / backbone).resolve())})
+    calibration_keys = [key for key in variants_by_backbone["dinov3_vitl16_pixal3d"] if key in contract.geometry_calibration_variant_keys]
+    for state in states:
+        if state["track"] != "controlled" or state["corruption"] != "clean":
+            continue
+        geometry_id = f"geometry__geometry_calibration__{state['state_id']}"
+        expected[geometry_id] = ("geometry", {**base(state, "geometry_calibration"), "job_type": "geometry_calibration", "geometry_contract": "fixed_base_only", "calibration_artifacts": True, "output_dir": str((root / "geometry" / "calibration" / str(state["state_id"])).resolve())})
+        feature_id = f"feature__geometry_calibration__{state['state_id']}__dinov3_vitl16_pixal3d__user_37_grid_track"
+        expected[feature_id] = ("feature", {**base(state, "geometry_calibration"), "job_type": "geometry_calibration_feature", "backbone": "dinov3_vitl16_pixal3d", "feature_track": "user_37_grid_track", "variant_keys": calibration_keys, "geometry_contract": "fixed_base_only", "output_dir": str((root / "features" / "geometry_calibration" / str(state["state_id"])).resolve())})
+    actual = {row.job_id: (row.phase, row.payload) for row in rows}
+    return actual == expected
+
+
+def _exact_metric_keys(contract: Adjacent16Contract) -> Mapping[str, set[tuple[object, ...]]]:
+    variants = tuple(item.key for item in contract.feature_variants)
+    controlled: set[tuple[object, ...]] = set()
+    stress: set[tuple[object, ...]] = set()
+    calibration: set[tuple[object, ...]] = set()
+    calibration_variants = tuple(contract.geometry_calibration_variant_keys)
+    kind_config = {"rotation": "rotation_degrees", "relative_translation": "relative_translation", "depth_scale": "depth_scale", "relative_depth_noise": "relative_depth_noise_std"}
+    for shoe in contract.raw["shoes"]:
+        for quartet in contract.quartets:
+            for first, second in itertools.combinations(quartet.view_ids, 2):
+                pair = f"{shoe}__{quartet.quartet_id}__{first}__{second}"
+                for variant in variants:
+                    controlled.add((shoe, quartet.quartet_id, first, second, None, "clean", 0.0, variant))
+                    stress.add((shoe, quartet.quartet_id, first, second, None, "deformed", 1.0, variant))
+                for changed in quartet.view_ids:
+                    if changed not in {first, second}:
+                        continue
+                    for corruption, strengths in contract.raw["corruptions"].items():
+                        for strength in strengths:
+                            for variant in variants:
+                                controlled.add((shoe, quartet.quartet_id, first, second, changed, corruption, float(strength), variant))
+                    for kind, config_name in kind_config.items():
+                        for magnitude in contract.raw["geometry_calibration"][config_name]:
+                            for variant in calibration_variants:
+                                calibration.add((shoe, quartet.quartet_id, first, second, changed, kind, float(magnitude), variant))
+    return {"controlled": controlled, "stress": stress, "geometry_calibration": calibration}
+
+
+def _validate_metric_keys(frames: Mapping[str, pd.DataFrame], contract: Adjacent16Contract) -> bool:
+    expected = _exact_metric_keys(contract)
+    for track, wanted in expected.items():
+        frame = frames[track]
+        fields = ("shoe_id", "quartet_id", "first_view", "second_view", "changed_view", "corruption", "severity", "variant_key") if track != "geometry_calibration" else ("shoe_id", "quartet_id", "first_view", "second_view", "changed_view", "perturbation_kind", "magnitude", "variant_key")
+        if not set(fields) <= set(frame):
+            return False
+        actual = {tuple(row.get(field) for field in fields) for row in frame.to_dict("records")}
+        if len(actual) != len(frame) or actual != wanted:
+            return False
+    return True
+
+
 def validate_adjacent16_final_gate(run_root: str | Path) -> Adjacent16FinalGateReport:
     """Validate exact adjacent-16 rows, evidence coverage, and storage policy."""
 
@@ -768,6 +972,8 @@ def validate_adjacent16_final_gate(run_root: str | Path) -> Adjacent16FinalGateR
             counts[row.phase] += 1
         if dict(counts) != _EXPECTED_REGISTRY_COUNTS or len(registry) != sum(_EXPECTED_REGISTRY_COUNTS.values()):
             failures.add("registry_counts")
+        if not _validate_registry_graph(root, contract, config_sha256, registry):
+            failures.add("registry_graph")
         bad_outputs = [row.job_id for row in registry if row.state == "completed" and not _valid_output_manifest(row, root)]
         if bad_outputs:
             failures.add("registry_output_hashes")
@@ -780,6 +986,8 @@ def validate_adjacent16_final_gate(run_root: str | Path) -> Adjacent16FinalGateR
         actual_rows["total"] = sum(actual_rows.values())
         if actual_rows != expected_rows:
             failures.add("metric_row_counts")
+        if not _validate_metric_keys(frames, contract):
+            failures.add("metric_row_keys")
         for track, frame in frames.items():
             if frame.empty:
                 continue
@@ -798,7 +1006,6 @@ def validate_adjacent16_final_gate(run_root: str | Path) -> Adjacent16FinalGateR
             if corruption == "clean" and (changed is None or pd.isna(changed)):
                 baseline[shoe, quartet, pair, variant] = row
         complete: set[tuple[str, str, str, str, str, str]] = set()
-        invalid_changed = False
         for unit in series:
             shoe, quartet, pair, _placement, _corruption, variant = unit
             required = [
@@ -810,25 +1017,60 @@ def validate_adjacent16_final_gate(run_root: str | Path) -> Adjacent16FinalGateR
             base = baseline.get((shoe, quartet, pair, variant))
             if base is not None and _finite_primary(base) and all(item is not None and _finite_primary(item) for item in evidence):
                 complete.add(unit)
-            elif any(item is not None for item in evidence) or base is not None:
-                invalid_changed = True
         coverage = len(complete) / len(series)
-        if invalid_changed or len(complete) != len(series):
+        if coverage < float(contract.raw["analyzability"]["minimum_controlled_complete_series_coverage"]):
             failures.add("controlled_complete_series")
-        primary_cells = {unit[1:] for unit in series}
-        all_four = sum(all((shoe, *cell) in complete for shoe in contract.raw["shoes"]) for cell in primary_cells) / len(primary_cells)
+        def physical_cell(unit: tuple[str, str, str, str, str, str]) -> tuple[str, str, str, str, str, str, str]:
+            shoe, quartet, pair_id, placement, corruption, variant = unit
+            parts = pair_id.split("__")
+            if len(parts) < 2:
+                raise ValueError("controlled pair ID is malformed")
+            return quartet, parts[-2], parts[-1], placement, corruption, variant, shoe
+
+        primary_cells = {physical_cell(unit)[:-1] for unit in series}
+        completed_physical = {physical_cell(unit) for unit in complete}
+        all_four = sum(
+            all((*cell, shoe) in completed_physical for shoe in contract.raw["shoes"])
+            for cell in primary_cells
+        ) / len(primary_cells)
         if all_four < float(contract.raw["analyzability"]["minimum_all_four_shoe_primary_cell_rate"]):
             failures.add("all_four_shoe_primary_cells")
-        changed_evidence = [controlled.get(item) for item in expected_changed_rows]
-        if any(item is None or not _finite_primary(item) for item in changed_evidence):
-            failures.add("common_support_evidence")
-        else:
-            support_retention = float(np.mean([
-                min(float(item["s11_first_to_second_overlap"]), float(item["s11_second_to_first_overlap"]))
-                for item in changed_evidence if item is not None
-            ]))
-            if support_retention < float(contract.raw["analyzability"]["minimum_common_support_retention"]):
-                failures.add("common_support_retention")
+        def feature_key(backbone: str, mode: str, resolution: int) -> str:
+            return f"user_37_grid_track__{backbone}__592__{mode}__{resolution}"
+
+        valid_members: dict[str, set[tuple[object, ...]]] = defaultdict(set)
+        for raw_key, row in controlled.items():
+            if not _finite_primary(row):
+                continue
+            shoe, quartet, pair_id, changed, corruption, severity, variant = raw_key
+            parts = str(pair_id).split("__")
+            if len(parts) < 2:
+                raise ValueError("controlled pair ID is malformed")
+            valid_members[str(variant)].add((shoe, quartet, parts[-2], parts[-1], changed, corruption, severity))
+        comparisons = [
+            tuple(feature_key(backbone, "bilinear", 37) for backbone in (
+                "dino_vitb16", "dinov2_vitb14", "dinov3_vitb16", "dinov3_vitl16_pixal3d",
+            )),
+            tuple(feature_key("dinov3_vitl16_pixal3d", "bilinear", resolution) for resolution in (37, 74, 148, 296, 592)),
+            *[
+                (
+                    feature_key("dinov3_vitl16_pixal3d", "bilinear", resolution),
+                    feature_key("dinov3_vitl16_pixal3d", "naf_normal_guide", resolution),
+                )
+                for resolution in (74, 148, 296, 592)
+            ],
+        ]
+        retentions: list[float] = []
+        for variants in comparisons:
+            sets = [valid_members[variant] for variant in variants]
+            union = set().union(*sets)
+            if not union:
+                retentions.append(0.0)
+            else:
+                retentions.append(len(set.intersection(*sets)) / len(union))
+        support_retention = min(retentions) if retentions else float("nan")
+        if support_retention < float(contract.raw["analyzability"]["minimum_common_support_retention"]):
+            failures.add("common_support_retention")
         stress = frames["stress"]
         stress_fields = {"abstained", "s11_first_to_second_overlap", "s11_second_to_first_overlap"}
         if not stress_fields <= set(stress) or stress.empty:

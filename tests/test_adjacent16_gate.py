@@ -55,6 +55,7 @@ def _register_sentinel_jobs(root: Path) -> tuple[str, ...]:
                 "state_id": f"{track}__{corruption}__{severity}",
                 "corruption": corruption,
                 "severity": severity,
+                "changed_view": "1" if corruption == "translation" else None,
             }))
             jobs.append(job_id)
     calibration = "feature__geometry_calibration_feature__dinov3_vitl16_pixal3d"
@@ -89,6 +90,11 @@ def test_timed_sentinel_manifest_selects_exactly_the_registered_thirteen_jobs(
     )
     assert set(selected) == set(expected)
     assert len(selected) == 13
+
+    (directory / "stale.json").write_text("{}", encoding="utf-8")
+    repeated = write_timed_sentinel_manifest(tmp_path)
+    assert repeated == directory
+    assert not (directory / "stale.json").exists()
 
 
 def test_runtime_projection_rejects_pending_or_untimed_sentinel_jobs(

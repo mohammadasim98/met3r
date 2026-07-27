@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import torch
 
+import met3r.adjacent16_gate as adjacent16_gate
 from met3r.adjacent16_gate import validate_adjacent16_geometry_preflight
 from met3r.known_camera import KnownCameraConfig, score_symmetric_geometry_support
 
@@ -91,3 +93,29 @@ def test_geometry_preflight_fails_closed_when_the_frozen_run_is_missing(
     assert report.passed is False
     assert report.pair_units == 0
     assert "input_validation" in report.failed_checks
+
+
+def test_preflight_pair_uses_confidence_percentile_and_the_eight_percent_pass_boundary() -> None:
+    """Catch applying the 20% median gate as an individual pair threshold."""
+
+    depth = torch.ones((2, 4, 4))
+    confidence = torch.stack((
+        torch.linspace(1.0, 2.0, 16).reshape(4, 4),
+        torch.ones((4, 4)),
+    ))
+    mask = torch.stack((
+        torch.ones((4, 4), dtype=torch.bool),
+        torch.tensor([[False, False, False, False], [False, False, False, False], [False, False, False, False], [False, False, True, True]]),
+    ))
+    intrinsics = torch.tensor(
+        [[[4.0, 0.0, 1.5], [0.0, 4.0, 1.5], [0.0, 0.0, 1.0]]] * 2
+    )
+    extrinsics = torch.eye(4).repeat(2, 1, 1)
+
+    scored = adjacent16_gate._score_preflight_pair(
+        depth, confidence, mask, intrinsics, extrinsics, 0, 1,
+    )
+
+    assert scored["minimum_directional_overlap"] == pytest.approx(2 / 14)
+    assert scored["symmetric_pass"] is True
+    assert scored["minimum_directional_overlap"] < 0.20
