@@ -192,6 +192,21 @@ def test_geometry_preflight_accepts_canonical_task6_task7_fixture_and_is_idempot
     assert (root / "reports/geometry_preflight.parquet").read_bytes() == first_bytes
     assert (root / "reports/geometry_preflight.json").read_bytes() == report_bytes
 
+    provenance = json.loads(report_bytes)
+    shoe = next(iter(json.loads(Path("configs/adjacent16_core.json").read_text())["shoes"]))
+    geometry = root / "geometry" / "calibration" / f"controlled__{shoe}__q0__clean" / "depth_geometry.npz"
+    with np.load(geometry) as artifact:
+        arrays = {name: artifact[name] for name in artifact.files}
+    arrays["confidence"] = arrays["confidence"].copy()
+    arrays["confidence"][0, 0, 0] = 0.123
+    np.savez_compressed(geometry, **arrays)
+    with sqlite3.connect(root / "registry/jobs.sqlite") as connection:
+        connection.execute("UPDATE jobs SET output_manifest_json=? WHERE job_id LIKE ?", (json.dumps({"files": [{"path": str(geometry.resolve()), "sha256": sha256_file(geometry)}]}), "%q0__clean"))
+    changed = validate_adjacent16_geometry_preflight(root)
+    changed_provenance = json.loads((root / "reports/geometry_preflight.json").read_text())
+    assert changed.passed is True
+    assert changed_provenance["input_sha256"] != provenance["input_sha256"]
+
 
 @pytest.mark.parametrize("mutation", ("missing", "extra", "mask", "order", "hash", "source"))
 def test_geometry_preflight_rejects_canonical_camera_and_provenance_mutations(
@@ -234,3 +249,38 @@ def test_geometry_preflight_rejects_canonical_camera_and_provenance_mutations(
     assert report.passed is False
     assert report.pair_units == 0
     assert report.failed_checks == ("input_validation",)
+
+
+@pytest.mark.parametrize(("mode", "expected"), (
+    ("shoe", "per_shoe_pair_coverage"),
+    ("global", "symmetric_pass_rate"),
+    ("median", "median_directional_overlap"),
+))
+def test_geometry_preflight_enforces_frozen_coverage_and_median_boundaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str, expected: str,
+) -> None:
+    """Catch conflating individual 8% passes with 80%/90%/20% gate thresholds."""
+
+    root = _canonical_preflight_run(tmp_path)
+    calls = 0
+
+    def boundary(*_args: object) -> dict[str, float | bool]:
+        nonlocal calls
+        index = calls
+        calls += 1
+        failed = (mode == "shoe" and index < 5) or (mode == "global" and index < 10)
+        minimum = 0.19 if mode == "median" else 0.30
+        return {
+            "first_to_second_overlap": minimum, "second_to_first_overlap": minimum,
+            "minimum_directional_overlap": minimum, "overlap_asymmetry": 0.0,
+            "common_valid_fraction": minimum, "cycle_error_px_median": 0.0,
+            "relative_depth_error_median": 0.0, "symmetric_pass": not failed,
+        }
+
+    monkeypatch.setattr(adjacent16_gate, "_score_preflight_pair", boundary)
+    report = validate_adjacent16_geometry_preflight(root)
+
+    assert report.pair_units == 96
+    assert expected in report.failed_checks
+    if mode == "median":
+        assert report.symmetric_pass_rate == 1.0

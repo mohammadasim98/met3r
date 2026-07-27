@@ -166,6 +166,14 @@ def _atomic_parquet(frame: pd.DataFrame, destination: Path) -> Path:
     return destination
 
 
+def _tree_hash(root: Path, paths: Sequence[Path]) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(paths):
+        digest.update(str(path.relative_to(root)).encode("utf-8"))
+        digest.update(bytes.fromhex(sha256_file(path)))
+    return digest.hexdigest()
+
+
 def _load_contract(root: Path) -> tuple[Adjacent16Contract, str]:
     config_path = root / "config" / "frozen_config.json"
     content = config_path.read_bytes()
@@ -442,6 +450,8 @@ def validate_adjacent16_geometry_preflight(run_root: str | Path) -> GeometryPref
     failures: set[str] = set()
     rows: list[dict[str, object]] = []
     per_shoe: dict[str, float] = {}
+    input_hash: str | None = None
+    output_hash: str | None = None
     try:
         contract, config_sha256 = _load_contract(root)
         registry = _registry_rows(root)
@@ -503,6 +513,18 @@ def validate_adjacent16_geometry_preflight(run_root: str | Path) -> GeometryPref
         ):
             raise ValueError("geometry preflight table contains duplicate or non-finite evidence")
         _atomic_parquet(table, root / "reports" / "geometry_preflight.parquet")
+        artifact_hash = _tree_hash(root, [
+            root / "config" / "frozen_config.json", root / "run_manifest.json",
+            root / "manifests" / "pair_conditions.jsonl",
+            *(root / "cameras").glob("*/*/*"), *(root / "geometry").glob("**/depth_geometry.npz"),
+        ])
+        registry_hash = hashlib.sha256(json.dumps([
+            {"job_id": item.job_id, "phase": item.phase, "state": item.state,
+             "payload_hash": item.payload_hash, "output_manifest": item.output_manifest}
+            for item in registry
+        ], sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+        input_hash = hashlib.sha256(f"{artifact_hash}:{registry_hash}".encode("utf-8")).hexdigest()
+        output_hash = sha256_file(root / "reports" / "geometry_preflight.parquet")
         symmetric_rate = float(table["symmetric_pass"].mean())
         median_overlap = float(table["minimum_directional_overlap"].median())
         per_shoe = {str(shoe): float(group["symmetric_pass"].mean()) for shoe, group in table.groupby("shoe_id", sort=True)}
@@ -525,7 +547,7 @@ def validate_adjacent16_geometry_preflight(run_root: str | Path) -> GeometryPref
         median_min_directional_overlap=median_overlap, per_shoe_pass_rate=per_shoe,
         failed_checks=tuple(sorted(failures)),
     )
-    _atomic_json(_json_safe(asdict(report)), root / "reports" / "geometry_preflight.json")
+    _atomic_json(_json_safe({**asdict(report), "config_sha256": input_hash and config_sha256 if "config_sha256" in locals() else None, "input_sha256": input_hash, "output_sha256": output_hash}), root / "reports" / "geometry_preflight.json")
     return report
 
 
