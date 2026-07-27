@@ -287,19 +287,51 @@ def _promote(staging: Path, output_dir: Path, task: StressTask, fingerprint: str
     if not output_dir.exists():
         os.replace(staging, output_dir)
         return
-    archive = output_dir.parent / "superseded_accepted" / fingerprint / f"run_{run_id}"
-    archive.parent.mkdir(parents=True, exist_ok=True)
+    slot = output_dir.parent / ".promotion_slots" / fingerprint / f"slot_{run_id}"
+    slot.parent.mkdir(parents=True, exist_ok=True)
     # Move the candidate into its final immutable archive slot *before* the
     # one commit operation.  After exchange, that same slot already contains
     # the old accepted directory; there is no fallible post-commit move.
-    os.replace(staging, archive)
+    os.replace(staging, slot)
     try:
-        _rename_exchange(archive, output_dir)
-    except Exception:
+        _rename_exchange(slot, output_dir)
+    except Exception as exchange_error:
         # Exchange has not committed: old canonical is still canonical.  Put
         # the candidate back where the caller's rejected archive path expects.
-        os.replace(archive, staging)
+        try:
+            os.replace(slot, staging)
+        except Exception as recovery_error:
+            _mark_neutral_recovery_rejected(slot, exchange_error, recovery_error, run_id)
+            raise RuntimeError(
+                "promotion exchange and candidate recovery both failed; "
+                f"neutral recovery slot retained at {slot}"
+            ) from recovery_error
         raise
+
+
+def _mark_neutral_recovery_rejected(
+    slot: Path, exchange_error: Exception, recovery_error: Exception, run_id: str
+) -> None:
+    """Fail closed in a neutral slot when neither promotion nor recovery moved."""
+
+    reason = {
+        "promotion_exchange_error": str(exchange_error),
+        "recovery_move_error": str(recovery_error),
+    }
+    try:
+        record = dict(_json_object(slot / "task.json"))
+        record.update({"status": "rejected", "acceptance": _false_acceptance(), "reason": reason})
+        _write_record(slot, record)
+    except Exception as audit_error:
+        marker = slot.parent / f"recovery_journal_{run_id}.json"
+        marker.write_text(
+            json.dumps({"slot": str(slot), "reason": reason, "audit_rewrite_error": str(audit_error)}, indent=2),
+            encoding="utf-8",
+        )
+        raise RuntimeError(
+            "promotion recovery failed and neutral audit rewrite failed; "
+            f"durable recovery journal written to {marker}"
+        ) from audit_error
 
 
 def _archive_rejected(
@@ -571,12 +603,14 @@ def _output_claim(output_dir: Path):
 
 
 @contextmanager
-def _machine_gpu_claim(physical_gpu: int):
+def _machine_gpu_claim(physical_gpu: int, *, lock_root: Path | None = None):
     """Machine-global physical-GPU exclusion held only for shoe_deform."""
 
     import fcntl
 
-    claim_path = Path("/tmp") / f"met3r-adjacent16-physical-gpu-{physical_gpu}.lock"
+    root = Path("/tmp") if lock_root is None else Path(lock_root)
+    root.mkdir(parents=True, exist_ok=True)
+    claim_path = root / f"met3r-adjacent16-physical-gpu-{physical_gpu}.lock"
     with claim_path.open("a+") as claim:
         fcntl.flock(claim.fileno(), fcntl.LOCK_EX)
         try:

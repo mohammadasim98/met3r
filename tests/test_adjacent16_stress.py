@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
+import os
 import threading
 import time
 import subprocess
@@ -357,6 +359,22 @@ def test_machine_gpu_claim_serializes_independent_invocations(tmp_path: Path, mo
     assert maximum == 1
 
 
+def test_machine_gpu_claim_serializes_distinct_processes(tmp_path: Path) -> None:
+    lock_root = tmp_path / "gpu-locks"
+    queue: multiprocessing.Queue[tuple[float, float]] = multiprocessing.Queue()
+    processes = [
+        multiprocessing.Process(target=_hold_gpu_claim, args=(lock_root, queue))
+        for _ in range(2)
+    ]
+    for process in processes: process.start()
+    intervals = [queue.get(timeout=5) for _ in processes]
+    for process in processes:
+        process.join(timeout=5)
+        assert process.exitcode == 0
+    first, second = sorted(intervals)
+    assert first[1] <= second[0]
+
+
 def test_bytesize_fingerprint_uses_git_toplevel_and_all_repo_changes(tmp_path: Path, monkeypatch) -> None:
     import met3r.adjacent16_stress as stress
     original = stress._bytesize_fingerprint_impl
@@ -419,8 +437,42 @@ def test_exchange_commits_old_accepted_directory_without_post_exchange_move(
     stress._promote(staging, output, _task(tmp_path), "fingerprint", "run")
 
     assert json.loads((output / "task.json").read_text())["new"] is True
-    archived = output.parent / "superseded_accepted/fingerprint/run_run/task.json"
+    archived = output.parent / ".promotion_slots/fingerprint/slot_run/task.json"
     assert json.loads(archived.read_text())["old"] is True
+
+
+def test_exchange_and_recovery_failure_marks_neutral_slot_rejected(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import met3r.adjacent16_stress as stress
+
+    task = _task(tmp_path)
+    task.output_dir.mkdir(parents=True)
+    (task.output_dir / "task.json").write_text(json.dumps({"status": "accepted", "old": True}))
+
+    def fake_run(args, **kwargs):  # type: ignore[no-untyped-def]
+        _accepted_artifacts(Path(args[args.index("--output-dir") + 1]))
+        class Result: returncode = 0
+        return Result()
+
+    real_replace = stress.os.replace
+    def fail_recovery(left, right):  # type: ignore[no-untyped-def]
+        if Path(left).parents[1].name == ".promotion_slots" and Path(right).name.startswith(".staging-"):
+            raise OSError("recovery move failed")
+        real_replace(left, right)
+
+    monkeypatch.setattr(stress, "_rename_exchange", lambda *args: (_ for _ in ()).throw(OSError("exchange failed")))
+    monkeypatch.setattr(stress.os, "replace", fail_recovery)
+    monkeypatch.setattr(stress.subprocess, "run", fake_run)
+    result = run_stress_tasks((task,), max_outer_attempts=1)
+
+    assert result["accepted"] == 0
+    assert json.loads((task.output_dir / "task.json").read_text())["old"] is True
+    records = list((task.output_dir.parent / ".promotion_slots").rglob("task.json"))
+    assert len(records) == 1
+    candidate = json.loads(records[0].read_text())
+    assert candidate["status"] == "rejected"
+    assert candidate["acceptance"] == {"camera_preserved": False, "background_preserved": False, "crop_preservation_gate": False}
 
 
 @pytest.mark.parametrize("field", ("camera", "background", "crop"))
@@ -465,3 +517,12 @@ def _accepted_artifacts(output: Path, *, camera: bool = True, background: bool =
     }
     (output / "deformation.json").write_text(json.dumps({"selected_attempt_id": "attempt", "attempts": [selected]}))
     (output / "metrics.json").write_text("{}")
+
+
+def _hold_gpu_claim(lock_root: Path, queue: multiprocessing.Queue) -> None:
+    from met3r.adjacent16_stress import _machine_gpu_claim
+
+    with _machine_gpu_claim(0, lock_root=lock_root):
+        started = time.monotonic()
+        time.sleep(0.12)
+        queue.put((started, time.monotonic()))
