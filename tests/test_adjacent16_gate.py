@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,54 @@ from met3r.adjacent16_gate import (
     write_timed_sentinel_manifest,
 )
 from met3r.job_registry import JobDefinition, JobRegistry
+from met3r.adjacent16_contract import load_adjacent16_contract
+from met3r.adjacent16_data import Adjacent16Manifest, AdjacentShoeRecord, AdjacentViewRecord
+from met3r.adjacent16_design import build_adjacent16_design
+
+
+def _write_frozen_manifest_fixture(root: Path) -> tuple[Path, ...]:
+    contract = load_adjacent16_contract("configs/adjacent16_core.json")
+    positions = {view: index for index, view in enumerate(contract.camera_order)}
+    shoes = []
+    for shoe in contract.raw["shoes"]:
+        views = []
+        for quartet in contract.quartets:
+            for view in quartet.view_ids:
+                views.append(AdjacentViewRecord(shoe, "fixture", quartet.quartet_id, view, positions[view], root / "rgb", root / "mask", None, None, None, None, None, 1.0, positions[view] * 7.5, "0" * 64, "0" * 64, None, None, None))
+        shoes.append(AdjacentShoeRecord(shoe, "fixture", tuple(views)))
+    design = build_adjacent16_design(Adjacent16Manifest(root, root, tuple(shoes)), contract)
+    manifests = root / "manifests"
+    manifests.mkdir(parents=True)
+    states = (*design.controlled_states, *design.stress_states)
+    state_path = manifests / "image_states.jsonl"
+    pair_path = manifests / "pair_conditions.jsonl"
+    variant_path = manifests / "feature_variants.json"
+    state_path.write_text("".join(json.dumps(asdict(item), sort_keys=True) + "\n" for item in states))
+    pair_path.write_text("".join(json.dumps(asdict(item), sort_keys=True) + "\n" for item in (*design.controlled_conditions, *design.stress_conditions)))
+    variant_path.write_text(json.dumps([asdict(item) for item in design.feature_variants], sort_keys=True))
+    return state_path, pair_path, variant_path
+
+
+def test_independent_frozen_manifest_fixture_is_exact_and_byte_stable(tmp_path: Path) -> None:
+    """Catch test fixtures that silently shrink the frozen manifest design."""
+
+    first = _write_frozen_manifest_fixture(tmp_path / "one")
+    second = _write_frozen_manifest_fixture(tmp_path / "two")
+    states = [json.loads(line) for line in first[0].read_text().splitlines()]
+    pairs = [json.loads(line) for line in first[1].read_text().splitlines()]
+
+    assert len(states) == 864
+    assert sum(row["track"] == "controlled" for row in states) == 848
+    assert sum(row["track"] == "stress" for row in states) == 16
+    assert len({row["state_id"] for row in states}) == 864
+    assert len(pairs) == 2688
+    assert sum(row["track"] == "controlled" for row in pairs) == 2592
+    assert sum(row["track"] == "stress" for row in pairs) == 96
+    assert {row["severity"] for row in pairs if row["corruption"] == "identity_swap"} == {1.0}
+    assert all(row["changed_view"] in {row["first_view"], row["second_view"]} for row in pairs if row["changed_view"] is not None)
+    assert json.loads(first[2].read_text()) == json.loads(second[2].read_text())
+    assert first[0].read_bytes() == second[0].read_bytes()
+    assert first[1].read_bytes() == second[1].read_bytes()
 
 
 def _frozen_config(root: Path) -> None:
