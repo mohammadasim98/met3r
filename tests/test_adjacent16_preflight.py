@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
 
+from met3r.adjacent16_gate import validate_adjacent16_geometry_preflight
 from met3r.known_camera import KnownCameraConfig, score_symmetric_geometry_support
 
 
@@ -76,3 +79,15 @@ def test_geometry_support_diagnostics_are_finite_for_valid_correspondences() -> 
     for direction in (support.first_to_second, support.second_to_first):
         assert torch.isfinite(direction.relative_depth_error[direction.valid_mask]).all()
         assert torch.isfinite(direction.cycle_error_px[direction.valid_mask]).all()
+
+
+def test_geometry_preflight_fails_closed_when_the_frozen_run_is_missing(
+    tmp_path: Path,
+) -> None:
+    """Catch a gate that treats a missing preflight input as passing evidence."""
+
+    report = validate_adjacent16_geometry_preflight(tmp_path / "missing")
+
+    assert report.passed is False
+    assert report.pair_units == 0
+    assert "input_validation" in report.failed_checks
