@@ -56,6 +56,9 @@ def _numeric_row(
         "angular_separation_deg": 7.5 * baseline_steps,
         "changed_view": None if corruption in {"clean", "deformed"} else "1",
         "image_state_id": f"{track}__{design_id}",
+        "geometry_contract": (
+            "base_plus_adaptive" if track == "stress" else "fixed_base_only"
+        ),
         "corruption": corruption,
         "severity": severity,
         "variant_key": variant_key,
@@ -595,6 +598,37 @@ def _write_render_run(root: Path) -> None:
         json.dumps(fit_images, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    shoes: list[dict[str, object]] = []
+    for shoe_index in range(4):
+        selected = fit_images[shoe_index * 16 : (shoe_index + 1) * 16]
+        shoes.append(
+            {
+                "shoe_id": f"shoe-{shoe_index}",
+                "camera_dataset_id": f"dataset-{shoe_index}",
+                "views": [
+                    {
+                        **record,
+                        "source_sha256": hashlib.sha256(
+                            Path(str(record["source_path"])).read_bytes()
+                        ).hexdigest(),
+                    }
+                    for record in selected
+                ],
+            }
+        )
+    (manifests / "adjacent16_manifest.json").write_text(
+        json.dumps(
+            {
+                "reconstruction_root": str(root),
+                "stress_root": str(root / "stress"),
+                "shoes": shoes,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
     config = {
         "experiment_id": "20260727_adjacent16_core_v1",
@@ -822,6 +856,24 @@ def test_audit_selection_rejects_low_high_changed_view_mismatch(
         build_adjacent16_audit_manifest(tmp_path)
 
 
+def test_audit_selection_rejects_low_high_geometry_contract_mismatch(
+    tmp_path: Path,
+) -> None:
+    """Catch exact design IDs pairing different geometry replay contracts."""
+
+    generation = _write_numeric_generation(tmp_path)
+    path = generation / "controlled_fidelity.parquet"
+    frame = pd.read_parquet(path)
+    frame.loc[
+        (frame["design_id"] == "C410") & (frame["variant_key"] == HIGH_VARIANT),
+        "geometry_contract",
+    ] = "base_plus_adaptive"
+    frame.to_parquet(path, index=False)
+
+    with pytest.raises(ValueError, match="geometry_contract"):
+        build_adjacent16_audit_manifest(tmp_path)
+
+
 def test_render_audit_rejects_aggregate_case_not_owned_by_pair_manifest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -853,6 +905,77 @@ def test_render_audit_rejects_aggregate_case_not_owned_by_pair_manifest(
         render_adjacent16_audit(tmp_path, device="cpu")
 
 
+def test_render_audit_rejects_wrong_track_geometry_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch controlled selections requesting stress adaptive geometry."""
+
+    _write_render_run(tmp_path)
+    generation = tmp_path / "metrics/aggregate_generations/render-generation"
+    path = generation / "controlled_fidelity.parquet"
+    frame = pd.read_parquet(path)
+    frame.loc[frame["design_id"] == "C200", "geometry_contract"] = (
+        "base_plus_adaptive"
+    )
+    frame.to_parquet(path, index=False)
+    monkeypatch.setattr(
+        adjacent16_visualization,
+        "load_feature_backbone",
+        lambda _name: (_ for _ in ()).throw(
+            AssertionError("model load must follow geometry-contract validation")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="canonical pair condition.*geometry_contract"):
+        render_adjacent16_audit(tmp_path, device="cpu")
+
+
+@pytest.mark.parametrize("mutation", ("owner_angle", "state_severity"))
+def test_render_audit_rejects_sub_tolerance_numeric_identity_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    """Catch approximate numeric comparison admitting a different replay owner."""
+
+    _write_render_run(tmp_path)
+    if mutation == "owner_angle":
+        path = tmp_path / "manifests/pair_conditions.jsonl"
+        rows = [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+        ]
+        next(row for row in rows if row["design_id"] == "C200")[
+            "angular_separation_deg"
+        ] += 1e-12
+    else:
+        path = tmp_path / "manifests/image_states.jsonl"
+        rows = [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+        ]
+        next(
+            row
+            for row in rows
+            if row["state_id"] == "controlled__shoe__q0__jpeg"
+        )["severity"] += 1e-12
+    path.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        adjacent16_visualization,
+        "load_feature_backbone",
+        lambda _name: (_ for _ in ()).throw(
+            AssertionError("model load must follow exact identity validation")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="differs"):
+        render_adjacent16_audit(tmp_path, device="cpu")
+
+
 def test_render_audit_rejects_aggregate_model_or_config_provenance_drift(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -876,6 +999,105 @@ def test_render_audit_rejects_aggregate_model_or_config_provenance_drift(
     )
 
     with pytest.raises(ValueError, match="aggregate provenance"):
+        render_adjacent16_audit(tmp_path, device="cpu")
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("repeated_path_hash", "unrelated_path", "stale_hash", "missing", "extra"),
+)
+def test_render_audit_reconciles_all_fit_sources_to_canonical_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    """Catch noncanonical or non-bijective 64-image PCA fit ownership."""
+
+    _write_render_run(tmp_path)
+    canonical_path = tmp_path / "manifests/adjacent16_manifest.json"
+    canonical = json.loads(canonical_path.read_text(encoding="utf-8"))
+    views = [
+        view
+        for shoe in canonical["shoes"]
+        for view in shoe["views"]
+    ]
+    fit_path = tmp_path / "pca_fit_images/clean_source_paths.json"
+    fit = json.loads(fit_path.read_text(encoding="utf-8"))
+    if mutation == "repeated_path_hash":
+        views[1]["source_path"] = views[0]["source_path"]
+        views[1]["source_sha256"] = views[0]["source_sha256"]
+    elif mutation == "unrelated_path":
+        unrelated = tmp_path / "clean_sources/unrelated.png"
+        Image.fromarray(np.zeros((12, 12, 3), dtype=np.uint8)).save(unrelated)
+        fit[0]["source_path"] = str(unrelated)
+    elif mutation == "stale_hash":
+        views[0]["source_sha256"] = "0" * 64
+    elif mutation == "missing":
+        canonical["shoes"][0]["views"].pop()
+    else:
+        canonical["shoes"][0]["views"].append(
+            {
+                **views[0],
+                "view_id": "extra",
+            }
+        )
+    canonical_path.write_text(
+        json.dumps(canonical, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    fit_path.write_text(
+        json.dumps(fit, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        adjacent16_visualization,
+        "load_feature_backbone",
+        lambda _name: (_ for _ in ()).throw(
+            AssertionError("model load must follow canonical PCA validation")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="canonical PCA"):
+        render_adjacent16_audit(tmp_path, device="cpu")
+
+
+def test_render_audit_rechecks_fit_hash_when_loading(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch a clean fit source changing after ownership validation."""
+
+    _write_render_run(tmp_path)
+    real_fit_sources = adjacent16_visualization._fit_source_records
+
+    def mutate_after_validation(
+        root: Path,
+    ) -> tuple[tuple[Path, ...], list[dict[str, str]]]:
+        paths, records = real_fit_sources(root)
+        Image.fromarray(np.full((12, 12, 3), 3, dtype=np.uint8)).save(paths[0])
+        return paths, records
+
+    _patch_tiny_models(monkeypatch)
+    monkeypatch.setattr(
+        adjacent16_visualization,
+        "_fit_source_records",
+        mutate_after_validation,
+    )
+
+    def consume_then_fail(
+        batches: object,
+        **_kwargs: object,
+    ) -> object:
+        next(iter(batches))
+        raise AssertionError("PCA fit must follow source hash revalidation")
+
+    monkeypatch.setattr(
+        adjacent16_visualization,
+        "fit_pca_basis",
+        consume_then_fail,
+    )
+
+    with pytest.raises(ValueError, match="fit source hash changed"):
         render_adjacent16_audit(tmp_path, device="cpu")
 
 
@@ -971,6 +1193,9 @@ def test_replay_rejects_feature_outputs_not_exactly_l37_and_l592() -> None:
         ("basis.npz", {"values": np.asarray([1.0])}),
         ("other_basis.npz", {"components": np.eye(3)}),
         ("pca_components.npy", np.eye(3)),
+        ("pca_components.npz", {"arr_0": np.eye(3)}),
+        ("PCA_BaSiS.NPZ", {"arr_0": np.eye(3)}),
+        ("FeAtUrEs.NpZ", {"arr_0": np.eye(3)}),
     ),
 )
 def test_render_audit_rejects_existing_raw_feature_or_basis_artifacts(
@@ -994,7 +1219,7 @@ def test_render_audit_rejects_existing_raw_feature_or_basis_artifacts(
     leaked.parent.mkdir(parents=True, exist_ok=True)
     if arrays is None:
         leaked.write_bytes(b"raw")
-    elif leaked.suffix == ".npy":
+    elif leaked.suffix.lower() == ".npy":
         np.save(leaked, arrays)
     else:
         assert isinstance(arrays, dict)
@@ -1089,3 +1314,52 @@ def test_audit_publication_treats_backup_cleanup_as_post_commit(
 
     assert json.loads((destination / "value.json").read_text()) == {"value": 3}
     assert not tuple(reports.glob(".audit_visualizations.backup.*"))
+
+
+def _write_complete_audit_backup(path: Path) -> None:
+    (path / "pca").mkdir(parents=True)
+    (path / "directional").mkdir()
+    (path / "audit_manifest.json").write_text('{"old": true}\n', encoding="utf-8")
+    (path / "pca_render_manifest.json").write_text(
+        '{"old": true}\n',
+        encoding="utf-8",
+    )
+    (path / "pca/old.png").write_bytes(b"pca")
+    (path / "directional/old.png").write_bytes(b"directional")
+
+
+def test_standalone_builder_restores_and_refuses_sole_render_backup(
+    tmp_path: Path,
+) -> None:
+    """Catch manifest-only publication deleting the sole recoverable render."""
+
+    _write_numeric_generation(tmp_path)
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    backup = reports / ".audit_visualizations.backup.sole"
+    _write_complete_audit_backup(backup)
+
+    with pytest.raises(ValueError, match="rendered audit snapshot"):
+        build_adjacent16_audit_manifest(tmp_path)
+
+    assert (reports / "audit_visualizations/pca/old.png").read_bytes() == b"pca"
+    assert not backup.exists()
+
+
+def test_standalone_builder_rejects_ambiguous_render_backups(
+    tmp_path: Path,
+) -> None:
+    """Catch builder choosing among multiple retained publication owners."""
+
+    _write_numeric_generation(tmp_path)
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    for suffix in ("one", "two"):
+        _write_complete_audit_backup(
+            reports / f".audit_visualizations.backup.{suffix}"
+        )
+
+    with pytest.raises(RuntimeError, match="ambiguous audit recovery"):
+        build_adjacent16_audit_manifest(tmp_path)
+
+    assert not (reports / "audit_visualizations").exists()

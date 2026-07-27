@@ -6,11 +6,12 @@ import json
 import math
 import os
 import gc
+import fcntl
 import hashlib
 import shutil
 import tempfile
 import uuid
-from contextlib import closing
+from contextlib import closing, contextmanager
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -64,6 +65,7 @@ _PAIR_IDENTITY = (
     "angular_separation_deg",
     "changed_view",
     "image_state_id",
+    "geometry_contract",
     "corruption",
     "severity",
 )
@@ -395,19 +397,21 @@ def build_adjacent16_audit_manifest(run_root: str | Path) -> Path:
 
     root = Path(run_root).expanduser().resolve()
     destination = root / "reports/audit_visualizations"
-    if (
-        (destination / "pca_render_manifest.json").exists()
-        or (destination / "pca").exists()
-        or (destination / "directional").exists()
-    ):
-        raise ValueError(
-            "rendered audit snapshot is owned by render_adjacent16_audit"
+    with _audit_publisher_lock(root):
+        _recover_audit_destination(destination)
+        if (
+            (destination / "pca_render_manifest.json").exists()
+            or (destination / "pca").exists()
+            or (destination / "directional").exists()
+        ):
+            raise ValueError(
+                "rendered audit snapshot is owned by render_adjacent16_audit"
+            )
+        payload = _build_audit_payload(root)
+        return _atomic_json(
+            destination / "audit_manifest.json",
+            payload,
         )
-    payload = _build_audit_payload(root)
-    return _atomic_json(
-        root / "reports/audit_visualizations/audit_manifest.json",
-        payload,
-    )
 
 
 def _build_audit_payload(
@@ -448,15 +452,16 @@ def _assert_no_raw_artifacts(root: Path) -> None:
         if not path.is_file():
             continue
         suffix = path.suffix.lower()
+        lower_stem = path.stem.lower()
         if suffix in {".pt", ".pth"}:
             raise ValueError(f"prohibited tensor artifact exists: {path}")
-        if path.name in {"features.npy", "features.npz", "basis.npz"}:
-            raise ValueError(f"prohibited feature or basis artifact exists: {path}")
-        if suffix == ".npy" and (
-            "component" in path.stem.lower()
-            or path.stem.lower() in {"basis", "pca_basis"}
+        if suffix in {".npy", ".npz"} and any(
+            token in lower_stem
+            for token in ("feature", "component", "basis")
         ):
-            raise ValueError(f"prohibited persisted PCA array exists: {path}")
+            raise ValueError(
+                f"prohibited feature, component, or basis array exists: {path}"
+            )
         if suffix != ".npz":
             continue
         try:
@@ -486,6 +491,63 @@ def _assert_no_raw_artifacts(root: Path) -> None:
             raise ValueError(f"cannot audit NPZ artifact for raw features: {path}") from error
 
 
+def _canonical_pca_sources(
+    root: Path,
+) -> dict[tuple[str, str, str], tuple[Path, str]]:
+    path = root / "manifests/adjacent16_manifest.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("canonical PCA source manifest is invalid") from error
+    shoes = payload.get("shoes") if isinstance(payload, Mapping) else None
+    if not isinstance(shoes, list):
+        raise ValueError("canonical PCA source manifest requires shoes")
+    result: dict[tuple[str, str, str], tuple[Path, str]] = {}
+    for shoe in shoes:
+        if not isinstance(shoe, Mapping) or not isinstance(
+            shoe.get("shoe_id"), str
+        ):
+            raise ValueError("canonical PCA shoe record is malformed")
+        views = shoe.get("views")
+        if not isinstance(views, list):
+            raise ValueError("canonical PCA shoe views are malformed")
+        for view in views:
+            if not isinstance(view, Mapping):
+                raise ValueError("canonical PCA view record is malformed")
+            identity = (
+                str(shoe["shoe_id"]),
+                str(view.get("quartet_id", "")),
+                str(view.get("view_id", "")),
+            )
+            source = view.get("source_path")
+            source_hash = view.get("source_sha256")
+            if (
+                any(not value for value in identity)
+                or identity in result
+                or not isinstance(source, str)
+                or not isinstance(source_hash, str)
+                or len(source_hash) != 64
+            ):
+                raise ValueError("canonical PCA identities or hashes are malformed")
+            source_path = Path(source).expanduser().resolve()
+            if not source_path.is_file():
+                raise ValueError(
+                    f"canonical PCA source image is missing: {source_path}"
+                )
+            if sha256_file(source_path) != source_hash:
+                raise ValueError(
+                    f"canonical PCA source hash is stale: {source_path}"
+                )
+            result[identity] = (source_path, source_hash)
+    if len(result) != 64:
+        raise ValueError("canonical PCA source set must contain exactly 64 records")
+    paths = [record[0] for record in result.values()]
+    hashes = [record[1] for record in result.values()]
+    if len(set(paths)) != 64 or len(set(hashes)) != 64:
+        raise ValueError("canonical PCA source paths and hashes must be globally unique")
+    return result
+
+
 def _fit_source_records(root: Path) -> tuple[tuple[Path, ...], list[dict[str, str]]]:
     path = root / "pca_fit_images/clean_source_paths.json"
     try:
@@ -494,7 +556,8 @@ def _fit_source_records(root: Path) -> tuple[tuple[Path, ...], list[dict[str, st
         raise ValueError("clean PCA source manifest is invalid") from error
     if not isinstance(raw, list) or len(raw) != 64:
         raise ValueError("shared PCA fitting requires exactly 64 clean source images")
-    canonical: list[tuple[tuple[str, str, str], Path]] = []
+    owners = _canonical_pca_sources(root)
+    canonical: list[tuple[tuple[str, str, str], Path, str]] = []
     identities: set[tuple[str, str, str]] = set()
     for item in raw:
         if not isinstance(item, Mapping):
@@ -511,14 +574,23 @@ def _fit_source_records(root: Path) -> tuple[tuple[Path, ...], list[dict[str, st
         ):
             raise ValueError("clean PCA source identities must be exact and unique")
         image_path = Path(source).expanduser().resolve()
-        if not image_path.is_file():
-            raise ValueError(f"clean PCA source image is missing: {image_path}")
+        owner = owners.get(identity)
+        if owner is None or image_path != owner[0]:
+            raise ValueError(
+                "clean PCA fit record differs from its canonical PCA source"
+            )
+        if sha256_file(image_path) != owner[1]:
+            raise ValueError(
+                f"clean PCA fit source hash differs from canonical PCA: {image_path}"
+            )
         identities.add(identity)
-        canonical.append((identity, image_path))
+        canonical.append((identity, image_path, owner[1]))
+    if identities != set(owners):
+        raise ValueError("clean PCA fit identities differ from canonical PCA sources")
     canonical.sort(key=lambda item: (*item[0], str(item[1])))
     paths: list[Path] = []
     records: list[dict[str, str]] = []
-    for identity, image_path in canonical:
+    for identity, image_path, source_hash in canonical:
         paths.append(image_path)
         records.append(
             {
@@ -526,7 +598,7 @@ def _fit_source_records(root: Path) -> tuple[tuple[Path, ...], list[dict[str, st
                 "quartet_id": identity[1],
                 "view_id": identity[2],
                 "path": str(image_path),
-                "sha256": sha256_file(image_path),
+                "sha256": source_hash,
             }
         )
     return tuple(paths), records
@@ -621,10 +693,15 @@ def _fit_policy_fingerprint(
 def _load_source_tensor(
     paths: Sequence[Path],
     *,
+    expected_hashes: Sequence[str],
     device: torch.device,
 ) -> Tensor:
+    if len(paths) != len(expected_hashes):
+        raise ValueError("PCA fit paths and hashes differ in length")
     tensors: list[Tensor] = []
-    for path in paths:
+    for path, expected_hash in zip(paths, expected_hashes, strict=True):
+        if sha256_file(path) != expected_hash:
+            raise ValueError(f"PCA fit source hash changed before loading: {path}")
         with Image.open(path) as image:
             value = np.asarray(
                 image.convert("RGB").resize(
@@ -647,9 +724,14 @@ def _pca_batches(
     *,
     device: torch.device,
     counters: dict[str, int],
+    expected_hashes: Sequence[str],
 ) -> Iterator[Tensor]:
     for start in range(0, len(paths), 4):
-        images = _load_source_tensor(paths[start : start + 4], device=device)
+        images = _load_source_tensor(
+            paths[start : start + 4],
+            expected_hashes=expected_hashes[start : start + 4],
+            device=device,
+        )
         native = extractor.extract_native(images)
         _validate_native_feature(native)
         counters["tokens"] += (
@@ -707,7 +789,7 @@ def _case_matches_state(case: Mapping[str, object], state: object) -> None:
         severity = float(case["severity"])
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError("audit case severity is malformed") from error
-    if not math.isclose(severity, float(getattr(state, "severity"))):
+    if severity != float(getattr(state, "severity")):
         raise ValueError("audit case severity differs from its image state")
     changed_view = case.get("changed_view")
     if changed_view != getattr(state, "changed_view"):
@@ -744,10 +826,18 @@ def _validate_cases_against_pair_manifest(
             )
         for field in _PAIR_IDENTITY:
             selected = _identity_value(case.get(field))
-            expected = _identity_value(owner.get(field))
+            expected = _identity_value(
+                (
+                    "base_plus_adaptive"
+                    if owner.get("track") == "stress"
+                    else "fixed_base_only"
+                )
+                if field == "geometry_contract"
+                else owner.get(field)
+            )
             if field in {"severity", "angular_separation_deg"}:
                 try:
-                    equal = math.isclose(float(selected), float(expected))
+                    equal = float(selected) == float(expected)
                 except (TypeError, ValueError):
                     equal = False
             elif field == "baseline_steps":
@@ -762,6 +852,19 @@ def _validate_cases_against_pair_manifest(
                     f"audit case {design_id!r} differs from its canonical "
                     f"pair condition for {field}"
                 )
+
+
+def _validate_cases_against_states(
+    root: Path,
+    cases: Sequence[Mapping[str, object]],
+) -> Mapping[str, object]:
+    states = _load_state_index(root)
+    for case in cases:
+        state_id = case.get("image_state_id")
+        if not isinstance(state_id, str) or state_id not in states:
+            raise ValueError("audit case references an unknown image state")
+        _case_matches_state(case, states[state_id])
+    return states
 
 
 def _paired_variant_features(
@@ -938,7 +1041,16 @@ def _replay_case(
     return paths
 
 
-def _publish_audit(staging: Path, destination: Path) -> None:
+def _complete_audit_snapshot(path: Path) -> bool:
+    return (
+        (path / "audit_manifest.json").is_file()
+        and (path / "pca_render_manifest.json").is_file()
+        and (path / "pca").is_dir()
+        and (path / "directional").is_dir()
+    )
+
+
+def _recover_audit_destination(destination: Path) -> None:
     stale_backups = sorted(
         destination.parent.glob(".audit_visualizations.backup.*")
     )
@@ -949,12 +1061,31 @@ def _publish_audit(staging: Path, destination: Path) -> None:
             except OSError:
                 pass
     elif len(stale_backups) == 1:
+        if not _complete_audit_snapshot(stale_backups[0]):
+            raise RuntimeError("retained audit backup is incomplete")
         os.replace(stale_backups[0], destination)
     elif len(stale_backups) > 1:
         raise RuntimeError(
             "ambiguous audit recovery: destination is absent and multiple "
             "backups are present"
         )
+
+
+@contextmanager
+def _audit_publisher_lock(root: Path):
+    metrics = root / "metrics"
+    metrics.mkdir(parents=True, exist_ok=True)
+    lock_path = metrics / ".audit-visualizations-publisher.lock"
+    with lock_path.open("a+b") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _publish_audit(staging: Path, destination: Path) -> None:
+    _recover_audit_destination(destination)
     backup = destination.parent / (
         f".audit_visualizations.backup.{uuid.uuid4().hex}"
     )
@@ -976,7 +1107,7 @@ def _publish_audit(staging: Path, destination: Path) -> None:
             pass
 
 
-def render_adjacent16_audit(
+def _render_adjacent16_audit_locked(
     run_root: str | Path,
     *,
     device: str,
@@ -1009,6 +1140,7 @@ def render_adjacent16_audit(
             seen.add(str(case["design_id"]))
             cases.append(case)
     _validate_cases_against_pair_manifest(root, cases)
+    states = _validate_cases_against_states(root, cases)
     aggregate_inputs = _aggregate_input_records(
         root,
         contract,
@@ -1030,6 +1162,7 @@ def render_adjacent16_audit(
     try:
         _atomic_json(staging / "audit_manifest.json", audit_payload)
         fit_paths, fit_records = _fit_source_records(root)
+        fit_hashes = tuple(record["sha256"] for record in fit_records)
         backbone = load_feature_backbone(_BACKBONE).to(torch_device)
         naf = load_naf_upsampler(device=torch_device).to(torch_device)
         extractor = MultiScaleFeatureExtractor(
@@ -1044,6 +1177,7 @@ def render_adjacent16_audit(
                 extractor,
                 device=torch_device,
                 counters=pca_counters,
+                expected_hashes=fit_hashes,
             ),
             max_tokens=_PCA_MAX_TOKENS,
             seed=_PCA_SEED,
@@ -1051,9 +1185,8 @@ def render_adjacent16_audit(
         if pca_counters["tokens"] <= _PCA_MAX_TOKENS:
             raise ValueError(
                 "shared PCA source tokens do not exercise deterministic subsampling"
-            )
+        )
         output_paths: list[Path] = []
-        states = _load_state_index(root)
         for case in cases:
             output_paths.extend(
                 _replay_case(
@@ -1123,3 +1256,15 @@ def render_adjacent16_audit(
         for path in sorted(destination.rglob("*"))
         if path.is_file()
     )
+
+
+def render_adjacent16_audit(
+    run_root: str | Path,
+    *,
+    device: str,
+) -> tuple[Path, ...]:
+    """Replay selected L37/L592 cases and persist PNG diagnostics only."""
+
+    root = Path(run_root).expanduser().resolve()
+    with _audit_publisher_lock(root):
+        return _render_adjacent16_audit_locked(root, device=device)
