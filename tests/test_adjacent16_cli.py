@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import sqlite3
 import subprocess
 import time
 from pathlib import Path
@@ -202,6 +204,166 @@ def test_feature_worker_uses_optional_job_id_file_and_defaults_to_all_pending(
     ]
 
 
+def test_temp_run_override_uses_one_persisted_stress_root_across_stress_and_prepare(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from met3r.adjacent16_cli import main
+
+    config = tmp_path / "adjacent16.json"
+    config.write_bytes(b'{"frozen":"config"}\n')
+    run_root = tmp_path / "custom-run"
+    expected_stress_root = run_root / "inputs" / "stress"
+    seen_stress_roots: list[Path | None] = []
+    contract = SimpleNamespace(
+        output_root=tmp_path / "configured-run",
+        stress_root=tmp_path / "configured-stress",
+        physical_gpus=(0, 1, 2, 3),
+    )
+
+    def fake_replace(value: SimpleNamespace, **changes: object) -> SimpleNamespace:
+        return SimpleNamespace(**{**vars(value), **changes})
+
+    def fake_manifest(
+        actual_contract: SimpleNamespace,
+        *,
+        require_stress: bool,
+    ) -> object:
+        assert not require_stress
+        seen_stress_roots.append(Path(actual_contract.stress_root))
+        return object()
+
+    def fake_prepare(
+        config_path: Path,
+        *,
+        output_root: Path,
+        stress_root: Path,
+    ) -> SimpleNamespace:
+        assert config_path == config.resolve()
+        assert output_root == run_root.resolve()
+        seen_stress_roots.append(Path(stress_root))
+        frozen = run_root / "config" / "frozen_config.json"
+        frozen.parent.mkdir(parents=True, exist_ok=True)
+        frozen.write_bytes(config.read_bytes())
+        (run_root / "run_manifest.json").write_text(
+            json.dumps(
+                {
+                    "experiment_id": "20260727_adjacent16_core_v1",
+                    "config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
+                }
+            ),
+            encoding="utf-8",
+        )
+        manifests = run_root / "manifests"
+        manifests.mkdir(parents=True, exist_ok=True)
+        (manifests / "adjacent16_manifest.json").write_text(
+            json.dumps({"stress_root": str(stress_root)}),
+            encoding="utf-8",
+        )
+        return SimpleNamespace(
+            root=run_root.resolve(),
+            config_sha256=hashlib.sha256(config.read_bytes()).hexdigest(),
+        )
+
+    monkeypatch.setattr("met3r.adjacent16_cli.load_adjacent16_contract", lambda path: contract)
+    monkeypatch.setattr("met3r.adjacent16_cli.replace", fake_replace)
+    monkeypatch.setattr("met3r.adjacent16_cli.build_adjacent16_manifest", fake_manifest)
+    monkeypatch.setattr(
+        "met3r.adjacent16_cli.render_stress_references",
+        lambda actual_contract, manifest: (),
+    )
+    monkeypatch.setattr(
+        "met3r.adjacent16_cli.build_stress_tasks",
+        lambda actual_contract, manifest, references: (),
+    )
+    monkeypatch.setattr(
+        "met3r.adjacent16_cli.run_stress_tasks",
+        lambda tasks, **kwargs: {"accepted": 0, "rejected": 0, "tasks": {}},
+    )
+    monkeypatch.setattr("met3r.adjacent16_cli.prepare_adjacent16_run", fake_prepare)
+
+    assert main(["prepare-stress", str(config), "--run-root", str(run_root)]) == 0
+    assert main(["prepare", str(config), "--output-root", str(run_root)]) == 0
+
+    assert seen_stress_roots == [expected_stress_root, expected_stress_root]
+    assert json.loads((run_root / "config" / "run_paths.json").read_text()) == {
+        "config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
+        "output_root": str(run_root.resolve()),
+        "stress_root": str(expected_stress_root.resolve()),
+    }
+
+
+def test_run_path_sidecar_rejects_rerun_drift_before_stress_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from met3r.adjacent16_cli import main
+
+    config = tmp_path / "config.json"
+    config.write_text("frozen", encoding="utf-8")
+    run_root = tmp_path / "run"
+    sidecar = run_root / "config" / "run_paths.json"
+    sidecar.parent.mkdir(parents=True)
+    sidecar.write_text(
+        json.dumps(
+            {
+                "config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
+                "output_root": str(tmp_path / "other-run"),
+                "stress_root": str(run_root / "inputs" / "stress"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "met3r.adjacent16_cli.load_adjacent16_contract",
+        lambda path: calls.append("stress-work"),
+    )
+
+    with pytest.raises(ValueError, match="persisted run paths differ"):
+        main(["prepare-stress", str(config), "--run-root", str(run_root)])
+
+    assert calls == []
+
+
+def test_nondefault_physical_gpus_fail_before_cli_or_launcher_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from met3r.adjacent16_cli import main
+
+    config = tmp_path / "config.json"
+    config.write_text("unused", encoding="utf-8")
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "met3r.adjacent16_cli.load_adjacent16_contract",
+        lambda path: calls.append("stress-work"),
+    )
+
+    with pytest.raises(SystemExit) as error:
+        main(
+            [
+                "prepare-stress",
+                str(config),
+                "--run-root",
+                str(tmp_path / "run"),
+                "--physical-gpus",
+                "4,5,6,7",
+            ]
+        )
+    assert error.value.code == 2
+    assert "physical GPUs must be exactly 0,1,2,3" in capsys.readouterr().err
+    assert calls == []
+
+    environment, _run_root, calls_path = _launcher_environment(tmp_path)
+    environment["PHYSICAL_GPUS"] = "4,5,6,7"
+    completed = _run_launcher("stress", environment, check=False)
+    assert completed.returncode == 2
+    assert "PHYSICAL_GPUS must be exactly 0,1,2,3" in completed.stderr
+    assert _calls(calls_path) == []
+
+
 def test_final_validate_stops_before_final_gate_when_ownership_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -259,6 +421,91 @@ def test_aggregate_validates_ownership_before_atomic_publication(
 
     assert main(["aggregate", str(tmp_path)]) == 0
     assert calls == ["design", "ownership", "aggregate"]
+
+
+@pytest.mark.parametrize("state", ("pending", "abstained"))
+def test_adjacent_status_requires_the_exact_completed_graph(
+    tmp_path: Path,
+    state: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from met3r.adjacent16_cli import main
+    from met3r.job_registry import JobDefinition, JobRegistry
+
+    registry = JobRegistry(tmp_path / "registry" / "jobs.sqlite")
+    registry.register(JobDefinition("feature-one", "feature", {"backbone": "fake"}))
+    if state == "abstained":
+        with sqlite3.connect(registry.path) as connection:
+            connection.execute(
+                "UPDATE jobs SET state = 'abstained', error = 'explained' "
+                "WHERE job_id = 'feature-one'"
+            )
+
+    assert main(["status", str(tmp_path), "--require-complete"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["complete"] is False
+    assert payload["counts"] == {"feature": {state: 1}}
+
+
+def test_adjacent_status_revalidates_completed_output_hashes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from met3r.adjacent16_cli import main
+    from met3r.job_registry import JobRegistry
+
+    registry = JobRegistry(tmp_path / "registry" / "jobs.sqlite")
+    payload_json = "{}"
+    payload_hash = hashlib.sha256(payload_json.encode()).hexdigest()
+    missing_manifest = json.dumps(
+        {
+            "files": [
+                {
+                    "path": str(tmp_path / "missing.parquet"),
+                    "sha256": "0" * 64,
+                }
+            ]
+        }
+    )
+    feature_ids = [f"feature-{index:04d}" for index in range(3472)]
+    geometry_ids = [f"geometry-{index:02d}" for index in range(32)]
+    with sqlite3.connect(registry.path) as connection:
+        connection.executemany(
+            """
+            INSERT INTO jobs(
+                job_id, phase, state, payload_json, payload_hash,
+                output_manifest_json
+            ) VALUES (?, ?, 'completed', ?, ?, ?)
+            """,
+            [
+                (
+                    job_id,
+                    "feature" if job_id.startswith("feature") else "geometry",
+                    payload_json,
+                    payload_hash,
+                    missing_manifest,
+                )
+                for job_id in (*feature_ids, *geometry_ids)
+            ],
+        )
+    monkeypatch.setattr(
+        "met3r.adjacent16_cli._load_contract",
+        lambda root: (object(), "f" * 64),
+    )
+    monkeypatch.setattr(
+        "met3r.adjacent16_cli._registry_rows",
+        lambda root: (SimpleNamespace(job_id=feature_ids[0]),),
+    )
+    monkeypatch.setattr(
+        "met3r.adjacent16_cli._validate_registry_graph",
+        lambda *args: True,
+    )
+
+    assert main(["status", str(tmp_path), "--require-complete"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["complete"] is False
+    assert payload["counts"]["feature"] == {"completed": 3471, "pending": 1}
 
 
 def test_launcher_default_gpu_mapping_is_deterministic_and_preserves_run(

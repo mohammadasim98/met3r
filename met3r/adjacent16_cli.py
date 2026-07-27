@@ -3,16 +3,25 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
+import sqlite3
+import tempfile
+from contextlib import contextmanager
 from dataclasses import asdict, is_dataclass, replace
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Iterator, Mapping, Sequence
 
+from . import adjacent16_gate as _gate_module
 from .adjacent16_analysis import analyze_adjacent16_run
 from .adjacent16_contract import Adjacent16Contract, load_adjacent16_contract
 from .adjacent16_data import Adjacent16Manifest, build_adjacent16_manifest
 from .adjacent16_design import Adjacent16Design
 from .adjacent16_gate import (
+    _load_contract,
+    _registry_rows,
+    _validate_registry_graph,
     _frozen_design,
     validate_adjacent16_final_gate,
     validate_adjacent16_geometry_preflight,
@@ -30,7 +39,7 @@ from .pilot_gate import (
     aggregate_all_metric_parts,
     validate_adjacent16_metric_ownership,
 )
-from .upper_cli import _status
+from .job_registry import JobRegistry
 from .upper_geometry import run_geometry_worker
 from .upper_metric_worker import run_feature_worker
 
@@ -46,9 +55,9 @@ def _gpu_indices(value: str) -> tuple[int, ...]:
         raise argparse.ArgumentTypeError(
             "physical GPUs must be comma-separated integers"
         ) from error
-    if len(result) != 4 or len(set(result)) != 4 or min(result) < 0:
+    if result != (0, 1, 2, 3):
         raise argparse.ArgumentTypeError(
-            "adjacent16 requires four distinct nonnegative physical GPUs"
+            "physical GPUs must be exactly 0,1,2,3"
         )
     return result
 
@@ -78,9 +87,214 @@ def _manifest_summary(manifest: Adjacent16Manifest) -> dict[str, int]:
     }
 
 
+def _run_paths_payload(config_path: Path, run_root: Path) -> dict[str, str]:
+    root = run_root.expanduser().resolve()
+    return {
+        "config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
+        "output_root": str(root),
+        "stress_root": str((root / "inputs" / "stress").resolve()),
+    }
+
+
+def _persist_run_paths(config_path: Path, run_root: Path) -> Mapping[str, str]:
+    payload = _run_paths_payload(config_path, run_root)
+    destination = run_root.expanduser().resolve() / "config" / "run_paths.json"
+    content = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        try:
+            existing = json.loads(destination.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError("persisted run paths are unreadable") from error
+        if existing != payload:
+            raise ValueError("persisted run paths differ from requested run")
+        return payload
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".run_paths.",
+        suffix=".tmp",
+        dir=destination.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, destination)
+        except FileExistsError:
+            existing = json.loads(destination.read_text(encoding="utf-8"))
+            if existing != payload:
+                raise ValueError("persisted run paths differ from requested run")
+        directory_fd = os.open(destination.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return payload
+
+
+def _validated_run_paths(run_root: Path) -> Mapping[str, str] | None:
+    root = run_root.expanduser().resolve()
+    destination = root / "config" / "run_paths.json"
+    frozen = root / "config" / "frozen_config.json"
+    if not destination.is_file():
+        if frozen.is_file():
+            raise ValueError("prepared adjacent run is missing persisted run paths")
+        return None
+    try:
+        payload = json.loads(destination.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("persisted run paths are unreadable") from error
+    expected_paths = {
+        "output_root": str(root),
+        "stress_root": str((root / "inputs" / "stress").resolve()),
+    }
+    if (
+        not isinstance(payload, Mapping)
+        or frozenset(payload)
+        != frozenset({"config_sha256", "output_root", "stress_root"})
+        or any(payload.get(key) != value for key, value in expected_paths.items())
+        or not isinstance(payload.get("config_sha256"), str)
+    ):
+        raise ValueError("persisted run paths differ from requested run")
+    if (
+        frozen.is_file()
+        and hashlib.sha256(frozen.read_bytes()).hexdigest()
+        != payload["config_sha256"]
+    ):
+        raise ValueError("persisted run paths differ from frozen config")
+    source_manifest = root / "manifests" / "adjacent16_manifest.json"
+    if source_manifest.is_file():
+        try:
+            source = json.loads(source_manifest.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError("persisted adjacent source manifest is unreadable") from error
+        if (
+            not isinstance(source, Mapping)
+            or source.get("stress_root") != payload["stress_root"]
+        ):
+            raise ValueError("persisted stress root differs from run paths")
+    return payload
+
+
+@contextmanager
+def _effective_gate_paths(run_root: Path) -> Iterator[None]:
+    payload = _validated_run_paths(run_root)
+    if payload is None:
+        yield
+        return
+    original = _gate_module.load_adjacent16_contract
+
+    def load_effective(path: str | Path) -> Adjacent16Contract:
+        contract = original(path)
+        return replace(
+            contract,
+            output_root=Path(payload["output_root"]),
+            stress_root=Path(payload["stress_root"]),
+        )
+
+    _gate_module.load_adjacent16_contract = load_effective
+    try:
+        yield
+    finally:
+        _gate_module.load_adjacent16_contract = original
+
+
+def _validate_prepared_paths(
+    config_path: Path,
+    run_root: Path,
+    prepared_config_sha256: str,
+) -> None:
+    payload = _persist_run_paths(config_path, run_root)
+    frozen = run_root / "config" / "frozen_config.json"
+    if (
+        not frozen.is_file()
+        or frozen.read_bytes() != config_path.read_bytes()
+        or prepared_config_sha256 != payload["config_sha256"]
+    ):
+        raise ValueError("persisted frozen config differs from requested config")
+    try:
+        run_manifest = json.loads(
+            (run_root / "run_manifest.json").read_text(encoding="utf-8")
+        )
+        source_manifest = json.loads(
+            (run_root / "manifests" / "adjacent16_manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("persisted adjacent run metadata is unreadable") from error
+    if (
+        not isinstance(run_manifest, Mapping)
+        or run_manifest.get("config_sha256") != payload["config_sha256"]
+        or not isinstance(source_manifest, Mapping)
+        or source_manifest.get("stress_root") != payload["stress_root"]
+    ):
+        raise ValueError("persisted adjacent run metadata differs from run paths")
+
+
+def _registry_counts(path: Path) -> dict[str, dict[str, int]]:
+    with sqlite3.connect(path, timeout=60) as connection:
+        rows = connection.execute(
+            """
+            SELECT phase, state, COUNT(*)
+            FROM jobs
+            GROUP BY phase, state
+            ORDER BY phase, state
+            """
+        ).fetchall()
+    counts: dict[str, dict[str, int]] = {}
+    for phase, state, count in rows:
+        counts.setdefault(str(phase), {})[str(state)] = int(count)
+    return counts
+
+
+def _adjacent_status(run_root: Path) -> tuple[dict[str, dict[str, int]], bool]:
+    registry_path = run_root / "registry" / "jobs.sqlite"
+    if not registry_path.is_file():
+        raise ValueError("missing adjacent16 job registry")
+    counts = _registry_counts(registry_path)
+    expected = {
+        "feature": {"completed": 3472},
+        "geometry": {"completed": 32},
+    }
+    if counts != expected:
+        return counts, False
+    try:
+        contract, config_sha256 = _load_contract(run_root)
+        rows = _registry_rows(run_root)
+        if not _validate_registry_graph(
+            run_root,
+            contract,
+            config_sha256,
+            rows,
+        ):
+            return counts, False
+        registry = JobRegistry(registry_path)
+        complete = all(
+            registry.validated_state(row.job_id) == "completed"
+            for row in rows
+        )
+    except (OSError, ValueError, KeyError, sqlite3.Error):
+        complete = False
+    refreshed = _registry_counts(registry_path)
+    return refreshed, complete and refreshed == expected
+
+
 def _load_adjacent16_design(run_root: str | Path) -> Adjacent16Design:
     root = Path(run_root).expanduser().resolve()
     contract = load_adjacent16_contract(root / "config" / "frozen_config.json")
+    paths = _validated_run_paths(root)
+    if paths is not None:
+        contract = replace(
+            contract,
+            output_root=Path(paths["output_root"]),
+            stress_root=Path(paths["stress_root"]),
+        )
     return _frozen_design(root, contract)
 
 
@@ -110,13 +324,18 @@ def _prepare_stress(
     max_parallel: int,
     max_outer_attempts: int,
 ) -> Mapping[str, object]:
-    contract: Adjacent16Contract = load_adjacent16_contract(config_path)
     if run_root is not None:
-        contract = replace(
-            contract,
-            output_root=run_root,
-            stress_root=run_root / "inputs" / "stress",
-        )
+        _persist_run_paths(config_path, run_root)
+    contract: Adjacent16Contract = load_adjacent16_contract(config_path)
+    effective_root = Path(
+        run_root if run_root is not None else contract.output_root
+    ).expanduser().resolve()
+    _persist_run_paths(config_path, effective_root)
+    contract = replace(
+        contract,
+        output_root=effective_root,
+        stress_root=effective_root / "inputs" / "stress",
+    )
     if physical_gpus is not None:
         contract = replace(contract, physical_gpus=physical_gpus)
     manifest = build_adjacent16_manifest(contract, require_stress=False)
@@ -247,9 +466,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         _print_json(result)
         return 0 if result.get("rejected") == 0 else 1
     if args.command == "prepare":
+        contract = load_adjacent16_contract(args.config)
+        run_root = Path(
+            args.output_root
+            if args.output_root is not None
+            else contract.output_root
+        ).expanduser().resolve()
+        paths = _persist_run_paths(args.config, run_root)
         prepared = prepare_adjacent16_run(
             args.config,
-            output_root=args.output_root,
+            output_root=run_root,
+            stress_root=Path(paths["stress_root"]),
+        )
+        if prepared.root != run_root:
+            raise ValueError("prepared run root differs from requested run root")
+        _validate_prepared_paths(
+            args.config,
+            run_root,
+            prepared.config_sha256,
         )
         _print_json(
             {
@@ -259,6 +493,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 0
     if args.command == "geometry-worker":
+        _validated_run_paths(args.run_root)
         summary = run_geometry_worker(
             args.run_root,
             args.shoe_id,
@@ -268,14 +503,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         _print_json(summary)
         return 0 if summary.failed == 0 else 1
     if args.command == "geometry-preflight":
-        report = validate_adjacent16_geometry_preflight(args.run_root)
+        with _effective_gate_paths(args.run_root):
+            report = validate_adjacent16_geometry_preflight(args.run_root)
         _print_json(report)
         return 0 if report.passed else 1
     if args.command == "sentinel-manifest":
-        path = write_timed_sentinel_manifest(args.run_root)
+        with _effective_gate_paths(args.run_root):
+            path = write_timed_sentinel_manifest(args.run_root)
         _print_json({"manifest_root": path})
         return 0
     if args.command == "feature-worker":
+        _validated_run_paths(args.run_root)
         job_ids = (
             _job_ids(args.job_id_file, args.backbone)
             if args.job_id_file is not None
@@ -297,10 +535,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         _print_json(summary)
         return 0 if summary.failed == 0 else 1
     if args.command == "runtime-gate":
-        report = validate_timed_runtime_projection(args.run_root)
+        with _effective_gate_paths(args.run_root):
+            report = validate_timed_runtime_projection(args.run_root)
         _print_json(report)
         return 0 if report.passed else 1
     if args.command == "aggregate":
+        _validated_run_paths(args.run_root)
         design = _load_adjacent16_design(args.run_root)
         validate_adjacent16_metric_ownership(args.run_root, design)
         _print_json(aggregate_all_metric_parts(args.run_root))
@@ -308,10 +548,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "final-validate":
         design = _load_adjacent16_design(args.run_root)
         validate_adjacent16_metric_ownership(args.run_root, design)
-        report = validate_adjacent16_final_gate(args.run_root)
+        with _effective_gate_paths(args.run_root):
+            report = validate_adjacent16_final_gate(args.run_root)
         _print_json(report)
         return 0 if report.passed else 1
     if args.command == "analyze":
+        _validated_run_paths(args.run_root)
         outputs = analyze_adjacent16_run(
             args.run_root,
             bootstrap_repeats=args.bootstrap_repeats,
@@ -320,10 +562,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         _print_json(outputs)
         return 0
     if args.command == "visualize":
+        _validated_run_paths(args.run_root)
         _print_json(render_adjacent16_audit(args.run_root, device=args.device))
         return 0
     if args.command == "status":
-        counts, complete = _status(args.run_root)
+        with _effective_gate_paths(args.run_root):
+            counts, complete = _adjacent_status(args.run_root)
         _print_json({"complete": complete, "counts": counts})
         if args.require_complete and not complete:
             return 1

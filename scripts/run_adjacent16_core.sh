@@ -17,8 +17,8 @@ case "$phase" in
 esac
 
 IFS=',' read -r -a gpus <<<"$PHYSICAL_GPUS"
-if [[ "${#gpus[@]}" -ne 4 ]]; then
-  echo "PHYSICAL_GPUS must contain exactly four comma-separated indices" >&2
+if [[ "$PHYSICAL_GPUS" != "0,1,2,3" ]]; then
+  echo "PHYSICAL_GPUS must be exactly 0,1,2,3" >&2
   exit 2
 fi
 
