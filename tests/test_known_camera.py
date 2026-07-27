@@ -7,6 +7,7 @@ from met3r.known_camera import (
     KnownCameraConfig,
     score_factorial_known_camera_pair,
     score_known_camera_pair,
+    score_symmetric_geometry_support,
     score_symmetric_known_camera_pair,
 )
 
@@ -170,6 +171,119 @@ def test_symmetric_score_is_invariant_to_view_order() -> None:
     torch.testing.assert_close(forward.score, reverse.score)
     torch.testing.assert_close(forward.first_to_second.score, reverse.second_to_first.score)
     torch.testing.assert_close(forward.second_to_first.score, reverse.first_to_second.score)
+
+
+def test_geometry_support_matches_symmetric_feature_score_validity_fields() -> None:
+    height = width = 5
+    first_features = torch.randn(1, 8, height, width)
+    second_features = torch.randn(1, 8, height, width)
+    depth = torch.ones(1, height, width)
+    mask = torch.ones(1, height, width, dtype=torch.bool)
+    intrinsics, extrinsics = _identity_camera(1, height, width)
+    config = KnownCameraConfig(min_overlap_fraction=0.0)
+
+    support = score_symmetric_geometry_support(
+        depth,
+        depth,
+        intrinsics,
+        intrinsics,
+        extrinsics,
+        extrinsics,
+        first_mask=mask,
+        second_mask=mask,
+        config=config,
+    )
+    feature_score = score_symmetric_known_camera_pair(
+        first_features,
+        second_features,
+        depth,
+        depth,
+        intrinsics,
+        intrinsics,
+        extrinsics,
+        extrinsics,
+        first_mask=mask,
+        second_mask=mask,
+        config=config,
+    )
+
+    assert torch.equal(support.abstained, feature_score.abstained)
+    for support_direction, feature_direction in (
+        (support.first_to_second, feature_score.first_to_second),
+        (support.second_to_first, feature_score.second_to_first),
+    ):
+        assert torch.equal(support_direction.valid_mask, feature_direction.valid_mask)
+        assert torch.equal(support_direction.abstained, feature_direction.abstained)
+        torch.testing.assert_close(
+            support_direction.overlap_fraction,
+            feature_direction.overlap_fraction,
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            support_direction.projected_xy,
+            feature_direction.projected_xy,
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            support_direction.relative_depth_error,
+            feature_direction.relative_depth_error,
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            support_direction.cycle_error_px,
+            feature_direction.cycle_error_px,
+            rtol=0,
+            atol=0,
+        )
+
+
+def test_feature_changes_cannot_change_geometry_support() -> None:
+    height = width = 5
+    depth = torch.ones(1, height, width)
+    mask = torch.ones(1, height, width, dtype=torch.bool)
+    intrinsics, extrinsics = _identity_camera(1, height, width)
+    config = KnownCameraConfig(min_overlap_fraction=0.0)
+    support = score_symmetric_geometry_support(
+        depth,
+        depth,
+        intrinsics,
+        intrinsics,
+        extrinsics,
+        extrinsics,
+        first_mask=mask,
+        second_mask=mask,
+        config=config,
+    )
+
+    for first_features, second_features in (
+        (torch.randn(1, 8, height, width), torch.randn(1, 8, height, width)),
+        (torch.zeros(1, 8, height, width), torch.ones(1, 8, height, width)),
+    ):
+        scored = score_symmetric_known_camera_pair(
+            first_features,
+            second_features,
+            depth,
+            depth,
+            intrinsics,
+            intrinsics,
+            extrinsics,
+            extrinsics,
+            first_mask=mask,
+            second_mask=mask,
+            config=config,
+        )
+        assert torch.equal(support.abstained, scored.abstained)
+        assert torch.equal(
+            support.first_to_second.valid_mask,
+            scored.first_to_second.valid_mask,
+        )
+        assert torch.equal(
+            support.second_to_first.valid_mask,
+            scored.second_to_first.valid_mask,
+        )
 
 
 def test_factorial_score_separates_feature_and_geometry_effects() -> None:

@@ -41,6 +41,27 @@ class PairMetricResult:
 
 
 @dataclass(frozen=True)
+class DirectionalGeometrySupport:
+    """Feature-independent reprojection support from one view into another."""
+
+    valid_mask: Tensor
+    overlap_fraction: Tensor
+    abstained: Tensor
+    projected_xy: Tensor
+    relative_depth_error: Tensor
+    cycle_error_px: Tensor
+
+
+@dataclass(frozen=True)
+class SymmetricGeometrySupport:
+    """Bidirectional feature-independent reprojection support."""
+
+    first_to_second: DirectionalGeometrySupport
+    second_to_first: DirectionalGeometrySupport
+    abstained: Tensor
+
+
+@dataclass(frozen=True)
 class SymmetricPairMetricResult:
     """Both directional comparisons and their abstention-aware mean."""
 
@@ -99,9 +120,13 @@ def _sample(values: Tensor, grid: Tensor, *, mode: str = "bilinear") -> Tensor:
     )
 
 
-def score_known_camera_pair(
-    target_features: Tensor,
-    source_features: Tensor,
+@dataclass(frozen=True)
+class _DirectionalGeometryProjection:
+    support: DirectionalGeometrySupport
+    grid: Tensor
+
+
+def _score_directional_geometry_support(
     target_depth: Tensor,
     source_depth: Tensor,
     target_intrinsics: Tensor,
@@ -109,22 +134,18 @@ def score_known_camera_pair(
     target_extrinsics_w2c: Tensor,
     source_extrinsics_w2c: Tensor,
     *,
-    target_mask: Tensor | None = None,
-    source_mask: Tensor | None = None,
-    config: KnownCameraConfig | None = None,
-) -> PairMetricResult:
-    """Compare a feature map after target-depth reprojection into the source view."""
+    target_mask: Tensor | None,
+    source_mask: Tensor | None,
+    config: KnownCameraConfig,
+    reference: Tensor,
+) -> _DirectionalGeometryProjection:
+    """Project target depth and establish valid source-view correspondences."""
 
-    config = config or KnownCameraConfig()
-    batch, _, height, width = target_features.shape
-    if source_features.shape[0] != batch:
-        raise ValueError("target and source feature batches must match")
-    if target_depth.shape != (batch, height, width):
-        raise ValueError("target_depth must match the target feature resolution")
+    batch, height, width = target_depth.shape
     if source_depth.shape != (batch, height, width):
-        raise ValueError("source_depth must match the source feature resolution")
+        raise ValueError("source_depth must match the target feature resolution")
 
-    pixels = _pixel_grid(batch, height, width, target_features)
+    pixels = _pixel_grid(batch, height, width, reference)
     target_xyz = torch.linalg.solve(target_intrinsics, pixels)
     target_xyz = target_xyz * target_depth.reshape(batch, 1, -1)
     target_h = torch.cat((target_xyz, torch.ones_like(target_xyz[:, :1])), dim=1)
@@ -140,10 +161,9 @@ def score_known_camera_pair(
     normalized_y = 2 * y / max(height - 1, 1) - 1
     grid = torch.stack((normalized_x, normalized_y), dim=-1).reshape(batch, height, width, 2)
 
-    sampled_features = _sample(source_features, grid)
     sampled_depth = _sample(source_depth[:, None], grid)[:, 0]
     sampled_source_mask = _sample(
-        _as_mask(source_mask, source_depth)[:, None].to(target_features.dtype),
+        _as_mask(source_mask, source_depth)[:, None].to(reference.dtype),
         grid,
         mode="nearest",
     )[:, 0] > 0.5
@@ -190,26 +210,126 @@ def score_known_camera_pair(
         & depth_consistent
     )
 
-    score_map = 1 - F.cosine_similarity(target_features, sampled_features, dim=1, eps=config.eps)
     valid_count = valid_mask.flatten(1).sum(dim=1)
     foreground_count = target_valid.flatten(1).sum(dim=1).clamp_min(1)
     overlap_fraction = valid_count / foreground_count
     abstained = (valid_count == 0) | (
         overlap_fraction < config.min_overlap_fraction
     )
-    weighted_sum = (score_map * valid_mask).flatten(1).sum(dim=1)
+    return _DirectionalGeometryProjection(
+        support=DirectionalGeometrySupport(
+            valid_mask=valid_mask,
+            overlap_fraction=overlap_fraction,
+            abstained=abstained,
+            projected_xy=projected_xy.reshape(batch, 2, height, width),
+            relative_depth_error=relative_depth_error,
+            cycle_error_px=cycle_error_px,
+        ),
+        grid=grid,
+    )
+
+
+def score_known_camera_pair(
+    target_features: Tensor,
+    source_features: Tensor,
+    target_depth: Tensor,
+    source_depth: Tensor,
+    target_intrinsics: Tensor,
+    source_intrinsics: Tensor,
+    target_extrinsics_w2c: Tensor,
+    source_extrinsics_w2c: Tensor,
+    *,
+    target_mask: Tensor | None = None,
+    source_mask: Tensor | None = None,
+    config: KnownCameraConfig | None = None,
+) -> PairMetricResult:
+    """Compare a feature map after target-depth reprojection into the source view."""
+
+    config = config or KnownCameraConfig()
+    batch, _, height, width = target_features.shape
+    if source_features.shape[0] != batch:
+        raise ValueError("target and source feature batches must match")
+    if target_depth.shape != (batch, height, width):
+        raise ValueError("target_depth must match the target feature resolution")
+    if source_depth.shape != (batch, height, width):
+        raise ValueError("source_depth must match the source feature resolution")
+
+    projection = _score_directional_geometry_support(
+        target_depth,
+        source_depth,
+        target_intrinsics,
+        source_intrinsics,
+        target_extrinsics_w2c,
+        source_extrinsics_w2c,
+        target_mask=target_mask,
+        source_mask=source_mask,
+        config=config,
+        reference=target_features,
+    )
+    support = projection.support
+    sampled_features = _sample(source_features, projection.grid)
+
+    score_map = 1 - F.cosine_similarity(target_features, sampled_features, dim=1, eps=config.eps)
+    valid_count = support.valid_mask.flatten(1).sum(dim=1)
+    weighted_sum = (score_map * support.valid_mask).flatten(1).sum(dim=1)
     score = weighted_sum / valid_count.clamp_min(1)
-    score = torch.where(abstained, torch.full_like(score, torch.nan), score)
+    score = torch.where(support.abstained, torch.full_like(score, torch.nan), score)
 
     return PairMetricResult(
         score=score,
         score_map=score_map,
-        valid_mask=valid_mask,
-        overlap_fraction=overlap_fraction,
-        abstained=abstained,
-        projected_xy=projected_xy.reshape(batch, 2, height, width),
-        relative_depth_error=relative_depth_error,
-        cycle_error_px=cycle_error_px,
+        valid_mask=support.valid_mask,
+        overlap_fraction=support.overlap_fraction,
+        abstained=support.abstained,
+        projected_xy=support.projected_xy,
+        relative_depth_error=support.relative_depth_error,
+        cycle_error_px=support.cycle_error_px,
+    )
+
+
+def score_symmetric_geometry_support(
+    first_depth: Tensor,
+    second_depth: Tensor,
+    first_intrinsics: Tensor,
+    second_intrinsics: Tensor,
+    first_extrinsics_w2c: Tensor,
+    second_extrinsics_w2c: Tensor,
+    *,
+    first_mask: Tensor | None = None,
+    second_mask: Tensor | None = None,
+    config: KnownCameraConfig | None = None,
+) -> SymmetricGeometrySupport:
+    """Measure reprojection support without constructing dummy features."""
+
+    config = config or KnownCameraConfig()
+    first_to_second = _score_directional_geometry_support(
+        first_depth,
+        second_depth,
+        first_intrinsics,
+        second_intrinsics,
+        first_extrinsics_w2c,
+        second_extrinsics_w2c,
+        target_mask=first_mask,
+        source_mask=second_mask,
+        config=config,
+        reference=first_depth,
+    ).support
+    second_to_first = _score_directional_geometry_support(
+        second_depth,
+        first_depth,
+        second_intrinsics,
+        first_intrinsics,
+        second_extrinsics_w2c,
+        first_extrinsics_w2c,
+        target_mask=second_mask,
+        source_mask=first_mask,
+        config=config,
+        reference=second_depth,
+    ).support
+    return SymmetricGeometrySupport(
+        first_to_second=first_to_second,
+        second_to_first=second_to_first,
+        abstained=first_to_second.abstained | second_to_first.abstained,
     )
 
 
