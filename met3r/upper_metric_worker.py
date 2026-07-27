@@ -321,9 +321,13 @@ def _validate_native_shape(
     native_variants = [
         variant for variant in variants if variant.feature_mode == "native"
     ]
-    if len(native_variants) != 1:
+    if len(native_variants) == 1:
+        expected = native_variants[0].resolution
+    elif not native_variants:
+        # Adjacent's frozen L matrix records its native grid as bilinear.
+        expected = min(variant.resolution for variant in variants)
+    else:
         raise ValueError("each feature track/input must have exactly one native variant")
-    expected = native_variants[0].resolution
     if native.ndim != 4 or tuple(native.shape[-2:]) != (expected, expected):
         raise ValueError(
             "backbone native grid does not match the feature variant contract: "

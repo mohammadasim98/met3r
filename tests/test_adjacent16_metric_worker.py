@@ -118,8 +118,8 @@ def test_adjacent_controlled_worker_uses_clean_geometry_and_posthoc_storage(tmp_
     raw = json.dumps(config).encode(); digest = hashlib.sha256(raw).hexdigest()
     (root / "config/frozen_config.json").write_bytes(raw)
     (root / "run_manifest.json").write_text(json.dumps({"config_sha256": digest}))
-    variant = {"feature_track": "track", "backbone": "fake", "input_size": 8, "feature_mode": "native", "resolution": 2}
-    (root / "manifests/feature_variants.json").write_text(json.dumps([variant]))
+    variants = [{"feature_track": "track", "backbone": "fake", "input_size": 8, "feature_mode": "bilinear", "resolution": value} for value in range(2, 11)]
+    (root / "manifests/feature_variants.json").write_text(json.dumps(variants))
     rows = []
     for sid, changed, corruption in (("clean", None, "clean"), ("changed", "0", "jpeg")):
         directory = root / "states" / sid; (directory / "images").mkdir(parents=True)
@@ -135,13 +135,15 @@ def test_adjacent_controlled_worker_uses_clean_geometry_and_posthoc_storage(tmp_
     np.savez_compressed(geometry / "depth_geometry.npz", depth=np.ones((4,504,504),np.float32), mask=np.ones((4,504,504),bool), confidence=np.ones((4,504,504),np.float32), intrinsics=np.broadcast_to(np.eye(3),(4,3,3)).copy(), extrinsics=np.broadcast_to(np.eye(4),(4,4,4)).copy(), meta__view_ids=np.asarray(views), meta__camera_groups=np.asarray(("upper",)*4), meta__camera_provenance=np.asarray("fixed_precomputed_da3"))
     (geometry / "depth_geometry.json").write_text(json.dumps({"camera_mode": CAMERA_MODE_LABEL, "camera_provenance": "fixed_precomputed_da3", "process_res": 504, "view_ids": list(views), "camera_groups": ["upper"]*4}))
     registry = JobRegistry(root / "registry/jobs.sqlite")
-    payload = {"job_type": "feature", "state_id": "changed", "track": "controlled", "analysis_track": "controlled", "shoe_id": "shoe", "quartet_id": "q3", "state_dir": str((root / "states/changed").resolve()), "config_sha256": digest, "backbone": "fake", "feature_track": "track", "variant_keys": ["track__fake__8__native__2"], "geometry_contract": "fixed_base_only"}
+    keys = [f"track__fake__8__bilinear__{value}" for value in range(2, 11)]
+    payload = {"job_type": "feature", "state_id": "changed", "track": "controlled", "analysis_track": "controlled", "shoe_id": "shoe", "quartet_id": "q3", "state_dir": str((root / "states/changed").resolve()), "config_sha256": digest, "backbone": "fake", "feature_track": "track", "variant_keys": list(reversed(keys)), "geometry_contract": "fixed_base_only"}
     registry.register(JobDefinition("wanted", "feature", payload)); registry.register(JobDefinition("other", "feature", payload))
     monkeypatch.setattr("met3r.upper_metric_worker.load_feature_backbone", lambda _: _TinyBackbone())
     monkeypatch.setattr("met3r.upper_metric_worker.load_naf_upsampler", lambda **_: _TinyNAF())
     monkeypatch.setattr("met3r.upper_metric_worker._fit_or_load_pca", lambda *args: (_ for _ in ()).throw(AssertionError("PCA")))
     assert run_feature_worker(root, "fake", "cpu", job_ids=["wanted"]).completed == 1
     frame = pd.read_parquet(root / "metrics/parts/track/wanted.parquet")
+    assert len(frame) == 9 and frame["variant_key"].tolist() == keys
     assert frame.iloc[0][["s00", "s01"]].nunique() == 1 and frame.iloc[0][["s10", "s11"]].nunique() == 1
     assert frame.iloc[0]["geometry_effect"] == 0 and frame.iloc[0]["interaction"] == 0
     assert frame.iloc[0]["quartet_id"] == "q3" and frame.iloc[0]["baseline_steps"] == 1 and frame.iloc[0]["angular_separation_deg"] == 7.5
