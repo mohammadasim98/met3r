@@ -446,6 +446,55 @@ def test_stress_symmetric_pass_rate_counts_invalid_rows_in_the_frozen_denominato
     assert failing.failed_checks == ("stress_symmetric_pass_rate",)
 
 
+def test_final_gate_rejects_identity_swap_manifest_mutation_without_row_loss(tmp_path: Path) -> None:
+    """Catch a cardinality-only manifest validation that accepts a changed frozen identity."""
+
+    fixture = _final_gate_fixture(tmp_path)
+    root = fixture["root"]
+    assert isinstance(root, Path)
+    path = root / "manifests" / "pair_conditions.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    identity = next(
+        row for row in rows
+        if row["track"] == "controlled" and row["corruption"] == "identity_swap" and row["severity"] == 1.0
+    )
+    identity["severity"] = 9.0
+    path.write_text("".join(json.dumps(row, sort_keys=True) + "\n" for row in rows))
+
+    report = validate_adjacent16_final_gate(root)
+    assert report.actual_rows == report.expected_rows
+    assert report.passed is False
+    assert "metric_row_counts" not in report.failed_checks
+    assert "input_validation" in report.failed_checks
+
+
+@pytest.mark.parametrize("track", ("controlled", "stress", "geometry_calibration"))
+def test_final_gate_rejects_duplicate_metric_keys_without_row_loss(tmp_path: Path, track: str) -> None:
+    """Catch a metric validator that checks only the frozen row cardinality."""
+
+    fixture = _final_gate_fixture(tmp_path)
+    root = fixture["root"]
+    path = fixture["metrics"][track]
+    assert isinstance(root, Path)
+    frame = pd.read_parquet(path)
+    if track == "controlled":
+        hard = frame.index[(frame.corruption == "identity_swap") & (frame.severity == 1.0)][0]
+        easy = frame.index[(frame.corruption == "clean") & (frame.severity == 0.0)][0]
+    elif track == "stress":
+        hard, easy = frame.index[-1], frame.index[0]
+    else:
+        hard = frame.index[frame.perturbation_kind == "relative_depth_noise"][-1]
+        easy = frame.index[frame.perturbation_kind == "rotation"][0]
+    frame.loc[hard] = frame.loc[easy]
+    frame.to_parquet(path, index=False)
+
+    report = validate_adjacent16_final_gate(root)
+    assert report.actual_rows == report.expected_rows
+    assert report.passed is False
+    assert "metric_row_counts" not in report.failed_checks
+    assert "metric_row_keys" in report.failed_checks
+
+
 def _frozen_config(root: Path) -> None:
     (root / "config").mkdir(parents=True)
     source = Path("configs/adjacent16_core.json")
