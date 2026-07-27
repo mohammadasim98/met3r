@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from dataclasses import asdict
@@ -493,6 +494,76 @@ def test_final_gate_rejects_duplicate_metric_keys_without_row_loss(tmp_path: Pat
     assert report.passed is False
     assert "metric_row_counts" not in report.failed_checks
     assert "metric_row_keys" in report.failed_checks
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_failure"),
+    (
+        pytest.param("unknown_job_id", "registry_graph", id="unknown-job-id"),
+        pytest.param("semantic_payload", "registry_graph", id="semantic-payload"),
+        pytest.param("pending", "unexplained_jobs", id="pending-job"),
+        pytest.param("bad_output_hash", "registry_output_hashes", id="bad-output-hash"),
+    ),
+)
+def test_final_gate_rejects_registry_and_output_mutations(
+    tmp_path: Path,
+    mutation: str,
+    expected_failure: str,
+) -> None:
+    """Catch count-preserving registry changes before they can masquerade as a frozen run."""
+
+    fixture = _final_gate_fixture(tmp_path)
+    root = fixture["root"]
+    assert isinstance(root, Path)
+    registry_path = root / "registry" / "jobs.sqlite"
+    with sqlite3.connect(registry_path) as connection:
+        job_id, payload_json, output_manifest_json = connection.execute(
+            "SELECT job_id, payload_json, output_manifest_json FROM jobs ORDER BY job_id LIMIT 1"
+        ).fetchone()
+        if mutation == "unknown_job_id":
+            connection.execute("UPDATE jobs SET job_id = ? WHERE job_id = ?", ("unknown__frozen_job", job_id))
+        elif mutation == "semantic_payload":
+            payload = json.loads(payload_json)
+            payload["analysis_track"] = "semantic_tamper"
+            canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            connection.execute(
+                "UPDATE jobs SET payload_json = ?, payload_hash = ? WHERE job_id = ?",
+                (canonical, hashlib.sha256(canonical.encode()).hexdigest(), job_id),
+            )
+        elif mutation == "pending":
+            connection.execute("UPDATE jobs SET state = 'pending' WHERE job_id = ?", (job_id,))
+        else:
+            manifest = json.loads(output_manifest_json)
+            manifest["files"][0]["sha256"] = "0" * 64
+            connection.execute(
+                "UPDATE jobs SET output_manifest_json = ? WHERE job_id = ?",
+                (json.dumps(manifest), job_id),
+            )
+
+    report = validate_adjacent16_final_gate(root)
+    assert report.actual_rows == report.expected_rows
+    assert report.passed is False
+    assert report.failed_checks == (expected_failure,)
+    if mutation == "pending":
+        assert report.unexplained_jobs == (job_id,)
+    if mutation == "semantic_payload":
+        assert "input_validation" not in report.failed_checks
+
+
+def test_final_gate_reports_exact_relative_raw_feature_artifact_paths(tmp_path: Path) -> None:
+    """Catch raw feature storage under reports, regardless of its serialized extension."""
+
+    fixture = _final_gate_fixture(tmp_path)
+    root = fixture["root"]
+    assert isinstance(root, Path)
+    names = ("embedding.npy", "raw.safetensors", "weights.pt", "checkpoint.pth", "artifact.bin")
+    for name in names:
+        (root / "reports" / name).write_bytes(b"raw-feature-storage\n")
+
+    report = validate_adjacent16_final_gate(root)
+    assert report.passed is False
+    assert report.failed_checks == ("raw_feature_artifact",)
+    assert report.raw_feature_artifacts == tuple(sorted(f"reports/{name}" for name in names))
 
 
 def _frozen_config(root: Path) -> None:
