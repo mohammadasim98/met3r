@@ -62,10 +62,25 @@ _TRANSIENT_ERRNOS = frozenset(
     }
 )
 _QUALITY_FIELDS = (
+    "generation_valid",
     "semantic_gate",
     "preservation_gate",
     "camera_preserved",
+    "background_preserved",
     "outsole_preserved",
+    "last_is_hidden",
+    "same_shoe_identity",
+    "design_preservation",
+    "photorealism",
+    "deformation_plausibility",
+    "semantic_confidence",
+    "semantic_quality_score",
+    "center_shift_normalized",
+    "bottom_shift_normalized",
+    "width_ratio",
+    "strict_compliant",
+    "moderate_alignment",
+    "alignment_class",
     "fit_relation",
 )
 _MIDDLE_DIAGNOSTIC_SEVERITY = {
@@ -1152,15 +1167,22 @@ def _metric_frame(rows: Sequence[Mapping[str, object]]) -> pd.DataFrame:
             f"{prefix}_{field}"
             for prefix in ("first", "second")
             for field in (
+                "generation_valid",
                 "semantic_gate",
                 "preservation_gate",
                 "camera_preserved",
+                "background_preserved",
                 "outsole_preserved",
+                "last_is_hidden",
+                "strict_compliant",
+                "moderate_alignment",
             )
         ),
     }
     string_columns = {
         "changed_view",
+        "first_alignment_class",
+        "second_alignment_class",
         "first_fit_relation",
         "second_fit_relation",
     }

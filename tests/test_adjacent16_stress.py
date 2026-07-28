@@ -125,15 +125,7 @@ def test_tasks_use_one_subprocess_per_view_round_robin_and_atomic_promotion(
     def fake_run(command, **kwargs):  # type: ignore[no-untyped-def]
         calls.append((list(command), kwargs["env"]["CUDA_VISIBLE_DEVICES"]))
         output = Path(command[command.index("--output-dir") + 1])
-        _png(output / "deformed.png")
-        _png(output / "deformed_mask.png", "L")
-        selected = {
-            "attempt_id": "attempt_01",
-            "semantic": {"camera_preserved": True, "background_preserved": True},
-            "preservation": {"passes_gate": True},
-        }
-        (output / "deformation.json").write_text(json.dumps({"selected_attempt_id": "attempt_01", "attempts": [selected]}))
-        (output / "metrics.json").write_text(json.dumps({"selected": "attempt_01"}))
+        _accepted_artifacts(output)
         class Result: returncode = 0
         return Result()
 
@@ -173,7 +165,9 @@ def test_stress_child_launch_does_not_require_fork(
                 "shutil.copy2(output / 'source.png', output / 'deformed.png')",
                 "shutil.copy2(output / 'source_mask.png', output / 'deformed_mask.png')",
                 "selected = {'attempt_id': 'a', 'semantic': {'camera_preserved': True, "
-                "'background_preserved': True}, 'preservation': {'passes_gate': True}}",
+                "'background_preserved': True}, 'preservation': {'passes_gate': True, "
+                "'center_shift_normalized': 0.001, 'bottom_shift_normalized': 0.001, "
+                "'width_ratio': 1.0}}",
                 "(output / 'deformation.json').write_text(json.dumps("
                 "{'selected_attempt_id': 'a', 'attempts': [selected]}))",
                 "(output / 'metrics.json').write_text('{}')",
@@ -211,11 +205,7 @@ def test_reuse_is_invalidated_by_input_prompt_or_implementation_hash(
     def fake_run(command, **kwargs):  # type: ignore[no-untyped-def]
         calls.append(1)
         output = Path(command[command.index("--output-dir") + 1])
-        _png(output / "deformed.png")
-        _png(output / "deformed_mask.png", "L")
-        selected = {"attempt_id": "a", "semantic": {"camera_preserved": True, "background_preserved": True}, "preservation": {"passes_gate": True}}
-        (output / "deformation.json").write_text(json.dumps({"selected_attempt_id": "a", "attempts": [selected]}))
-        (output / "metrics.json").write_text("{}")
+        _accepted_artifacts(output)
         class Result: returncode = 0
         return Result()
 
@@ -228,28 +218,46 @@ def test_reuse_is_invalidated_by_input_prompt_or_implementation_hash(
     assert len(calls) == 2
 
 
-def test_rejected_attempts_are_archived_and_never_accepted_by_score(
+def test_generation_valid_noncompliant_attempt_is_promoted_with_reliability_labels(
     tmp_path: Path, monkeypatch
 ) -> None:
     task = _task(tmp_path)
 
     def fake_run(command, **kwargs):  # type: ignore[no-untyped-def]
         output = Path(command[command.index("--output-dir") + 1])
-        _png(output / "deformed.png")
-        _png(output / "deformed_mask.png", "L")
-        selected = {"attempt_id": "a", "semantic": {"camera_preserved": False, "background_preserved": True}, "preservation": {"passes_gate": True}, "metrics": {"fit_score": 999.0}}
-        (output / "deformation.json").write_text(json.dumps({"selected_attempt_id": "a", "attempts": [selected]}))
-        (output / "metrics.json").write_text("{}")
+        _accepted_artifacts(
+            output,
+            camera=False,
+            background=True,
+            crop=False,
+            center_shift=0.02,
+            bottom_shift=0.01,
+            width_ratio=1.04,
+        )
         class Result: returncode = 0
         return Result()
 
     monkeypatch.setattr("met3r.adjacent16_stress.subprocess.run", fake_run)
     result = run_stress_tasks((task,), max_outer_attempts=1)
 
-    assert result["accepted"] == 0
-    assert not task.output_dir.exists()
-    archived = list((task.output_dir.parent / "rejected_attempts").rglob("deformation.json"))
-    assert len(archived) == 1
+    assert result["accepted"] == 1
+    assert (task.output_dir / "deformed.png").is_file()
+    assert not list((task.output_dir.parent / "rejected_attempts").rglob("deformation.json"))
+    record = json.loads((task.output_dir / "task.json").read_text())
+    assert record["status"] == "accepted"
+    assert record["generation_valid"] is True
+    assert record["strict_compliant"] is False
+    assert record["reliability"] == {
+        "alignment_class": "moderate",
+        "background_preserved": True,
+        "bottom_shift_normalized": 0.01,
+        "camera_preserved": False,
+        "center_shift_normalized": 0.02,
+        "crop_preservation_gate": False,
+        "moderate_alignment": True,
+        "strict_compliant": False,
+        "width_ratio": 1.04,
+    }
 
 
 def test_reuse_requires_unchanged_inputs_prompt_implementation_bytesize_and_outputs(
@@ -528,7 +536,9 @@ def test_exchange_and_recovery_failure_marks_neutral_slot_rejected(
 
 
 @pytest.mark.parametrize("field", ("camera", "background", "crop"))
-def test_each_frozen_acceptance_gate_can_reject(tmp_path: Path, monkeypatch, field: str) -> None:
+def test_each_frozen_acceptance_gate_is_an_annotation_not_an_exclusion(
+    tmp_path: Path, monkeypatch, field: str
+) -> None:
     task = _task(tmp_path)
 
     def fake_run(args, **kwargs):  # type: ignore[no-untyped-def]
@@ -539,7 +549,12 @@ def test_each_frozen_acceptance_gate_can_reject(tmp_path: Path, monkeypatch, fie
         return Result()
 
     monkeypatch.setattr("met3r.adjacent16_stress.subprocess.run", fake_run)
-    assert run_stress_tasks((task,), max_outer_attempts=1)["accepted"] == 0
+    result = run_stress_tasks((task,), max_outer_attempts=1)
+
+    assert result["accepted"] == 1
+    record = json.loads((task.output_dir / "task.json").read_text())
+    assert record["generation_valid"] is True
+    assert record["strict_compliant"] is False
 
 
 def test_unrelated_semantic_outsole_and_fit_fields_do_not_change_acceptance(
@@ -556,15 +571,30 @@ def test_unrelated_semantic_outsole_and_fit_fields_do_not_change_acceptance(
     assert run_stress_tasks((task,), max_outer_attempts=1)["accepted"] == 1
 
 
-def _accepted_artifacts(output: Path, *, camera: bool = True, background: bool = True,
-                        crop: bool = True, outsole: bool = True, fit: str = "worsened") -> None:
+def _accepted_artifacts(
+    output: Path,
+    *,
+    camera: bool = True,
+    background: bool = True,
+    crop: bool = True,
+    outsole: bool = True,
+    fit: str = "worsened",
+    center_shift: float = 0.001,
+    bottom_shift: float = 0.001,
+    width_ratio: float = 1.0,
+) -> None:
     _png(output / "deformed.png")
     _png(output / "deformed_mask.png", "L")
     selected = {
         "attempt_id": "attempt", "semantic": {
             "camera_preserved": camera, "background_preserved": background,
             "outsole_preserved": outsole, "passes_gate": False,
-        }, "preservation": {"passes_gate": crop},
+        }, "preservation": {
+            "passes_gate": crop,
+            "center_shift_normalized": center_shift,
+            "bottom_shift_normalized": bottom_shift,
+            "width_ratio": width_ratio,
+        },
         "comparison": {"relation": fit}, "metrics": {"fit_score": 999.0},
     }
     (output / "deformation.json").write_text(json.dumps({"selected_attempt_id": "attempt", "attempts": [selected]}))

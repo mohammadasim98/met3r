@@ -552,7 +552,7 @@ def _parser() -> argparse.ArgumentParser:
     prepare_stress.add_argument("--run-root", type=_resolved)
     prepare_stress.add_argument("--physical-gpus", type=_gpu_indices)
     prepare_stress.add_argument("--max-parallel", type=int, default=4)
-    prepare_stress.add_argument("--max-outer-attempts", type=int, default=3)
+    prepare_stress.add_argument("--max-outer-attempts", type=int, default=1)
 
     prepare = commands.add_parser("prepare", help="prepare the immutable run tree")
     prepare.add_argument("config", type=_resolved)

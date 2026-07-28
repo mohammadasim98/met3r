@@ -165,10 +165,28 @@ def _audit_stress(manifest: Adjacent16Manifest) -> None:
     for shoe in manifest.shoes:
         for view in shoe.views:
             quality = view.quality
-            if quality is None or not all((
-                quality.status == "ok", quality.task_status == "ok", quality.semantic_gate,
-                quality.preservation_gate, quality.camera_preserved, quality.outsole_preserved,
-            )):
+            if (
+                quality is None
+                or not quality.generation_valid
+                or quality.task_status not in {"ok", "accepted"}
+                or quality.background_preserved is None
+                or quality.last_is_hidden is None
+                or any(
+                    value is None
+                    for value in (
+                        quality.same_shoe_identity,
+                        quality.design_preservation,
+                        quality.photorealism,
+                        quality.deformation_plausibility,
+                        quality.semantic_confidence,
+                        quality.semantic_quality_score,
+                        quality.center_shift_normalized,
+                        quality.bottom_shift_normalized,
+                        quality.width_ratio,
+                    )
+                )
+                or quality.alignment_class == "unknown"
+            ):
                 raise ValueError(f"stress audit failed for {shoe.shoe_id}/{view.quartet_id}/{view.view_id}")
 
 

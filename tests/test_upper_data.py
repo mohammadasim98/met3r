@@ -57,9 +57,22 @@ def _valid_deformation_payload() -> dict[str, object]:
         "semantic": {
             "passes_gate": False,
             "camera_preserved": True,
+            "background_preserved": True,
             "outsole_preserved": True,
+            "last_is_hidden": True,
+            "same_shoe_identity": 0.98,
+            "design_preservation": 0.96,
+            "photorealism": 0.94,
+            "deformation_plausibility": 0.92,
+            "confidence": 0.97,
+            "quality_score": 95.0,
         },
-        "preservation": {"passes_gate": False},
+        "preservation": {
+            "passes_gate": False,
+            "center_shift_normalized": 0.02,
+            "bottom_shift_normalized": 0.01,
+            "width_ratio": 1.04,
+        },
         "comparison": {"relation": "improved"},
         "metrics": {"fit_score": 90.0},
     }
@@ -68,6 +81,23 @@ def _valid_deformation_payload() -> dict[str, object]:
         "selected_attempt_id": "attempt_01",
         "attempts": [selected],
     }
+
+
+def test_quality_retains_noncompliance_as_continuous_reliability_metadata() -> None:
+    quality = upper_data._quality(
+        _valid_deformation_payload(),
+        {"status": "accepted", "generation_valid": True},
+    )
+
+    assert quality.generation_valid is True
+    assert quality.strict_compliant is False
+    assert quality.moderate_alignment is True
+    assert quality.alignment_class == "moderate"
+    assert quality.background_preserved is True
+    assert quality.center_shift_normalized == pytest.approx(0.02)
+    assert quality.bottom_shift_normalized == pytest.approx(0.01)
+    assert quality.width_ratio == pytest.approx(1.04)
+    assert quality.same_shoe_identity == pytest.approx(0.98)
 
 
 @pytest.fixture

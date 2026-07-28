@@ -608,12 +608,25 @@ def _source_manifest(
                     expected_quality is None
                     or not isinstance(raw_quality, Mapping)
                     or not _strict_json_equal(raw_quality, expected_quality_json)
-                    or expected_quality.status != "ok"
-                    or expected_quality.task_status != "ok"
-                    or not expected_quality.semantic_gate
-                    or not expected_quality.preservation_gate
-                    or not expected_quality.camera_preserved
-                    or not expected_quality.outsole_preserved
+                    or not expected_quality.generation_valid
+                    or expected_quality.task_status not in {"ok", "accepted"}
+                    or expected_quality.background_preserved is None
+                    or expected_quality.last_is_hidden is None
+                    or any(
+                        value is None
+                        for value in (
+                            expected_quality.same_shoe_identity,
+                            expected_quality.design_preservation,
+                            expected_quality.photorealism,
+                            expected_quality.deformation_plausibility,
+                            expected_quality.semantic_confidence,
+                            expected_quality.semantic_quality_score,
+                            expected_quality.center_shift_normalized,
+                            expected_quality.bottom_shift_normalized,
+                            expected_quality.width_ratio,
+                        )
+                    )
+                    or expected_quality.alignment_class == "unknown"
                 ):
                     raise ValueError("adjacent stress audit preservation failed")
                 stress_sha256 = expected_stress_sha256
@@ -1589,10 +1602,25 @@ _CALIBRATION_IDENTITY_FIELDS = (
     *_METRIC_IDENTITY_FIELDS[15:],
 )
 _STRESS_METRIC_QUALITY_FIELDS = (
+    "generation_valid",
     "semantic_gate",
     "preservation_gate",
     "camera_preserved",
+    "background_preserved",
     "outsole_preserved",
+    "last_is_hidden",
+    "same_shoe_identity",
+    "design_preservation",
+    "photorealism",
+    "deformation_plausibility",
+    "semantic_confidence",
+    "semantic_quality_score",
+    "center_shift_normalized",
+    "bottom_shift_normalized",
+    "width_ratio",
+    "strict_compliant",
+    "moderate_alignment",
+    "alignment_class",
     "fit_relation",
 )
 
@@ -1763,6 +1791,18 @@ def _validate_stress_metric_quality(
                     if (
                         not isinstance(actual_value, (bool, np.bool_))
                         or bool(actual_value) != expected_value
+                    ):
+                        return False
+                elif isinstance(expected_value, float):
+                    if (
+                        not isinstance(
+                            actual_value,
+                            (int, float, np.integer, np.floating),
+                        )
+                        or isinstance(actual_value, (bool, np.bool_))
+                        or not np.isclose(
+                            float(actual_value), expected_value, rtol=0.0, atol=1e-12
+                        )
                     ):
                         return False
                 elif (

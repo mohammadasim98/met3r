@@ -60,9 +60,22 @@ def write_valid_stress(root: Path, shoe_id: str, quartet_id: str, view_id: str) 
         "semantic": {
             "passes_gate": True,
             "camera_preserved": True,
+            "background_preserved": True,
             "outsole_preserved": True,
+            "last_is_hidden": True,
+            "same_shoe_identity": 0.98,
+            "design_preservation": 0.97,
+            "photorealism": 0.96,
+            "deformation_plausibility": 0.95,
+            "confidence": 0.99,
+            "quality_score": 97.0,
         },
-        "preservation": {"passes_gate": True},
+        "preservation": {
+            "passes_gate": True,
+            "center_shift_normalized": 0.001,
+            "bottom_shift_normalized": 0.001,
+            "width_ratio": 1.0,
+        },
         "comparison": {"relation": "equivalent"},
         "metrics": {"fit_score": 1.0},
     }
@@ -78,7 +91,9 @@ def write_valid_stress(root: Path, shoe_id: str, quartet_id: str, view_id: str) 
             }
         )
     )
-    (deformation / "task.json").write_text(json.dumps({"status": "ok"}))
+    (deformation / "task.json").write_text(
+        json.dumps({"status": "accepted", "generation_valid": True})
+    )
 
 
 def _view_image(index: int, shoe_offset: int) -> Image.Image:

@@ -145,10 +145,25 @@ def _quality(value: bool, relation: str) -> dict[str, object]:
     return {
         "status": "low_quality",
         "selected_attempt_id": "attempt-1",
+        "generation_valid": True,
         "semantic_gate": value,
         "preservation_gate": not value,
         "camera_preserved": value,
+        "background_preserved": not value,
         "outsole_preserved": not value,
+        "last_is_hidden": True,
+        "same_shoe_identity": 0.98 if value else 0.91,
+        "design_preservation": 0.96 if value else 0.90,
+        "photorealism": 0.94,
+        "deformation_plausibility": 0.92,
+        "semantic_confidence": 0.97,
+        "semantic_quality_score": 95.0 if value else 90.0,
+        "center_shift_normalized": 0.001 if value else 0.02,
+        "bottom_shift_normalized": 0.001 if value else 0.01,
+        "width_ratio": 1.0 if value else 1.04,
+        "strict_compliant": value,
+        "moderate_alignment": True,
+        "alignment_class": "strict" if value else "moderate",
         "fit_relation": relation,
         "task_status": "complete",
     }
@@ -654,8 +669,16 @@ def test_stress_rows_keep_both_view_quality_covariates(
         "second_preservation_gate",
         "first_camera_preserved",
         "second_camera_preserved",
+        "first_background_preserved",
+        "second_background_preserved",
         "first_outsole_preserved",
         "second_outsole_preserved",
+        "first_center_shift_normalized",
+        "second_center_shift_normalized",
+        "first_width_ratio",
+        "second_width_ratio",
+        "first_alignment_class",
+        "second_alignment_class",
         "first_fit_relation",
         "second_fit_relation",
     } <= set(frame)
@@ -664,6 +687,9 @@ def test_stress_rows_keep_both_view_quality_covariates(
     assert bool(row["second_semantic_gate"]) is False
     assert row["first_fit_relation"] == "improved"
     assert row["second_fit_relation"] == "equivalent"
+    assert row["first_alignment_class"] == "strict"
+    assert row["second_alignment_class"] == "moderate"
+    assert float(row["second_center_shift_normalized"]) == pytest.approx(0.02)
 
 
 def test_geometry_calibration_scores_seventeen_perturbations_per_changed_view(

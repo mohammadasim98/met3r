@@ -12,6 +12,7 @@ import pandas as pd
 from PIL import Image
 
 from met3r.adjacent16_gate import (
+    _STRESS_METRIC_QUALITY_FIELDS,
     _registry_rows,
     _source_manifest,
     _validate_metric_keys,
@@ -117,7 +118,22 @@ def _write_frozen_manifest_fixture(root: Path) -> tuple[tuple[Path, ...], object
                             camera_preserved=True,
                             outsole_preserved=True,
                             fit_relation="equivalent",
-                            task_status="ok",
+                            task_status="accepted",
+                            generation_valid=True,
+                            background_preserved=True,
+                            last_is_hidden=True,
+                            same_shoe_identity=0.98,
+                            design_preservation=0.97,
+                            photorealism=0.96,
+                            deformation_plausibility=0.95,
+                            semantic_confidence=0.99,
+                            semantic_quality_score=97.0,
+                            center_shift_normalized=0.001,
+                            bottom_shift_normalized=0.001,
+                            width_ratio=1.0,
+                            strict_compliant=True,
+                            moderate_alignment=True,
+                            alignment_class="strict",
                         ),
                     )
                 )
@@ -407,13 +423,7 @@ def _metric_row(
         **{
             f"{prefix}_{field}": None
             for prefix in ("first", "second")
-            for field in (
-                "semantic_gate",
-                "preservation_gate",
-                "camera_preserved",
-                "outsole_preserved",
-                "fit_relation",
-            )
+            for field in _STRESS_METRIC_QUALITY_FIELDS
         },
         **extra,
     }
@@ -440,13 +450,7 @@ def _write_frozen_metric_tables(root: Path, contract: object, design: object, co
                 ("first", condition.first_view),
                 ("second", condition.second_view),
             )
-            for field in (
-                "semantic_gate",
-                "preservation_gate",
-                "camera_preserved",
-                "outsole_preserved",
-                "fit_relation",
-            )
+            for field in _STRESS_METRIC_QUALITY_FIELDS
         }
         for variant in design.feature_variants:
             stress.append(
@@ -529,13 +533,7 @@ def test_metric_validation_rejects_stress_quality_that_differs_from_source_view(
     columns = tuple(
         f"{prefix}_{field}"
         for prefix in ("first", "second")
-        for field in (
-            "semantic_gate",
-            "preservation_gate",
-            "camera_preserved",
-            "outsole_preserved",
-            "fit_relation",
-        )
+        for field in _STRESS_METRIC_QUALITY_FIELDS
     )
     for column in columns:
         original = frames["stress"].loc[row, column]

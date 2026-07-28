@@ -175,7 +175,7 @@ def run_stress_tasks(
     tasks: Sequence[StressTask],
     *,
     max_parallel: int = 4,
-    max_outer_attempts: int = 3,
+    max_outer_attempts: int = 1,
 ) -> Mapping[str, object]:
     """Run one independent ``shoe_deform`` subprocess per view atomically."""
 
@@ -240,16 +240,35 @@ def _run_one_task(
                 finally:
                     shutil.rmtree(input_staging)
                 shutil.copy2(task.mask_path, staging / "source_mask.png")
-                accepted, acceptance = _accepted(staging, completed.returncode)
-                record = _task_record(task, fingerprint, command, outer_attempt, acceptance, completed.returncode, run_id)
-                if not accepted:
-                    _write_record(staging, {**record, "status": "rejected", "reason": "acceptance gates failed"})
+                generation_valid, acceptance, reliability = _generation_assessment(
+                    staging, completed.returncode
+                )
+                record = _task_record(
+                    task, fingerprint, command, outer_attempt, acceptance,
+                    completed.returncode, run_id, generation_valid=generation_valid,
+                    reliability=reliability,
+                )
+                if not generation_valid:
+                    _write_record(
+                        staging,
+                        {
+                            **record,
+                            "status": "rejected",
+                            "reason": "generation artifacts are incomplete or malformed",
+                        },
+                    )
                     _archive_rejected(staging, task, outer_attempt, fingerprint, run_id)
                     continue
                 output_hashes = _verified_output_hashes(staging)
                 _write_record(staging, {**record, "status": "accepted", "output_hashes": output_hashes})
                 _promote(staging, task.output_dir, task, fingerprint, run_id)
-                return {"accepted": True, "reused": False, "fingerprint": fingerprint}
+                return {
+                    "accepted": True,
+                    "reused": False,
+                    "fingerprint": fingerprint,
+                    "strict_compliant": reliability["strict_compliant"],
+                    "alignment_class": reliability["alignment_class"],
+                }
             except Exception as error:
                 if staging.exists():
                     rejected = {**(record or _task_record(task, fingerprint, [], outer_attempt, _false_acceptance(), None, run_id)),
@@ -261,28 +280,82 @@ def _run_one_task(
         return {"accepted": False, "fingerprint": fingerprint}
 
 
-def _accepted(staging: Path, returncode: int) -> tuple[bool, dict[str, bool]]:
+def _generation_assessment(
+    staging: Path, returncode: int
+) -> tuple[bool, dict[str, bool], dict[str, object]]:
     acceptance = {"camera_preserved": False, "background_preserved": False, "crop_preservation_gate": False}
-    if returncode != 0 or not (staging / "deformation.json").is_file():
-        return False, acceptance
+    reliability = _false_reliability()
+    if (
+        returncode != 0
+        or not (staging / "deformation.json").is_file()
+        or any(not (staging / name).is_file() for name in ("deformed.png", "deformed_mask.png"))
+    ):
+        return False, acceptance, reliability
+    try:
+        for name in ("deformed.png", "deformed_mask.png"):
+            with Image.open(staging / name) as image:
+                image.verify()
+    except (OSError, ValueError):
+        return False, acceptance, reliability
     deformation = _json_object(staging / "deformation.json")
     selected_id = _required_string(deformation, "selected_attempt_id")
     attempts = deformation.get("attempts")
     if not isinstance(attempts, list):
-        return False, acceptance
+        return False, acceptance, reliability
     selected = [item for item in attempts if isinstance(item, Mapping) and item.get("attempt_id") == selected_id]
     if len(selected) != 1:
-        return False, acceptance
+        return False, acceptance, reliability
     semantic = selected[0].get("semantic")
     preservation = selected[0].get("preservation")
     if not isinstance(semantic, Mapping) or not isinstance(preservation, Mapping):
-        return False, acceptance
+        return False, acceptance, reliability
     acceptance = {
         "camera_preserved": semantic.get("camera_preserved") is True,
         "background_preserved": semantic.get("background_preserved") is True,
         "crop_preservation_gate": preservation.get("passes_gate") is True,
     }
-    return all(acceptance.values()), acceptance
+    try:
+        center_shift = _finite_float(
+            preservation, "center_shift_normalized"
+        )
+        bottom_shift = _finite_float(
+            preservation, "bottom_shift_normalized"
+        )
+        width_ratio = _finite_float(preservation, "width_ratio")
+    except ValueError:
+        return False, acceptance, reliability
+    moderate = (
+        center_shift <= 0.03
+        and bottom_shift <= 0.03
+        and 0.90 <= width_ratio <= 1.10
+    )
+    strict_compliant = all(acceptance.values())
+    reliability = {
+        **acceptance,
+        "center_shift_normalized": center_shift,
+        "bottom_shift_normalized": bottom_shift,
+        "width_ratio": width_ratio,
+        "strict_compliant": strict_compliant,
+        "moderate_alignment": moderate,
+        "alignment_class": (
+            "strict"
+            if strict_compliant
+            else "moderate"
+            if moderate
+            else "high_misalignment"
+        ),
+    }
+    return True, acceptance, reliability
+
+
+def _finite_float(payload: Mapping[str, object], key: str) -> float:
+    value = payload.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{key} must be numeric")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{key} must be finite")
+    return result
 
 
 def _copy_inputs(task: StressTask, staging: Path) -> None:
@@ -377,6 +450,7 @@ def _is_reusable(task: StressTask, fingerprint: str) -> bool:
         return False
     return (
         record.get("status") == "accepted"
+        and record.get("generation_valid") is True
         and record.get("fingerprint") == fingerprint
         and record.get("input_hashes") == expected_inputs
         and record.get("output_hashes") == expected_outputs
@@ -404,17 +478,37 @@ def _false_acceptance() -> dict[str, bool]:
     return {"camera_preserved": False, "background_preserved": False, "crop_preservation_gate": False}
 
 
+def _false_reliability() -> dict[str, object]:
+    return {
+        **_false_acceptance(),
+        "center_shift_normalized": None,
+        "bottom_shift_normalized": None,
+        "width_ratio": None,
+        "strict_compliant": False,
+        "moderate_alignment": False,
+        "alignment_class": "invalid",
+    }
+
+
 def _task_record(
     task: StressTask, fingerprint: str, command: Sequence[str], outer_attempt: int,
     acceptance: Mapping[str, bool], returncode: int | None, run_id: str,
+    *,
+    generation_valid: bool = False,
+    reliability: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
+    reliability_record = dict(reliability or _false_reliability())
     return {
         "task_key": _task_key(task), "run_id": run_id, "input_hashes": _input_hashes(task),
         "command": list(command), "prompt_version": _PROMPT_VERSION,
         "outer_attempt": outer_attempt, "fingerprint": fingerprint,
         "implementation_hash": _implementation_hash(),
         "bytesize_repository_state": _bytesize_fingerprint(),
-        "camera_label": _CAMERA_LABEL, "acceptance": dict(acceptance),
+        "camera_label": _CAMERA_LABEL,
+        "acceptance": dict(acceptance),
+        "generation_valid": generation_valid,
+        "strict_compliant": reliability_record["strict_compliant"],
+        "reliability": reliability_record,
         "returncode": returncode,
     }
 
