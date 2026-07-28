@@ -2285,6 +2285,42 @@ def _representative_estimate(
     return f"{float(value):.4f}" if np.isfinite(value) else "not estimable"
 
 
+def _module_design_interpretation(stress: pd.DataFrame) -> str:
+    selected = stress.query(
+        "baseline_steps == 'all' and "
+        "metric == 'low_finite_high_abstained_rate'"
+    )
+    value = (
+        pd.to_numeric(selected["estimate"], errors="coerce").iloc[0]
+        if not selected.empty
+        else float("nan")
+    )
+    if not np.isfinite(value):
+        return (
+            "The low-finite/high-abstained rate was not estimable, so this "
+            "experiment does not provide direct evidence for preserving a "
+            "valid semantic low-resolution path while gating an invalid "
+            "high-resolution path."
+        )
+    if float(value) <= 0.0:
+        return (
+            "No low-finite/high-abstained cases were observed (all-baseline "
+            f"rate `{float(value):.4f}`). Therefore this experiment does not "
+            "provide direct evidence for preserving a valid semantic "
+            "low-resolution path while gating an invalid high-resolution "
+            "path. The observed module-design evidence is instead the "
+            "reliability-stratified pass rate and the finite low/high "
+            "disagreement."
+        )
+    return (
+        "Low-finite/high-abstained cases were observed; the all-baseline "
+        f"observed rate was `{float(value):.4f}`. This is a candidate gating "
+        "signal for preserving low-resolution semantic evidence while "
+        "suppressing invalid high-resolution evidence, but this experiment "
+        "does not train or validate that learnable module."
+    )
+
+
 def _write_report(
     destination: Path,
     *,
@@ -2331,6 +2367,7 @@ def _write_report(
             ("identity score", "spearman_disagreement_vs_identity"),
         )
     }
+    module_design_interpretation = _module_design_interpretation(stress)
     incomplete = analyzability.loc[
         ~analyzability["passed"].astype(bool),
         "criterion",
@@ -2408,9 +2445,9 @@ def _write_report(
         "",
         "Geometry/visibility reliability is reported separately from "
         "conditional feature fidelity. Stress pass rates, low/high finite "
-        "states, the low-finite/high-abstained use case, and finite paired "
-        f"disagreement occupy {len(stress)} rows. Missing high-resolution "
-        "evidence is a reliability boundary, not a zero similarity score.",
+        "states, the low-finite/high-abstained state, and finite paired "
+        f"disagreement occupy {len(stress)} rows. Abstained evidence is "
+        "reported as a reliability boundary, never as a zero similarity score.",
         "The all-baseline L592 symmetric pass rates by pair-level generation "
         "reliability were "
         f"`{high_pass_strata['strict']}` (strict), "
@@ -2429,11 +2466,7 @@ def _write_report(
         "",
         f"## 8. {REPORT_SECTION_TITLES[7]}",
         "",
-        "The direct module-design signal is finite low-resolution semantic "
-        "evidence paired with abstained high-resolution pixel-aligned "
-        "evidence. A View Reliability Module could preserve the former while "
-        "gating the latter. This experiment does not train or validate that "
-        "learnable module.",
+        module_design_interpretation,
         "",
         f"## 9. {REPORT_SECTION_TITLES[8]}",
         "",

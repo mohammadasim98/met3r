@@ -606,6 +606,29 @@ def test_stress_reliability_counts_low_finite_high_abstained_and_disagreement() 
     assert set(summary["baseline_steps"]) == {"all", 1, 2, 3}
 
 
+def test_module_design_interpretation_does_not_claim_an_unobserved_boundary() -> None:
+    """Catch a zero low-finite/high-abstained rate being reported as direct evidence."""
+
+    absent = pd.DataFrame(
+        [
+            {
+                "baseline_steps": "all",
+                "metric": "low_finite_high_abstained_rate",
+                "estimate": 0.0,
+            }
+        ]
+    )
+    observed = absent.assign(estimate=1 / 12)
+
+    absent_text = adjacent16_analysis._module_design_interpretation(absent)
+    observed_text = adjacent16_analysis._module_design_interpretation(observed)
+
+    assert "No low-finite/high-abstained cases were observed" in absent_text
+    assert "does not provide direct evidence" in absent_text
+    assert "observed rate was `0.0833`" in observed_text
+    assert "candidate gating signal" in observed_text
+
+
 def test_stress_analyzability_uses_only_exact_low_high_pairs() -> None:
     """Catch unrelated variants or unpaired low rows changing the stress criterion."""
 
