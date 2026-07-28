@@ -22,6 +22,7 @@ from contextlib import contextmanager
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +43,7 @@ _REQUIRED_FILES = (
 _NON_TASK_FILES = tuple(name for name in _REQUIRED_FILES if name != "task.json")
 _CLAIM_GUARD = threading.Lock()
 _CLAIMS: dict[str, threading.Lock] = {}
+_FINGERPRINT_GUARD = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -522,6 +524,16 @@ def _implementation_hash() -> str:
 
 
 def _bytesize_fingerprint() -> Mapping[str, object]:
+    # All tasks in one launcher process must bind to the same repository
+    # snapshot.  The repository audit includes binary diffs and untracked-file
+    # hashes, so recomputing it two or three times per view is both unnecessary
+    # and prohibitively expensive on a dirty production checkout.
+    with _FINGERPRINT_GUARD:
+        return _cached_bytesize_fingerprint()
+
+
+@lru_cache(maxsize=1)
+def _cached_bytesize_fingerprint() -> Mapping[str, object]:
     return _bytesize_fingerprint_impl()
 
 

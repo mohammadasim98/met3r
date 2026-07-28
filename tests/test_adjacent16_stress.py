@@ -24,10 +24,23 @@ from met3r.adjacent16_stress import (
 
 
 @pytest.fixture(autouse=True)
-def _stable_bytesize_fingerprint(monkeypatch):
+def _stable_bytesize_fingerprint(monkeypatch, request):
     """Avoid hashing the intentionally huge dirty ByteSize checkout in unit fakes."""
 
-    monkeypatch.setattr("met3r.adjacent16_stress._bytesize_fingerprint", lambda: {"state": "fixture"})
+    import met3r.adjacent16_stress as stress
+
+    stress._cached_bytesize_fingerprint.cache_clear()
+    if request.node.name == (
+        "test_bytesize_fingerprint_uses_git_toplevel_and_all_repo_changes"
+    ):
+        yield
+        stress._cached_bytesize_fingerprint.cache_clear()
+        return
+    monkeypatch.setattr(
+        stress, "_bytesize_fingerprint_impl", lambda: {"state": "fixture"}
+    )
+    yield
+    stress._cached_bytesize_fingerprint.cache_clear()
 
 
 def _png(path: Path, mode: str = "RGB") -> Path:
@@ -465,6 +478,32 @@ def test_bytesize_fingerprint_uses_git_toplevel_and_all_repo_changes(tmp_path: P
     assert baseline != unstaged != staged
     assert untracked_one != untracked_two
     assert untracked_two["untracked_file_sha256"]["parent-untracked.txt"]
+
+
+def test_bytesize_fingerprint_is_computed_once_across_parallel_tasks(
+    monkeypatch,
+) -> None:
+    import met3r.adjacent16_stress as stress
+
+    calls = 0
+    lock = threading.Lock()
+
+    def slow_snapshot():  # type: ignore[no-untyped-def]
+        nonlocal calls
+        with lock:
+            calls += 1
+        time.sleep(0.05)
+        return {"state": "frozen"}
+
+    stress._cached_bytesize_fingerprint.cache_clear()
+    monkeypatch.setattr(stress, "_bytesize_fingerprint_impl", slow_snapshot)
+    with __import__("concurrent.futures").futures.ThreadPoolExecutor(
+        max_workers=4
+    ) as executor:
+        results = list(executor.map(lambda _: stress._bytesize_fingerprint(), range(8)))
+
+    assert calls == 1
+    assert results == [{"state": "frozen"}] * 8
 
 
 def test_exchange_commits_old_accepted_directory_without_post_exchange_move(
