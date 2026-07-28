@@ -48,6 +48,28 @@ _CALIBRATION_VALUES = {
     "depth_scale": [1.01, 1.02, 1.05, 1.1],
     "relative_depth_noise": [0.005, 0.01, 0.02, 0.05],
 }
+_VALID_QUALITY = {
+    "generation_valid": True,
+    "semantic_gate": True,
+    "preservation_gate": True,
+    "camera_preserved": True,
+    "background_preserved": True,
+    "outsole_preserved": True,
+    "last_is_hidden": True,
+    "same_shoe_identity": 5,
+    "design_preservation": 5,
+    "photorealism": 5,
+    "deformation_plausibility": 5,
+    "semantic_confidence": 5,
+    "semantic_quality_score": 5.0,
+    "center_shift_normalized": 0.0,
+    "bottom_shift_normalized": 0.0,
+    "width_ratio": 1.0,
+    "strict_compliant": True,
+    "moderate_alignment": True,
+    "alignment_class": "strict",
+    "fit_relation": "same",
+}
 
 
 def test_state_index_and_clean_lookup_keep_quartets_separate(tmp_path: Path) -> None:
@@ -200,14 +222,16 @@ def _write_adjacent_calibration_fixture(
         ),
         encoding="utf-8",
     )
-    template = directory / "_template.npz"
+    calibration_directory = directory / "calibration"
+    template = calibration_directory / "_template.npz"
+    template.parent.mkdir(parents=True)
     _write_q3_geometry(template, views)
     records = []
     for index, view in enumerate(views):
         for kind, magnitudes in _CALIBRATION_VALUES.items():
             for magnitude in magnitudes:
                 path = (
-                    directory
+                    calibration_directory
                     / view
                     / f"{kind}_{magnitude}"
                     / "geometry.npz"
@@ -226,7 +250,7 @@ def _write_adjacent_calibration_fixture(
                     }
                 )
     template.unlink()
-    (directory / "calibration_manifest.json").write_text(
+    (calibration_directory / "calibration_manifest.json").write_text(
         json.dumps(
             {
                 "artifact_type": "upper_geometry_calibration",
@@ -454,13 +478,7 @@ def _make_adjacent_calibration_run(
         "".join(json.dumps(pair) + "\n" for pair in pairs),
         encoding="utf-8",
     )
-    quality = {
-        "semantic_gate": True,
-        "preservation_gate": True,
-        "camera_preserved": True,
-        "outsole_preserved": True,
-        "fit_relation": "same",
-    }
+    quality = _VALID_QUALITY
     (root / "manifests" / "upper_manifest.json").write_text(
         json.dumps(
             {
@@ -696,6 +714,7 @@ def test_adjacent_q3_calibration_worker_runs_only_frozen_variants_in_manifest_or
             / "geometry"
             / "calibration"
             / "clean"
+            / "calibration"
             / view_id
             / f"{kind}_{magnitude}"
             / "geometry.npz"
@@ -913,7 +932,7 @@ def _make_adjacent_controlled_run(
     (root / "manifests/image_states.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
     pair = {"design_id": "C1", "track": "controlled", "shoe_id": "shoe", "quartet_id": "q3", "pair_id": "shoe__q3__42__0", "first_view": "42", "second_view": "0", "baseline_steps": 1, "angular_separation_deg": 7.5, "changed_view": "0", "image_state_id": "changed", "corruption": "jpeg", "severity": .5}
     (root / "manifests/pair_conditions.jsonl").write_text(json.dumps(pair) + "\n")
-    (root / "manifests/upper_manifest.json").write_text(json.dumps({"shoes": [{"shoe_id": "shoe", "views": [{"view_id": v, "quality": {"semantic_gate": True, "preservation_gate": True, "camera_preserved": True, "outsole_preserved": True, "fit_relation": "same"}} for v in views]}]}))
+    (root / "manifests/upper_manifest.json").write_text(json.dumps({"shoes": [{"shoe_id": "shoe", "views": [{"view_id": v, "quality": _VALID_QUALITY} for v in views]}]}))
     geometry = root / "geometry/calibration/clean"; geometry.mkdir()
     np.savez_compressed(geometry / "depth_geometry.npz", depth=np.ones((4,504,504),np.float32), mask=np.ones((4,504,504),bool), confidence=np.ones((4,504,504),np.float32), intrinsics=np.broadcast_to(np.eye(3),(4,3,3)).copy(), extrinsics=np.broadcast_to(np.eye(4),(4,4,4)).copy(), meta__view_ids=np.asarray(views), meta__camera_groups=np.asarray(("upper",)*4), meta__camera_provenance=np.asarray("fixed_precomputed_da3"))
     (geometry / "depth_geometry.json").write_text(json.dumps({"camera_mode": CAMERA_MODE_LABEL, "camera_provenance": "fixed_precomputed_da3", "process_res": 504, "view_ids": list(views), "camera_groups": ["upper"]*4}))
@@ -1109,7 +1128,7 @@ def test_adjacent_stress_worker_loads_only_ordered_base_and_adaptive_geometry(tm
         with (root / "manifests/image_states.jsonl").open("a") as handle: handle.write(json.dumps(state)+"\n")
     pair = {"design_id":"S1","track":"stress","shoe_id":"shoe","quartet_id":"q3","pair_id":"shoe__q3__42__0","first_view":"42","second_view":"0","baseline_steps":1,"angular_separation_deg":7.5,"changed_view":None,"image_state_id":"stress-state","corruption":"deformed","severity":1.}
     (root / "manifests/pair_conditions.jsonl").write_text(json.dumps(pair)+"\n")
-    (root / "manifests/upper_manifest.json").write_text(json.dumps({"shoes":[{"shoe_id":"shoe","views":[{"view_id":v,"quality":{"semantic_gate":True,"preservation_gate":True,"camera_preserved":True,"outsole_preserved":True,"fit_relation":"same"}} for v in views]}]}))
+    (root / "manifests/upper_manifest.json").write_text(json.dumps({"shoes":[{"shoe_id":"shoe","views":[{"view_id":v,"quality":_VALID_QUALITY} for v in views]}]}))
     def write_geometry(directory: Path, depth: float) -> None:
         directory.mkdir(parents=True, exist_ok=True); np.savez_compressed(directory/"depth_geometry.npz", depth=np.full((4,504,504),depth,np.float32),mask=np.ones((4,504,504),bool),confidence=np.ones((4,504,504),np.float32),intrinsics=np.broadcast_to(np.eye(3),(4,3,3)).copy(),extrinsics=np.broadcast_to(np.eye(4),(4,4,4)).copy(),meta__view_ids=np.asarray(views),meta__camera_groups=np.asarray(("upper",)*4),meta__camera_provenance=np.asarray("fixed_precomputed_da3")); (directory/"depth_geometry.json").write_text(json.dumps({"camera_mode":CAMERA_MODE_LABEL,"camera_provenance":"fixed_precomputed_da3","process_res":504,"view_ids":list(views),"camera_groups":["upper"]*4}))
     write_geometry(root/"geometry/calibration/clean", 1.0); write_geometry(root/"geometry/stress/stress-state", 1.1)

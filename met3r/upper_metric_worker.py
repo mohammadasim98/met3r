@@ -1456,11 +1456,12 @@ def _calibration_records(
     contract: _RunContract,
     clean_state: _StateRecord,
 ) -> tuple[Mapping[str, object], ...]:
-    calibration_root = (
+    geometry_root = (
         contract.root / "geometry" / "calibration" / clean_state.state_id
         if contract.visualization_policy == "posthoc_audit_only"
-        else contract.root / "geometry" / clean_state.state_id / "calibration"
+        else contract.root / "geometry" / clean_state.state_id
     )
+    calibration_root = geometry_root / "calibration"
     path = calibration_root / "calibration_manifest.json"
     manifest = _json_object(path)
     if manifest.get("artifact_type") != "upper_geometry_calibration":
@@ -1471,11 +1472,7 @@ def _calibration_records(
         raise ValueError("geometry calibration seed mismatch")
     if tuple(manifest.get("views", ())) != clean_state.view_ids:
         raise ValueError("geometry calibration view order mismatch")
-    expected_base = (
-        calibration_root / "depth_geometry.npz"
-        if contract.visualization_policy == "posthoc_audit_only"
-        else contract.root / "geometry" / clean_state.state_id / "depth_geometry.npz"
-    ).resolve()
+    expected_base = (geometry_root / "depth_geometry.npz").resolve()
     if Path(str(manifest.get("base_geometry", ""))).resolve() != expected_base:
         raise ValueError("geometry calibration base path mismatch")
     raw_records = manifest.get("artifacts")
