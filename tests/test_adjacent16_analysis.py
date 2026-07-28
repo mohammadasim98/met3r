@@ -432,6 +432,32 @@ def _stress_rows() -> pd.DataFrame:
                         "s11_first_to_second_overlap": np.nan if abstained else 0.5,
                         "s11_second_to_first_overlap": np.nan if abstained else 0.4,
                         "abstained": abstained,
+                        "first_alignment_class": (
+                            "strict"
+                            if shoe_index == 0
+                            else "moderate"
+                            if shoe_index in {1, 3}
+                            else "high_misalignment"
+                        ),
+                        "second_alignment_class": (
+                            "strict"
+                            if shoe_index == 0
+                            else "moderate"
+                            if shoe_index in {1, 3}
+                            else "high_misalignment"
+                        ),
+                        "first_center_shift_normalized": 0.005
+                        + 0.01 * shoe_index,
+                        "second_center_shift_normalized": 0.006
+                        + 0.01 * shoe_index,
+                        "first_bottom_shift_normalized": 0.004
+                        + 0.01 * shoe_index,
+                        "second_bottom_shift_normalized": 0.005
+                        + 0.01 * shoe_index,
+                        "first_width_ratio": 1.0 + 0.02 * shoe_index,
+                        "second_width_ratio": 1.01 + 0.02 * shoe_index,
+                        "first_same_shoe_identity": 0.99 - 0.02 * shoe_index,
+                        "second_same_shoe_identity": 0.98 - 0.02 * shoe_index,
                     }
                 )
     return pd.DataFrame(rows)
@@ -552,6 +578,19 @@ def test_stress_reliability_counts_low_finite_high_abstained_and_disagreement() 
         "low_finite_high_abstained_rate", "estimate"
     ] == pytest.approx(1 / 12)
     assert all_steps.loc["both_finite_rate", "estimate"] == pytest.approx(11 / 12)
+    high_pass = all_steps.loc["high_symmetric_pass_rate"]
+    assert high_pass["strict_estimate"] == pytest.approx(1.0)
+    assert high_pass["moderate_estimate"] == pytest.approx(5 / 6)
+    assert high_pass["high_misalignment_estimate"] == pytest.approx(1.0)
+    assert high_pass["strict_n_pairs"] == 3
+    assert high_pass["moderate_n_pairs"] == 6
+    assert high_pass["high_misalignment_n_pairs"] == 3
+    assert {
+        "spearman_disagreement_vs_center_shift",
+        "spearman_disagreement_vs_bottom_shift",
+        "spearman_disagreement_vs_width_deviation",
+        "spearman_disagreement_vs_identity",
+    } <= set(all_steps.index)
     assert all_steps.loc[
         "finite_low_high_disagreement", "estimate"
     ] == pytest.approx(0.2)

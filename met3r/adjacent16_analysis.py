@@ -1123,6 +1123,60 @@ def summarize_stress_reliability(
     """Summarize paired low/high real-deformation validity and disagreement."""
 
     low, high, paired, low_keys, high_keys = _paired_stress_rows(frame)
+    reliability_columns = (
+        "first_alignment_class",
+        "second_alignment_class",
+        "first_center_shift_normalized",
+        "second_center_shift_normalized",
+        "first_bottom_shift_normalized",
+        "second_bottom_shift_normalized",
+        "first_width_ratio",
+        "second_width_ratio",
+        "first_same_shoe_identity",
+        "second_same_shoe_identity",
+    )
+    _require(frame, reliability_columns, "stress reliability covariates")
+    class_rank = {"strict": 0, "moderate": 1, "high_misalignment": 2}
+    for column in ("first_alignment_class", "second_alignment_class"):
+        low_column = f"{column}_low"
+        high_column = f"{column}_high"
+        if not (
+            paired[low_column].isin(class_rank).all()
+            and paired[high_column].isin(class_rank).all()
+            and (paired[low_column] == paired[high_column]).all()
+        ):
+            raise ValueError("stress reliability class differs across feature variants")
+    paired["_alignment_class"] = paired.apply(
+        lambda row: max(
+            (
+                str(row["first_alignment_class_low"]),
+                str(row["second_alignment_class_low"]),
+            ),
+            key=class_rank.__getitem__,
+        ),
+        axis=1,
+    )
+    paired["_max_center_shift"] = paired[
+        [
+            "first_center_shift_normalized_low",
+            "second_center_shift_normalized_low",
+        ]
+    ].max(axis=1)
+    paired["_max_bottom_shift"] = paired[
+        [
+            "first_bottom_shift_normalized_low",
+            "second_bottom_shift_normalized_low",
+        ]
+    ].max(axis=1)
+    paired["_max_width_deviation"] = (
+        paired[
+            ["first_width_ratio_low", "second_width_ratio_low"]
+        ].astype(float)
+        - 1.0
+    ).abs().max(axis=1)
+    paired["_min_identity"] = paired[
+        ["first_same_shoe_identity_low", "second_same_shoe_identity_low"]
+    ].min(axis=1)
     union = low_keys | high_keys
     common = low_keys & high_keys
     paired["low_symmetric_pass_rate"] = (
@@ -1241,15 +1295,102 @@ def summarize_stress_reliability(
                 repeats=bootstrap_repeats,
                 seed=seed,
             )
+            record = {
+                "baseline_steps": steps_value,
+                "metric": metric,
+                **summary,
+                "n_common_support": len(step_common),
+                "n_union_support": len(step_union),
+                "support_retention": retention,
+                "complete_series_coverage": completeness,
+            }
+            for stratum in class_rank:
+                stratum_rows = selected[
+                    selected["_alignment_class"] == stratum
+                ]
+                stratum_shoes = (
+                    stratum_rows.groupby(
+                        "shoe_id", dropna=False, sort=True
+                    )[metric]
+                    .mean()
+                    .reset_index(name="value")
+                )
+                stratum_summary = _summarize_shoes(
+                    stratum_shoes,
+                    repeats=bootstrap_repeats,
+                    seed=seed,
+                )
+                record.update(
+                    {
+                        f"{stratum}_{key}": value
+                        for key, value in stratum_summary.items()
+                    }
+                )
+                record[f"{stratum}_n_pairs"] = len(stratum_rows)
+            records.append(record)
+        correlations = {
+            "spearman_disagreement_vs_center_shift": "_max_center_shift",
+            "spearman_disagreement_vs_bottom_shift": "_max_bottom_shift",
+            "spearman_disagreement_vs_width_deviation": "_max_width_deviation",
+            "spearman_disagreement_vs_identity": "_min_identity",
+        }
+        for metric, covariate in correlations.items():
+            shoe_values = []
+            for shoe_id, shoe_rows in selected.groupby(
+                "shoe_id", dropna=False, sort=True
+            ):
+                usable = shoe_rows[
+                    np.isfinite(shoe_rows["finite_low_high_disagreement"])
+                    & np.isfinite(pd.to_numeric(shoe_rows[covariate], errors="coerce"))
+                ]
+                value = (
+                    usable["finite_low_high_disagreement"].corr(
+                        pd.to_numeric(usable[covariate], errors="coerce"),
+                        method="spearman",
+                    )
+                    if (
+                        len(usable) >= 2
+                        and usable["finite_low_high_disagreement"].nunique() >= 2
+                        and pd.to_numeric(
+                            usable[covariate], errors="coerce"
+                        ).nunique()
+                        >= 2
+                    )
+                    else np.nan
+                )
+                shoe_values.append({"shoe_id": shoe_id, "value": value})
             records.append(
                 {
                     "baseline_steps": steps_value,
                     "metric": metric,
-                    **summary,
+                    **_summarize_shoes(
+                        pd.DataFrame(
+                            shoe_values,
+                            columns=("shoe_id", "value"),
+                        ),
+                        repeats=bootstrap_repeats,
+                        seed=seed,
+                    ),
                     "n_common_support": len(step_common),
                     "n_union_support": len(step_union),
                     "support_retention": retention,
                     "complete_series_coverage": completeness,
+                    **{
+                        f"{stratum}_{key}": np.nan
+                        for stratum in class_rank
+                        for key in (
+                            "estimate",
+                            "n_shoes_valid",
+                            "ci_low",
+                            "ci_high",
+                        )
+                    },
+                    **{
+                        f"{stratum}_n_pairs": int(
+                            (selected["_alignment_class"] == stratum).sum()
+                        )
+                        for stratum in class_rank
+                    },
                 }
             )
     return pd.DataFrame(records)
@@ -2050,23 +2191,45 @@ def _build_stress_figure(
     axes[1, 0].set_xlabel("baseline steps")
     axes[1, 0].set_ylabel("absolute feature-effect difference")
     _annotate_support(axes[1, 0], disagreement)
-    all_stress = stress[stress["baseline_steps"] == "all"].copy()
-    all_stress["_metric_position"] = np.arange(len(all_stress))
-    finite_all = _finite_rows(all_stress, "estimate")
+    high_all = stress[
+        (stress["baseline_steps"] == "all")
+        & (stress["metric"] == "high_symmetric_pass_rate")
+    ].iloc[0]
+    strata = ("strict", "moderate", "high_misalignment")
+    stratum_values = np.asarray(
+        [high_all[f"{stratum}_estimate"] for stratum in strata],
+        dtype=float,
+    )
+    finite = np.isfinite(stratum_values)
     axes[1, 1].bar(
-        finite_all["_metric_position"],
-        finite_all["estimate"],
+        np.arange(len(strata))[finite],
+        stratum_values[finite],
     )
     axes[1, 1].set_xticks(
-        finite_all["_metric_position"],
-        finite_all["metric"],
+        np.arange(len(strata)),
+        ("strict", "moderate", "high misalignment"),
         rotation=25,
         ha="right",
-        fontsize=7,
     )
-    axes[1, 1].set_title("All-baseline reliability boundary")
-    axes[1, 1].set_ylabel("rate or disagreement")
-    _annotate_support(axes[1, 1], all_stress)
+    axes[1, 1].set_ylim(0.0, 1.0)
+    axes[1, 1].set_title("L592 pass rate by generation reliability")
+    axes[1, 1].set_ylabel("symmetric pass rate")
+    pair_counts = ", ".join(
+        f"{label}: n={int(high_all[f'{stratum}_n_pairs'])}"
+        for label, stratum in zip(
+            ("strict", "moderate", "high"),
+            strata,
+            strict=True,
+        )
+    )
+    axes[1, 1].text(
+        0.01,
+        0.02,
+        pair_counts,
+        transform=axes[1, 1].transAxes,
+        fontsize=8,
+        va="bottom",
+    )
     figure.suptitle("Independent-deformation reliability stress")
     figure.tight_layout(rect=(0, 0, 1, 0.95))
     return figure
@@ -2146,6 +2309,28 @@ def _write_report(
         "baseline_steps == 'all' and metric == 'symmetric_coverage'",
         "estimate",
     )
+    high_pass_strata = {
+        stratum: _representative_estimate(
+            stress,
+            "baseline_steps == 'all' and "
+            "metric == 'high_symmetric_pass_rate'",
+            f"{stratum}_estimate",
+        )
+        for stratum in ("strict", "moderate", "high_misalignment")
+    }
+    reliability_correlations = {
+        label: _representative_estimate(
+            stress,
+            f"baseline_steps == 'all' and metric == '{metric}'",
+            "estimate",
+        )
+        for label, metric in (
+            ("center shift", "spearman_disagreement_vs_center_shift"),
+            ("bottom shift", "spearman_disagreement_vs_bottom_shift"),
+            ("width deviation", "spearman_disagreement_vs_width_deviation"),
+            ("identity score", "spearman_disagreement_vs_identity"),
+        )
+    }
     incomplete = analyzability.loc[
         ~analyzability["passed"].astype(bool),
         "criterion",
@@ -2226,6 +2411,21 @@ def _write_report(
         "states, the low-finite/high-abstained use case, and finite paired "
         f"disagreement occupy {len(stress)} rows. Missing high-resolution "
         "evidence is a reliability boundary, not a zero similarity score.",
+        "The all-baseline L592 symmetric pass rates by pair-level generation "
+        "reliability were "
+        f"`{high_pass_strata['strict']}` (strict), "
+        f"`{high_pass_strata['moderate']}` (moderate), and "
+        f"`{high_pass_strata['high_misalignment']}` (high misalignment). "
+        "A pair inherits the worse of its two view labels; these strata are "
+        "descriptive and are never exclusion criteria.",
+        "Per-shoe Spearman associations between finite L37/L592 disagreement "
+        "and the continuous generation covariates were "
+        + ", ".join(
+            f"{label} `{value}`"
+            for label, value in reliability_correlations.items()
+        )
+        + ". Non-estimable values are retained when within-shoe support or "
+        "variation is insufficient.",
         "",
         f"## 8. {REPORT_SECTION_TITLES[7]}",
         "",
