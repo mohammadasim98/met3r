@@ -214,10 +214,18 @@ def _run_one_task(
                 command = _deformation_command(staging)
                 environment = os.environ.copy()
                 environment["CUDA_VISIBLE_DEVICES"] = str(task.physical_gpu)
+                existing_pythonpath = environment.get("PYTHONPATH")
+                environment["PYTHONPATH"] = os.pathsep.join(
+                    part for part in (
+                        str(_BYTESIZE_RECONSTRUCTION),
+                        existing_pythonpath,
+                    )
+                    if part
+                )
                 with gpu_claim:
                     with _machine_gpu_claim(task.physical_gpu):
                         completed = subprocess.run(
-                            command, cwd=_BYTESIZE_RECONSTRUCTION, env=environment,
+                            command, env=environment, close_fds=False,
                             text=True, capture_output=True, check=False,
                         )
                 shutil.copy2(task.mask_path, staging / "source_mask.png")

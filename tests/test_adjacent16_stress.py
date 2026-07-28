@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 import os
+import sys
 import threading
 import time
 import subprocess
@@ -153,6 +154,51 @@ def test_tasks_use_one_subprocess_per_view_round_robin_and_atomic_promotion(
         assert (task.output_dir / "source_mask.png").is_file()
         assert (task.output_dir / "task.json").is_file()
         assert not list(task.output_dir.parent.glob(".staging-*"))
+
+
+def test_stress_child_launch_does_not_require_fork(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Native renderer threads make fork unsafe; the child must use spawn."""
+
+    task = _task(tmp_path)
+    child = tmp_path / "accepted_child.py"
+    child.write_text(
+        "\n".join(
+            (
+                "import json, shutil, sys",
+                "from pathlib import Path",
+                "output = Path(sys.argv[sys.argv.index('--output-dir') + 1])",
+                "shutil.copy2(output / 'source.png', output / 'deformed.png')",
+                "shutil.copy2(output / 'source_mask.png', output / 'deformed_mask.png')",
+                "selected = {'attempt_id': 'a', 'semantic': {'camera_preserved': True, "
+                "'background_preserved': True}, 'preservation': {'passes_gate': True}}",
+                "(output / 'deformation.json').write_text(json.dumps("
+                "{'selected_attempt_id': 'a', 'attempts': [selected]}))",
+                "(output / 'metrics.json').write_text('{}')",
+            )
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "met3r.adjacent16_stress._deformation_command",
+        lambda staging: [
+            sys.executable,
+            str(child),
+            "--output-dir",
+            str(staging),
+        ],
+    )
+
+    def unsafe_fork(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise AssertionError("fork is unsafe after native renderer threads start")
+
+    monkeypatch.setattr(subprocess, "_fork_exec", unsafe_fork)
+
+    result = run_stress_tasks((task,), max_outer_attempts=1)
+
+    assert result["accepted"] == 1
+    assert (task.output_dir / "deformed.png").is_file()
 
 
 def test_reuse_is_invalidated_by_input_prompt_or_implementation_hash(
