@@ -1062,18 +1062,22 @@ def test_final_gate_rejects_exact_metric_identity_mutations(
 
 
 @pytest.mark.parametrize(
-    ("mutation", "expected_failure"),
+    ("mutation", "expected_failures"),
     (
-        pytest.param("unknown_job_id", "registry_graph", id="unknown-job-id"),
-        pytest.param("semantic_payload", "registry_graph", id="semantic-payload"),
-        pytest.param("pending", "unexplained_jobs", id="pending-job"),
-        pytest.param("bad_output_hash", "registry_output_hashes", id="bad-output-hash"),
+        pytest.param(
+            "unknown_job_id",
+            ("registry_graph", "registry_output_hashes"),
+            id="unknown-job-id",
+        ),
+        pytest.param("semantic_payload", ("registry_graph",), id="semantic-payload"),
+        pytest.param("pending", ("unexplained_jobs",), id="pending-job"),
+        pytest.param("bad_output_hash", ("registry_output_hashes",), id="bad-output-hash"),
     ),
 )
 def test_final_gate_rejects_registry_and_output_mutations(
     tmp_path: Path,
     mutation: str,
-    expected_failure: str,
+    expected_failures: tuple[str, ...],
 ) -> None:
     """Catch count-preserving registry changes before they can masquerade as a frozen run."""
 
@@ -1108,7 +1112,7 @@ def test_final_gate_rejects_registry_and_output_mutations(
     report = validate_adjacent16_final_gate(root)
     assert report.actual_rows == report.expected_rows
     assert report.passed is False
-    assert report.failed_checks == (expected_failure,)
+    assert report.failed_checks == expected_failures
     if mutation == "pending":
         assert report.unexplained_jobs == (job_id,)
     if mutation == "semantic_payload":
