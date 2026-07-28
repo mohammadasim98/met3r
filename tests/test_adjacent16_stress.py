@@ -182,7 +182,7 @@ def test_stress_child_launch_does_not_require_fork(
     )
     monkeypatch.setattr(
         "met3r.adjacent16_stress._deformation_command",
-        lambda staging: [
+        lambda inputs, staging: [
             sys.executable,
             str(child),
             "--output-dir",
@@ -290,8 +290,13 @@ def test_command_uses_immutable_staged_inputs(tmp_path: Path, monkeypatch) -> No
     def fake_run(args, **kwargs):  # type: ignore[no-untyped-def]
         command.extend(args)
         output = Path(args[args.index("--output-dir") + 1])
-        assert Path(args[args.index("--image") + 1]) == output / "source.png"
-        assert Path(args[args.index("--last-render") + 1]) == output / "last_render.png"
+        source = Path(args[args.index("--image") + 1])
+        last_render = Path(args[args.index("--last-render") + 1])
+        assert source.name == "source.png"
+        assert last_render.name == "last_render.png"
+        assert source.parent == last_render.parent
+        assert not source.is_relative_to(output)
+        assert not last_render.is_relative_to(output)
         _accepted_artifacts(output)
         class Result: returncode = 0
         return Result()

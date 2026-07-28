@@ -211,23 +211,30 @@ def _run_one_task(
             record: dict[str, object] | None = None
             try:
                 _copy_inputs(task, staging)
-                command = _deformation_command(staging)
-                environment = os.environ.copy()
-                environment["CUDA_VISIBLE_DEVICES"] = str(task.physical_gpu)
-                existing_pythonpath = environment.get("PYTHONPATH")
-                environment["PYTHONPATH"] = os.pathsep.join(
-                    part for part in (
-                        str(_BYTESIZE_RECONSTRUCTION),
-                        existing_pythonpath,
-                    )
-                    if part
+                input_staging = Path(
+                    tempfile.mkdtemp(prefix=".inputs-", dir=task.output_dir.parent)
                 )
-                with gpu_claim:
-                    with _machine_gpu_claim(task.physical_gpu):
-                        completed = subprocess.run(
-                            command, env=environment, close_fds=False,
-                            text=True, capture_output=True, check=False,
+                try:
+                    _copy_inputs(task, input_staging)
+                    command = _deformation_command(input_staging, staging)
+                    environment = os.environ.copy()
+                    environment["CUDA_VISIBLE_DEVICES"] = str(task.physical_gpu)
+                    existing_pythonpath = environment.get("PYTHONPATH")
+                    environment["PYTHONPATH"] = os.pathsep.join(
+                        part for part in (
+                            str(_BYTESIZE_RECONSTRUCTION),
+                            existing_pythonpath,
                         )
+                        if part
+                    )
+                    with gpu_claim:
+                        with _machine_gpu_claim(task.physical_gpu):
+                            completed = subprocess.run(
+                                command, env=environment, close_fds=False,
+                                text=True, capture_output=True, check=False,
+                            )
+                finally:
+                    shutil.rmtree(input_staging)
                 shutil.copy2(task.mask_path, staging / "source_mask.png")
                 accepted, acceptance = _accepted(staging, completed.returncode)
                 record = _task_record(task, fingerprint, command, outer_attempt, acceptance, completed.returncode, run_id)
@@ -281,10 +288,10 @@ def _copy_inputs(task: StressTask, staging: Path) -> None:
         shutil.copy2(source, staging / name)
 
 
-def _deformation_command(staging: Path) -> list[str]:
+def _deformation_command(inputs: Path, output: Path) -> list[str]:
     return [
-        sys.executable, "-m", "shoe_deform", "--image", str(staging / "source.png"),
-        "--last-render", str(staging / "last_render.png"), "--output-dir", str(staging),
+        sys.executable, "-m", "shoe_deform", "--image", str(inputs / "source.png"),
+        "--last-render", str(inputs / "last_render.png"), "--output-dir", str(output),
         "--max-attempts", "2",
     ]
 
