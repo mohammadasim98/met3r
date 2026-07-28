@@ -2348,7 +2348,7 @@ def _write_report(
     support_by_step = {
         step: _representative_estimate(
             support,
-            f"baseline_steps == '{step}' and "
+            f"baseline_steps == {step} and "
             "metric == 'minimum_directional_overlap'",
             "estimate",
         )
@@ -2417,7 +2417,7 @@ def _write_report(
     disagreement_by_step = {
         step: _representative_estimate(
             stress,
-            f"baseline_steps == '{step}' and "
+            f"baseline_steps == {step} and "
             "metric == 'finite_low_high_disagreement'",
             "estimate",
         )
@@ -2481,8 +2481,8 @@ def _write_report(
         "| 인접 뷰가 geometry confound를 줄이는가? | "
         f"대칭 coverage `{symmetric}`, step 1/2/3 최소 overlap "
         f"`{support_by_step['1']}` / `{support_by_step['2']}` / "
-        f"`{support_by_step['3']}` | 인접 upper-view 조건의 support를 "
-        "분리해 기술한다. |",
+        f"`{support_by_step['3']}` | 인접 upper-view support는 관찰했지만 실제 "
+        "confound 감소는 직접 검증하지 않았다. |",
         "| 어떤 DINO backbone이 적합한가? | translation Spearman: "
         + ", ".join(
             f"{name} `{value}`"
@@ -2523,8 +2523,8 @@ def _write_report(
         f"`{support_by_step['3']}`이고 all-baseline 대칭 coverage는 "
         f"`{symmetric}`이다.",
         "",
-        "**해석.** 인접 upper-view protocol은 geometry confound를 줄이는 조건을 "
-        "제공하지만, support 자체가 완전한 geometry 정답은 아니다.",
+        "**해석.** 인접 upper-view support는 관찰했지만 실제 confound 감소는 직접 "
+        "검증하지 않았다. support 자체도 완전한 geometry 정답은 아니다.",
         "",
         f"## 4. {REPORT_SECTION_TITLES[3]}",
         "",

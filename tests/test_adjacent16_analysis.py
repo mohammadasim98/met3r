@@ -1043,6 +1043,7 @@ def test_analyze_adjacent16_run_publishes_exact_atomic_research_snapshot(
     assert "절대적인 DA3 카메라 오차를 추정하지 않는다" in report
     assert "해상도 hard gate가 직접 검증된 것은 아니다" in report
     assert "결측 또는 abstention을 0점으로 대체하지 않았다" in report
+    assert "실제 confound 감소는 직접 검증하지 않았다" in report
     assert f"controlled rows: {len(controlled):,}" in report
     assert f"geometry calibration rows: {len(geometry):,}" in report
     assert f"stress rows: {len(stress):,}" in report
@@ -1050,6 +1051,24 @@ def test_analyze_adjacent16_run_publishes_exact_atomic_research_snapshot(
     assert "bootstrap repeats: `20`" in report
     assert "sha256" in report.lower()
     assert sha256_file(preflight_parquet) in report
+
+    support_table = pd.read_parquet(
+        tmp_path / "reports/tables/support_coverage.parquet"
+    )
+    disagreement_table = pd.read_parquet(
+        tmp_path / "reports/tables/stress_reliability.parquet"
+    )
+    for step in ("1", "2", "3"):
+        overlap = support_table.query(
+            f"baseline_steps == '{step}' and "
+            "metric == 'minimum_directional_overlap'"
+        ).iloc[0]["estimate"]
+        disagreement = disagreement_table.query(
+            f"baseline_steps == '{step}' and "
+            "metric == 'finite_low_high_disagreement'"
+        ).iloc[0]["estimate"]
+        assert f"`{float(overlap):.4f}`" in report
+        assert f"`{float(disagreement):.4f}`" in report
 
     published_paths = [
         preflight_parquet,
