@@ -90,6 +90,30 @@ def test_manifest_requires_complete_strict_stress_audits(dense_contract) -> None
         build_adjacent16_manifest(dense_contract, require_stress=True)
 
 
+def test_optional_manifest_ignores_reference_only_stress_directory(
+    dense_contract,
+) -> None:
+    """A killed preparation remains resumable when only last_render exists."""
+
+    shoe_id = next(iter(dense_contract.raw["shoes"]))
+    reference = (
+        dense_contract.stress_root
+        / shoe_id
+        / "q0"
+        / "view_1"
+        / "deformation"
+        / "last_render.png"
+    )
+    reference.parent.mkdir(parents=True)
+    reference.write_bytes(b"incomplete-reference")
+
+    manifest = build_adjacent16_manifest(dense_contract, require_stress=False)
+    view = manifest.shoes[0].views[0]
+
+    assert view.stress_path is None
+    assert view.task_json_path is None
+
+
 def test_manifest_rejects_present_stress_view_with_incomplete_audit(dense_contract) -> None:
     """Catch accepting a present selected stress view with missing audit metadata."""
 

@@ -166,13 +166,14 @@ def _stress_record(
     require_stress: bool,
 ) -> tuple[Path | None, Path | None, Path | None, Path | None, Path | None, str | None, str | None, DeformationQuality | None]:
     deformation_root = root / shoe_id / quartet_id / f"view_{view_id}" / "deformation"
-    if not deformation_root.exists() and not require_stress:
+    task_json_path = deformation_root / "task.json"
+    if not require_stress and not task_json_path.is_file():
         return (None,) * 8
     stress_path = _require_file(deformation_root / "deformed.png", label="stress image")
     stress_mask_path = _require_file(deformation_root / "deformed_mask.png", label="stress mask")
     deformation_json_path = _require_file(deformation_root / "deformation.json", label="stress deformation metadata")
     metrics_json_path = _require_file(deformation_root / "metrics.json", label="stress deformation metrics")
-    task_json_path = _require_file(deformation_root / "task.json", label="stress deformation task")
+    task_json_path = _require_file(task_json_path, label="stress deformation task")
     _source_image(stress_path)
     _mask_image(stress_mask_path, source_path=stress_path)
     deformation = _load_json(deformation_json_path, label="stress deformation metadata")
