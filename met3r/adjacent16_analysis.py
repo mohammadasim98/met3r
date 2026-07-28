@@ -99,18 +99,18 @@ FIGURE_FILENAMES = (
     "05_real_deformation_reliability.png",
 )
 REPORT_SECTION_TITLES = (
-    "frozen protocol and exact completed counts",
-    "adjacent-view support/preflight result",
-    "common-37 backbone fidelity",
-    "DINOv3-L resolution fidelity",
-    "NAF versus bilinear",
-    "local geometry sensitivity",
-    "real independent-deformation reliability boundary",
-    "View Reliability Module implications",
-    "limitations and non-claims",
-    "artifact index and reproducibility hashes",
+    "한눈에 보는 결론",
+    "실험 범위와 해석 원칙",
+    "인접 뷰 Support와 Overlap",
+    "DINO Backbone 비교",
+    "DINOv3-L 해상도 및 NAF 비교",
+    "카메라와 Geometry 민감도",
+    "실제 독립 Deformation의 Reliability",
+    "View Reliability Module 시사점",
+    "한계와 후속 검증",
+    "시각화 및 재현성 부록",
 )
-CAMERA_LIMITATION = "fixed/precomputed DA3 cameras (not calibrated GT)"
+CAMERA_LIMITATION = "fixed/precomputed DA3 camera (calibrated GT 아님)"
 _CONTROLLED_SUPPORT_COMPARISONS = frozenset(
     {
         "four_backbone_common37",
@@ -2345,6 +2345,90 @@ def _write_report(
         "baseline_steps == 'all' and metric == 'symmetric_coverage'",
         "estimate",
     )
+    support_by_step = {
+        step: _representative_estimate(
+            support,
+            f"baseline_steps == '{step}' and "
+            "metric == 'minimum_directional_overlap'",
+            "estimate",
+        )
+        for step in ("1", "2", "3")
+    }
+    translation_by_backbone = {
+        backbone_name: _representative_estimate(
+            backbone,
+            "baseline_steps == 'all' and "
+            f"backbone == '{backbone_name}' and "
+            "corruption == 'translation' and "
+            "endpoint == 'severity_spearman'",
+            "estimate",
+        )
+        for backbone_name in (
+            "dino_vitb16",
+            "dinov2_vitb14",
+            "dinov3_vitb16",
+            "dinov3_vitl16_pixal3d",
+        )
+    }
+    resolution_endpoints = {
+        (resolution_value, corruption): _representative_estimate(
+            resolution,
+            "baseline_steps == 'all' and "
+            f"resolution == {resolution_value} and "
+            f"corruption == '{corruption}' and "
+            "endpoint == 'severity_spearman'",
+            "estimate",
+        )
+        for resolution_value in (37, 592)
+        for corruption in ("translation", "thin_plate_warp")
+    }
+    jpeg_by_resolution = {
+        resolution_value: _representative_estimate(
+            resolution,
+            "baseline_steps == 'all' and "
+            f"resolution == {resolution_value} and corruption == 'jpeg' and "
+            "endpoint == 'nuisance_absolute_delta'",
+            "estimate",
+        )
+        for resolution_value in (37, 592)
+    }
+    naf_minus_bilinear = {
+        label: _representative_estimate(
+            naf,
+            "baseline_steps == 'all' and resolution == 592 and "
+            f"corruption == '{corruption}' and endpoint == '{endpoint}'",
+            "naf_minus_bilinear",
+        )
+        for label, corruption, endpoint in (
+            ("JPEG absolute delta", "jpeg", "nuisance_absolute_delta"),
+            ("TPS Spearman", "thin_plate_warp", "severity_spearman"),
+        )
+    }
+    rotation_responses = {
+        (variant, magnitude): _representative_estimate(
+            geometry,
+            "baseline_steps == 'all' and perturbation_kind == 'rotation' and "
+            f"magnitude == {magnitude} and variant == '{variant}'",
+            "geometry_response",
+        )
+        for variant in ("L37-bilinear", "L592-NAF")
+        for magnitude in (0.25, 1.0, 5.0)
+    }
+    disagreement_by_step = {
+        step: _representative_estimate(
+            stress,
+            f"baseline_steps == '{step}' and "
+            "metric == 'finite_low_high_disagreement'",
+            "estimate",
+        )
+        for step in ("1", "2", "3")
+    }
+    low_finite_high_abstained = _representative_estimate(
+        stress,
+        "baseline_steps == 'all' and "
+        "metric == 'low_finite_high_abstained_rate'",
+        "estimate",
+    )
     high_pass_strata = {
         stratum: _representative_estimate(
             stress,
@@ -2367,7 +2451,6 @@ def _write_report(
             ("identity score", "spearman_disagreement_vs_identity"),
         )
     }
-    module_design_interpretation = _module_design_interpretation(stress)
     incomplete = analyzability.loc[
         ~analyzability["passed"].astype(bool),
         "criterion",
@@ -2389,105 +2472,188 @@ def _write_report(
         )
     ]
     lines = [
-        "# Adjacent 16-view fidelity and reliability report",
+        "# 인접 Upper 16-view DINO Feature Fidelity 및 Reliability 연구 보고서",
         "",
         f"## 1. {REPORT_SECTION_TITLES[0]}",
         "",
-        f"Camera contract: {CAMERA_LIMITATION}.",
-        f"- controlled rows: {controlled_rows:,}",
-        f"- geometry calibration rows: {geometry_rows:,}",
-        f"- stress rows: {stress_rows:,}",
-        f"- total metric rows: {controlled_rows + geometry_rows + stress_rows:,}",
-        f"- seed: `{seed}`",
-        f"- bootstrap repeats: `{bootstrap_repeats}`",
-        "",
-        "All intervals resample the four shoe clusters only. Quartets, pairs, "
-        "changed-view placements, and severities remain repeated measurements. "
-        "The intervals and rankings are descriptive because n=4 shoe clusters.",
+        "| 연구 질문 | 관찰된 결과 | 해석 |",
+        "|---|---|---|",
+        "| 인접 뷰가 geometry confound를 줄이는가? | "
+        f"대칭 coverage `{symmetric}`, step 1/2/3 최소 overlap "
+        f"`{support_by_step['1']}` / `{support_by_step['2']}` / "
+        f"`{support_by_step['3']}` | 인접 upper-view 조건의 support를 "
+        "분리해 기술한다. |",
+        "| 어떤 DINO backbone이 적합한가? | translation Spearman: "
+        + ", ".join(
+            f"{name} `{value}`"
+            for name, value in translation_by_backbone.items()
+        )
+        + " | 공통 support 안의 조건부 비교이며 일반적 우월성 주장은 아니다. |",
+        "| 높은 feature resolution이 항상 유리한가? | L37/L592 translation "
+        f"`{resolution_endpoints[(37, 'translation')]}` / "
+        f"`{resolution_endpoints[(592, 'translation')]}` | endpoint별로 "
+        "확인해야 하며 항상이라는 결론은 낼 수 없다. |",
+        "| DA3 geometry 오차와 feature 차이를 분리할 수 있는가? | 국소 perturbation "
+        "반응을 별도 측정했다. | precomputed camera 주변 민감도이지 절대 오차 추정은 아니다. |",
+        "| View Reliability Module을 무엇으로 학습해야 하는가? | reliability strata의 "
+        "pass rate와 유한 L37/L592 disagreement를 관찰했다. | 연속 reliability "
+        "weighting은 지지되지만 hard gate는 직접 검증되지 않았다. |",
         "",
         f"## 2. {REPORT_SECTION_TITLES[1]}",
         "",
-        f"Clean symmetric coverage was `{symmetric}`. Directional overlap and "
-        "one-, two-, and three-step support remain separate in the published "
-        "`support_coverage` table and figure. Abstention and NaN values count "
-        "as missing evidence and coverage, never as score zero.",
+        f"카메라 계약은 {CAMERA_LIMITATION}이다. controlled rows: "
+        f"{controlled_rows:,}; geometry calibration rows: {geometry_rows:,}; "
+        f"stress rows: {stress_rows:,}; total metric rows: "
+        f"{controlled_rows + geometry_rows + stress_rows:,}; seed: `{seed}`; "
+        f"bootstrap repeats: `{bootstrap_repeats}`.",
+        "",
+        "모든 구간은 네 shoe cluster만 재표본화한다. quartet, pair, changed-view "
+        "배치와 severity는 반복 측정으로 남으므로, n=4에서의 구간과 순위는 "
+        "기술적 요약이다. 결측 또는 abstention을 0점으로 대체하지 않았다.",
         "",
         f"## 3. {REPORT_SECTION_TITLES[2]}",
         "",
-        "Conditional feature fidelity compares DINO, DINOv2, DINOv3-B, and "
-        "Pixal3D DINOv3-L at bilinear 37 only on the exact shared "
-        "`shoe_id × quartet_id × pair_id × changed_view × corruption × severity` "
-        "support. Identity AUROC, translation/TPS rank endpoints, and JPEG "
-        f"nuisance deltas occupy {len(backbone)} published endpoint rows.",
+        "![인접 뷰의 support와 overlap](figures/01_adjacent_support.png)",
+        "",
+        "**그림 읽는 법.** 대칭 coverage와 direction별 overlap을 all 및 baseline "
+        "step별로 읽는다; 낮은 support는 낮은 similarity가 아니라 관찰 불가를 뜻한다.",
+        "",
+        "**관찰된 결과.** step 1/2/3의 최소 direction overlap은 각각 "
+        f"`{support_by_step['1']}`, `{support_by_step['2']}`, "
+        f"`{support_by_step['3']}`이고 all-baseline 대칭 coverage는 "
+        f"`{symmetric}`이다.",
+        "",
+        "**해석.** 인접 upper-view protocol은 geometry confound를 줄이는 조건을 "
+        "제공하지만, support 자체가 완전한 geometry 정답은 아니다.",
         "",
         f"## 4. {REPORT_SECTION_TITLES[3]}",
         "",
-        "The five bilinear DINOv3-L resolutions use one five-way exact "
-        "intersection. Every estimate is accompanied by its paired "
-        f"difference from bilinear 37; {len(resolution)} rows preserve "
-        "baseline-step strata and endpoint-specific four-shoe validity.",
+        "![37-grid에서 DINO backbone 비교](figures/02_common37_backbones.png)",
+        "",
+        "**그림 읽는 법.** 네 backbone은 exact shared "
+        "`shoe_id × quartet_id × pair_id × changed_view × corruption × severity` "
+        "support의 bilinear 37 결과만 비교한다.",
+        "",
+        "**관찰된 결과.** all-baseline translation Spearman은 "
+        + ", ".join(
+            f"{name} `{value}`"
+            for name, value in translation_by_backbone.items()
+        )
+        + "이다.",
+        "",
+        "**해석.** 이 비교는 동일 물리 cell의 조건부 feature fidelity이며, "
+        "네 shoe를 넘어선 backbone의 일반적 우월성을 검증하지 않는다.",
         "",
         f"## 5. {REPORT_SECTION_TITLES[4]}",
         "",
-        "At 74, 148, 296, and 592, NAF-normal minus bilinear is calculated "
-        "within the same exact physical cells and then within shoe. No "
-        f"unrelated marginal means are subtracted; {len(naf)} paired rows "
-        "are published.",
+        "![DINOv3-L 해상도와 NAF 비교](figures/03_dinov3l_resolution_naf.png)",
+        "",
+        "**그림 읽는 법.** bilinear 37과 592의 endpoint를 exact five-way support에서, "
+        "NAF 차이는 동일 resolution의 paired support에서 읽는다.",
+        "",
+        "**관찰된 결과.** L37/L592의 translation Spearman은 "
+        f"`{resolution_endpoints[(37, 'translation')]}` / "
+        f"`{resolution_endpoints[(592, 'translation')]}`, TPS Spearman은 "
+        f"`{resolution_endpoints[(37, 'thin_plate_warp')]}` / "
+        f"`{resolution_endpoints[(592, 'thin_plate_warp')]}`, JPEG absolute "
+        f"delta는 `{jpeg_by_resolution[37]}` / `{jpeg_by_resolution[592]}`이다. "
+        "592 NAF-minus-bilinear는 JPEG absolute delta "
+        f"`{naf_minus_bilinear['JPEG absolute delta']}`, TPS Spearman "
+        f"`{naf_minus_bilinear['TPS Spearman']}`이다.",
+        "",
+        "**해석.** 해상도와 NAF의 차이는 endpoint 및 paired support에 의존한다. "
+        "따라서 높은 resolution이 항상 더 낫다는 주장은 이 표에서 나오지 않는다.",
         "",
         f"## 6. {REPORT_SECTION_TITLES[5]}",
         "",
-        "The L37-bilinear and L592-NAF envelopes report absolute local "
-        "responses to injected camera/depth perturbations on paired support. "
-        f"The {len(geometry)} rows characterize sensitivity around the "
-        f"{CAMERA_LIMITATION}; they do not estimate unknown absolute camera error.",
+        "![카메라와 geometry perturbation 민감도](figures/04_geometry_calibration.png)",
+        "",
+        "**그림 읽는 법.** L37-bilinear와 L592-NAF의 absolute response를 동일 "
+        "paired support에서 rotation magnitude별로 비교한다.",
+        "",
+        "**관찰된 결과.** rotation 0.25°/1°/5°에서 L37-bilinear는 "
+        f"`{rotation_responses[('L37-bilinear', 0.25)]}` / "
+        f"`{rotation_responses[('L37-bilinear', 1.0)]}` / "
+        f"`{rotation_responses[('L37-bilinear', 5.0)]}`, L592-NAF는 "
+        f"`{rotation_responses[('L592-NAF', 0.25)]}` / "
+        f"`{rotation_responses[('L592-NAF', 1.0)]}` / "
+        f"`{rotation_responses[('L592-NAF', 5.0)]}`이다.",
+        "",
+        "**해석.** injected local perturbation은 precomputed camera 주변의 민감도를 "
+        "추정하지만, 알려지지 않은 절대적인 DA3 카메라 오차를 추정하지 않는다.",
         "",
         f"## 7. {REPORT_SECTION_TITLES[6]}",
         "",
-        "Geometry/visibility reliability is reported separately from "
-        "conditional feature fidelity. Stress pass rates, low/high finite "
-        "states, the low-finite/high-abstained state, and finite paired "
-        f"disagreement occupy {len(stress)} rows. Abstained evidence is "
-        "reported as a reliability boundary, never as a zero similarity score.",
-        "The all-baseline L592 symmetric pass rates by pair-level generation "
-        "reliability were "
-        f"`{high_pass_strata['strict']}` (strict), "
-        f"`{high_pass_strata['moderate']}` (moderate), and "
-        f"`{high_pass_strata['high_misalignment']}` (high misalignment). "
-        "A pair inherits the worse of its two view labels; these strata are "
-        "descriptive and are never exclusion criteria.",
-        "Per-shoe Spearman associations between finite L37/L592 disagreement "
-        "and the continuous generation covariates were "
+        "![독립 deformation reliability 분석](figures/05_real_deformation_reliability.png)",
+        "",
+        "**그림 읽는 법.** pair는 두 view 중 더 나쁜 alignment class를 따르며, "
+        "pass rate와 finite L37/L592 disagreement를 feature score와 분리해 읽는다.",
+        "",
+        "**관찰된 결과.** all-baseline L592 symmetric pass rate는 strict "
+        f"`{high_pass_strata['strict']}`, moderate "
+        f"`{high_pass_strata['moderate']}`, high-misalignment "
+        f"`{high_pass_strata['high_misalignment']}`이다. baseline step 1/2/3의 "
+        "finite low/high disagreement는 "
+        f"`{disagreement_by_step['1']}` / `{disagreement_by_step['2']}` / "
+        f"`{disagreement_by_step['3']}`이다. 연속 covariate와의 per-shoe "
+        "Spearman은 "
         + ", ".join(
             f"{label} `{value}`"
             for label, value in reliability_correlations.items()
         )
-        + ". Non-estimable values are retained when within-shoe support or "
-        "variation is insufficient.",
+        + "이다.",
+        "",
+        "**해석.** abstention은 0 similarity가 아니라 reliability boundary다. "
+        "strata는 제외 기준이 아니라 관찰된 generation reliability의 기술이다.",
         "",
         f"## 8. {REPORT_SECTION_TITLES[7]}",
         "",
-        module_design_interpretation,
+        "### 직접 확인된 사실",
+        "",
+        "Reliability-stratified pass rate와 finite L37/L592 disagreement는 연속적인 "
+        "reliability weighting을 지지한다. 이 결과는 feature fidelity와 geometry/visibility "
+        "reliability를 분리해 보고해야 함을 뒷받침한다.",
+        "",
+        "### 이번 실험에서 확인되지 않은 것",
+        "",
+        (
+            "low-finite/high-abstained case가 관찰되지 않았으므로 "
+            "semantic-low/pixel-high hard gate는 직접 검증되지 않았다. 즉, "
+            "해상도 hard gate가 직접 검증된 것은 아니다."
+            if low_finite_high_abstained == "0.0000"
+            else "low-finite/high-abstained rate는 "
+            f"`{low_finite_high_abstained}`이지만, 이 관찰만으로 semantic-low/"
+            "pixel-high hard gate를 학습 또는 검증하지 않았다. 즉, 해상도 hard "
+            "gate가 직접 검증된 것은 아니다."
+        ),
+        "",
+        "### 제안하는 모듈 설계",
+        "",
+        "연속적인 reliability head가 semantic 및 pixel evidence를 가중하도록 설계한다. "
+        "학습과 별도의 held-out 검증을 전제로 하며 제약은 다음과 같다:",
+        "",
+        "0 ≤ pixel_weight ≤ semantic_weight ≤ 1",
         "",
         f"## 9. {REPORT_SECTION_TITLES[8]}",
         "",
-        "These results are conditional on adjacent upper views, the fixed "
-        "four-shoe sample, and DA3-estimated geometry. They do not establish "
-        "calibrated-camera ground truth, bottom-view behavior, population-level "
-        "backbone superiority, confirmatory significance, or generalization "
-        "beyond these shoes. Identity swap remains an upper-bound semantic "
-        "corruption. Local perturbation envelopes do not recover absolute "
-        "camera error.",
+        "결과는 adjacent upper view, 고정된 네 shoe 표본, DA3-estimated geometry에 "
+        "조건부다. calibrated-camera ground truth, bottom-view behavior, 모집단 수준 "
+        "backbone superiority, 확증적 유의성, 이 shoe 밖의 일반화를 확립하지 않는다. "
+        "Identity swap은 semantic corruption의 upper-bound이며, local perturbation "
+        "envelope은 absolute camera error를 복원하지 않는다.",
         (
-            "Frozen analyzability criteria not met: "
+            "충족하지 못한 frozen analyzability criterion: "
             + ", ".join(f"`{value}`" for value in incomplete)
-            + ". The report retains these failures as reliability boundaries."
+            + ". 이 실패는 reliability boundary로 남긴다."
             if incomplete
-            else "All artifact-derived frozen analyzability criteria in this "
-            "snapshot were met."
+            else "이 snapshot의 artifact-derived frozen analyzability criteria는 모두 충족했다."
         ),
         "",
         f"## 10. {REPORT_SECTION_TITLES[9]}",
         "",
+        "- [PCA audit visualizations](audit_visualizations/pca/)",
+        "- [Directional audit visualizations](audit_visualizations/directional/)",
+        "- [Audit manifest](audit_visualizations/audit_manifest.json)",
         *input_lines,
         *artifact_lines,
         "",
