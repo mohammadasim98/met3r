@@ -1018,6 +1018,9 @@ def test_analyze_adjacent16_run_publishes_exact_atomic_research_snapshot(
         assert "complete_series_coverage" in table
 
     report = outputs.report_path.read_text(encoding="utf-8")
+    assert report.startswith(
+        "# 인접 Upper 16-view DINO Feature Fidelity 및 Reliability 연구 보고서"
+    )
     assert [
         line.removeprefix("## ")
         for line in report.splitlines()
@@ -1026,11 +1029,20 @@ def test_analyze_adjacent16_run_publishes_exact_atomic_research_snapshot(
         f"{index}. {title}"
         for index, title in enumerate(REPORT_SECTION_TITLES, start=1)
     ]
-    assert "fixed/precomputed DA3 cameras (not calibrated GT)" in report
-    assert "four shoe clusters" in report
-    assert "descriptive" in report
-    assert "conditional feature fidelity" in report.lower()
-    assert "geometry/visibility reliability" in report.lower()
+    for filename in FIGURE_FILENAMES:
+        assert f"](figures/{filename})" in report
+
+    assert "한눈에 보는 결론" in report
+    assert "관찰된 결과" in report
+    assert "해석" in report
+    assert "직접 확인된 사실" in report
+    assert "이번 실험에서 확인되지 않은 것" in report
+    assert "제안하는 모듈 설계" in report
+    assert "0 ≤ pixel_weight ≤ semantic_weight ≤ 1" in report
+    assert "fixed/precomputed DA3 camera (calibrated GT 아님)" in report
+    assert "절대적인 DA3 카메라 오차를 추정하지 않는다" in report
+    assert "해상도 hard gate가 직접 검증된 것은 아니다" in report
+    assert "결측 또는 abstention을 0점으로 대체하지 않았다" in report
     assert f"controlled rows: {len(controlled):,}" in report
     assert f"geometry calibration rows: {len(geometry):,}" in report
     assert f"stress rows: {len(stress):,}" in report
