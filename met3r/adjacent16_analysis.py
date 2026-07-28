@@ -2279,11 +2279,20 @@ def _representative_estimate(
     query: str,
     column: str,
 ) -> str:
+    value = _representative_value(frame, query, column)
+    return f"{value:.4f}" if np.isfinite(value) else "not estimable"
+
+
+def _representative_value(
+    frame: pd.DataFrame,
+    query: str,
+    column: str,
+) -> float:
     selected = frame.query(query)
     if selected.empty:
-        return "not estimable"
+        return float("nan")
     value = pd.to_numeric(selected[column], errors="coerce").iloc[0]
-    return f"{float(value):.4f}" if np.isfinite(value) else "not estimable"
+    return float(value) if np.isfinite(value) else float("nan")
 
 
 def _module_design_interpretation(stress: pd.DataFrame) -> str:
@@ -2322,6 +2331,32 @@ def _module_design_interpretation(stress: pd.DataFrame) -> str:
     )
 
 
+def _module_design_interpretation_ko(stress: pd.DataFrame) -> str:
+    value = _representative_value(
+        stress,
+        "baseline_steps == 'all' and "
+        "metric == 'low_finite_high_abstained_rate'",
+        "estimate",
+    )
+    if not np.isfinite(value):
+        return (
+            "low-finite/high-abstained rate를 추정할 수 없으므로 "
+            "semantic-low/pixel-high hard gate는 직접 검증되지 않았다. 즉, "
+            "해상도 hard gate가 직접 검증된 것은 아니다."
+        )
+    if value <= 0.0:
+        return (
+            "low-finite/high-abstained case가 관찰되지 않았으므로 "
+            "semantic-low/pixel-high hard gate는 직접 검증되지 않았다. 즉, "
+            "해상도 hard gate가 직접 검증된 것은 아니다."
+        )
+    return (
+        f"low-finite/high-abstained rate는 `{value:.4f}`이지만, 이 관찰만으로 "
+        "semantic-low/pixel-high hard gate를 학습 또는 검증하지 않았다. 즉, "
+        "해상도 hard gate가 직접 검증된 것은 아니다."
+    )
+
+
 def _write_report(
     destination: Path,
     *,
@@ -2355,13 +2390,12 @@ def _write_report(
         )
         for step in ("1", "2", "3")
     }
-    translation_by_backbone = {
-        backbone_name: _representative_estimate(
+    backbone_endpoints = {
+        (backbone_name, corruption, endpoint): _representative_estimate(
             backbone,
             "baseline_steps == 'all' and "
             f"backbone == '{backbone_name}' and "
-            "corruption == 'translation' and "
-            "endpoint == 'severity_spearman'",
+            f"corruption == '{corruption}' and endpoint == '{endpoint}'",
             "estimate",
         )
         for backbone_name in (
@@ -2369,6 +2403,14 @@ def _write_report(
             "dinov2_vitb14",
             "dinov3_vitb16",
             "dinov3_vitl16_pixal3d",
+        )
+        for corruption, endpoint in (
+            ("identity_swap", "clean_corrupt_auroc"),
+            ("translation", "severity_spearman"),
+            ("translation", "pairwise_rank_accuracy"),
+            ("thin_plate_warp", "severity_spearman"),
+            ("thin_plate_warp", "pairwise_rank_accuracy"),
+            ("jpeg", "nuisance_absolute_delta"),
         )
     }
     resolution_endpoints = {
@@ -2405,16 +2447,47 @@ def _write_report(
             ("TPS Spearman", "thin_plate_warp", "severity_spearman"),
         )
     }
-    rotation_responses = {
-        (variant, magnitude): _representative_estimate(
+    geometry_responses = {
+        (perturbation_kind, magnitude, variant): _representative_estimate(
             geometry,
-            "baseline_steps == 'all' and perturbation_kind == 'rotation' and "
+            "baseline_steps == 'all' and "
+            f"perturbation_kind == '{perturbation_kind}' and "
             f"magnitude == {magnitude} and variant == '{variant}'",
             "geometry_response",
         )
+        for perturbation_kind, magnitudes in (
+            ("depth_scale", (1.01, 1.05)),
+            ("relative_depth_noise", (0.005, 0.05)),
+            ("relative_translation", (0.0025, 0.02)),
+            ("rotation", (0.25, 1.0, 5.0)),
+        )
+        for magnitude in magnitudes
         for variant in ("L37-bilinear", "L592-NAF")
-        for magnitude in (0.25, 1.0, 5.0)
     }
+    depth_boundary_query = (
+        "baseline_steps == 'all' and perturbation_kind == 'depth_scale' and "
+        "magnitude == 1.1 and variant == 'L37-bilinear'"
+    )
+    depth_boundary_common = _representative_value(
+        geometry,
+        depth_boundary_query,
+        "n_common_support",
+    )
+    depth_boundary_union = _representative_value(
+        geometry,
+        depth_boundary_query,
+        "n_union_support",
+    )
+    depth_boundary_common_text = (
+        str(int(depth_boundary_common))
+        if np.isfinite(depth_boundary_common)
+        else "not estimable"
+    )
+    depth_boundary_union_text = (
+        str(int(depth_boundary_union))
+        if np.isfinite(depth_boundary_union)
+        else "not estimable"
+    )
     disagreement_by_step = {
         step: _representative_estimate(
             stress,
@@ -2424,12 +2497,7 @@ def _write_report(
         )
         for step in ("1", "2", "3")
     }
-    low_finite_high_abstained = _representative_estimate(
-        stress,
-        "baseline_steps == 'all' and "
-        "metric == 'low_finite_high_abstained_rate'",
-        "estimate",
-    )
+    module_design_interpretation_ko = _module_design_interpretation_ko(stress)
     high_pass_strata = {
         stratum: _representative_estimate(
             stress,
@@ -2472,6 +2540,31 @@ def _write_report(
             )
         )
     ]
+    backbone_lines = [
+        f"- `{name}`: identity AUROC "
+        f"`{backbone_endpoints[(name, 'identity_swap', 'clean_corrupt_auroc')]}`; "
+        "translation Spearman "
+        f"`{backbone_endpoints[(name, 'translation', 'severity_spearman')]}`, "
+        "pairwise rank accuracy "
+        f"`{backbone_endpoints[(name, 'translation', 'pairwise_rank_accuracy')]}`; "
+        "TPS Spearman "
+        f"`{backbone_endpoints[(name, 'thin_plate_warp', 'severity_spearman')]}`, "
+        "pairwise rank accuracy "
+        f"`{backbone_endpoints[(name, 'thin_plate_warp', 'pairwise_rank_accuracy')]}`; "
+        "JPEG absolute delta "
+        f"`{backbone_endpoints[(name, 'jpeg', 'nuisance_absolute_delta')]}`."
+        for name in COMMON37_BACKBONES
+    ]
+    depth_boundary_line = (
+        "depth_scale 10%에서는 common finite support "
+        f"`{depth_boundary_common_text}` / union finite support "
+        f"`{depth_boundary_union_text}`로, abstention boundary다."
+        if np.isfinite(depth_boundary_common)
+        and depth_boundary_common <= 0.0
+        else "depth_scale 10%에서는 common finite support "
+        f"`{depth_boundary_common_text}` / union finite support "
+        f"`{depth_boundary_union_text}`가 관찰되어 완전 abstention boundary는 아니다."
+    )
     lines = [
         "# 인접 Upper 16-view DINO Feature Fidelity 및 Reliability 연구 보고서",
         "",
@@ -2486,8 +2579,9 @@ def _write_report(
         "confound 감소는 직접 검증하지 않았다. |",
         "| 어떤 DINO backbone이 적합한가? | translation Spearman: "
         + ", ".join(
-            f"{name} `{value}`"
-            for name, value in translation_by_backbone.items()
+            f"{name} "
+            f"`{backbone_endpoints[(name, 'translation', 'severity_spearman')]}`"
+            for name in COMMON37_BACKBONES
         )
         + " | 공통 support 안의 조건부 비교이며 일반적 우월성 주장은 아니다. |",
         "| 높은 feature resolution이 항상 유리한가? | L37/L592 translation "
@@ -2514,10 +2608,10 @@ def _write_report(
         "",
         f"## 3. {REPORT_SECTION_TITLES[2]}",
         "",
-        "![인접 뷰의 support와 overlap](figures/01_adjacent_support.png)",
-        "",
         "**그림 읽는 법.** 대칭 coverage와 direction별 overlap을 all 및 baseline "
         "step별로 읽는다; 낮은 support는 낮은 similarity가 아니라 관찰 불가를 뜻한다.",
+        "",
+        "![인접 뷰의 support와 overlap](figures/01_adjacent_support.png)",
         "",
         "**관찰된 결과.** step 1/2/3의 최소 direction overlap은 각각 "
         f"`{support_by_step['1']}`, `{support_by_step['2']}`, "
@@ -2529,28 +2623,33 @@ def _write_report(
         "",
         f"## 4. {REPORT_SECTION_TITLES[3]}",
         "",
-        "![37-grid에서 DINO backbone 비교](figures/02_common37_backbones.png)",
-        "",
         "**그림 읽는 법.** 네 backbone은 exact shared "
         "`shoe_id × quartet_id × pair_id × changed_view × corruption × severity` "
-        "support의 bilinear 37 결과만 비교한다.",
+        "support의 bilinear 37 결과만 비교한다. 네 panel은 identity AUROC, "
+        "translation/TPS severity Spearman, 두 corruption의 pairwise rank "
+        "accuracy, JPEG signed/absolute nuisance delta를 각각 보여 준다.",
         "",
-        "**관찰된 결과.** all-baseline translation Spearman은 "
-        + ", ".join(
-            f"{name} `{value}`"
-            for name, value in translation_by_backbone.items()
-        )
-        + "이다.",
+        "![37-grid에서 DINO backbone 비교](figures/02_common37_backbones.png)",
         "",
-        "**해석.** 이 비교는 동일 물리 cell의 조건부 feature fidelity이며, "
-        "네 shoe를 넘어선 backbone의 일반적 우월성을 검증하지 않는다.",
+        "**관찰된 결과.** all-baseline endpoint를 backbone별로 나누면 다음과 같다. "
+        "Identity AUROC saturation, translation과 TPS의 두 rank-preservation "
+        "endpoint, JPEG absolute nuisance delta를 서로 바꾸어 읽지 않는다.",
+        "",
+        *backbone_lines,
+        "",
+        "**해석.** identity AUROC의 포화는 이 corruption에서의 ceiling을 뜻한다. "
+        "Translation/TPS Spearman과 pairwise accuracy는 severity 순서 보존을, "
+        "JPEG absolute delta는 작을수록 nuisance 불변성이 높음을 뜻한다. "
+        "DINOv3-L은 합리적인 선택이지만 모든 endpoint에서 지배적이지 않다. "
+        "이 exact-support 실험에서 original DINO가 DINOv2보다 낫다는 순서는 "
+        "재현하지 못했다. 이 비교는 네 shoe에 조건부이며 모집단 우월성 검증이 아니다.",
         "",
         f"## 5. {REPORT_SECTION_TITLES[4]}",
         "",
-        "![DINOv3-L 해상도와 NAF 비교](figures/03_dinov3l_resolution_naf.png)",
-        "",
         "**그림 읽는 법.** bilinear 37과 592의 endpoint를 exact five-way support에서, "
         "NAF 차이는 동일 resolution의 paired support에서 읽는다.",
+        "",
+        "![DINOv3-L 해상도와 NAF 비교](figures/03_dinov3l_resolution_naf.png)",
         "",
         "**관찰된 결과.** L37/L592의 translation Spearman은 "
         f"`{resolution_endpoints[(37, 'translation')]}` / "
@@ -2567,28 +2666,56 @@ def _write_report(
         "",
         f"## 6. {REPORT_SECTION_TITLES[5]}",
         "",
+        "**그림 읽는 법.** L37-bilinear와 L592-NAF의 absolute response를 동일 "
+        "paired support에서 비교한다. depth_scale은 precomputed depth의 전역 scale, "
+        "relative_depth_noise는 국소 상대 depth noise, relative_translation은 camera "
+        "위치 perturbation, rotation은 camera 각도 perturbation에 대한 국소 민감도다.",
+        "",
         "![카메라와 geometry perturbation 민감도](figures/04_geometry_calibration.png)",
         "",
-        "**그림 읽는 법.** L37-bilinear와 L592-NAF의 absolute response를 동일 "
-        "paired support에서 rotation magnitude별로 비교한다.",
-        "",
         "**관찰된 결과.** rotation 0.25°/1°/5°에서 L37-bilinear는 "
-        f"`{rotation_responses[('L37-bilinear', 0.25)]}` / "
-        f"`{rotation_responses[('L37-bilinear', 1.0)]}` / "
-        f"`{rotation_responses[('L37-bilinear', 5.0)]}`, L592-NAF는 "
-        f"`{rotation_responses[('L592-NAF', 0.25)]}` / "
-        f"`{rotation_responses[('L592-NAF', 1.0)]}` / "
-        f"`{rotation_responses[('L592-NAF', 5.0)]}`이다.",
+        f"`{geometry_responses[('rotation', 0.25, 'L37-bilinear')]}` / "
+        f"`{geometry_responses[('rotation', 1.0, 'L37-bilinear')]}` / "
+        f"`{geometry_responses[('rotation', 5.0, 'L37-bilinear')]}`, "
+        "L592-NAF는 "
+        f"`{geometry_responses[('rotation', 0.25, 'L592-NAF')]}` / "
+        f"`{geometry_responses[('rotation', 1.0, 'L592-NAF')]}` / "
+        f"`{geometry_responses[('rotation', 5.0, 'L592-NAF')]}`이다.",
+        "",
+        "depth_scale 1%/5%에서 L37-bilinear는 "
+        f"`{geometry_responses[('depth_scale', 1.01, 'L37-bilinear')]}` / "
+        f"`{geometry_responses[('depth_scale', 1.05, 'L37-bilinear')]}`, "
+        "L592-NAF는 "
+        f"`{geometry_responses[('depth_scale', 1.01, 'L592-NAF')]}` / "
+        f"`{geometry_responses[('depth_scale', 1.05, 'L592-NAF')]}`이다.",
+        "",
+        "relative_depth_noise 0.5%/5%에서 L37-bilinear는 "
+        f"`{geometry_responses[('relative_depth_noise', 0.005, 'L37-bilinear')]}` / "
+        f"`{geometry_responses[('relative_depth_noise', 0.05, 'L37-bilinear')]}`, "
+        "L592-NAF는 "
+        f"`{geometry_responses[('relative_depth_noise', 0.005, 'L592-NAF')]}` / "
+        f"`{geometry_responses[('relative_depth_noise', 0.05, 'L592-NAF')]}`이다.",
+        "",
+        "relative_translation 0.25%/2%에서 L37-bilinear는 "
+        f"`{geometry_responses[('relative_translation', 0.0025, 'L37-bilinear')]}` / "
+        f"`{geometry_responses[('relative_translation', 0.02, 'L37-bilinear')]}`, "
+        "L592-NAF는 "
+        f"`{geometry_responses[('relative_translation', 0.0025, 'L592-NAF')]}` / "
+        f"`{geometry_responses[('relative_translation', 0.02, 'L592-NAF')]}`이다.",
+        "",
+        depth_boundary_line,
         "",
         "**해석.** injected local perturbation은 precomputed camera 주변의 민감도를 "
-        "추정하지만, 알려지지 않은 절대적인 DA3 카메라 오차를 추정하지 않는다.",
+        "추정한다. 각 series는 서로 다른 물리 단위의 국소 response envelope이며, "
+        "10% depth_scale의 support 소실은 score 0이 아니라 abstention 경계다. "
+        "이 실험은 알려지지 않은 절대적인 DA3 카메라 오차를 추정하지 않는다.",
         "",
         f"## 7. {REPORT_SECTION_TITLES[6]}",
         "",
-        "![독립 deformation reliability 분석](figures/05_real_deformation_reliability.png)",
-        "",
         "**그림 읽는 법.** pair는 두 view 중 더 나쁜 alignment class를 따르며, "
         "pass rate와 finite L37/L592 disagreement를 feature score와 분리해 읽는다.",
+        "",
+        "![독립 deformation reliability 분석](figures/05_real_deformation_reliability.png)",
         "",
         "**관찰된 결과.** all-baseline L592 symmetric pass rate는 strict "
         f"`{high_pass_strata['strict']}`, moderate "
@@ -2617,16 +2744,7 @@ def _write_report(
         "",
         "### 이번 실험에서 확인되지 않은 것",
         "",
-        (
-            "low-finite/high-abstained case가 관찰되지 않았으므로 "
-            "semantic-low/pixel-high hard gate는 직접 검증되지 않았다. 즉, "
-            "해상도 hard gate가 직접 검증된 것은 아니다."
-            if low_finite_high_abstained == "0.0000"
-            else "low-finite/high-abstained rate는 "
-            f"`{low_finite_high_abstained}`이지만, 이 관찰만으로 semantic-low/"
-            "pixel-high hard gate를 학습 또는 검증하지 않았다. 즉, 해상도 hard "
-            "gate가 직접 검증된 것은 아니다."
-        ),
+        module_design_interpretation_ko,
         "",
         "### 제안하는 모듈 설계",
         "",

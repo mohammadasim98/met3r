@@ -357,47 +357,70 @@ def test_bootstrap_keeps_an_entirely_missing_shoe_in_four_cluster_draws() -> Non
 
 def _geometry_rows() -> pd.DataFrame:
     rows: list[dict[str, object]] = []
+    magnitudes_by_kind = {
+        "depth_scale": (1.01, 1.02, 1.05, 1.1),
+        "relative_depth_noise": (0.005, 0.01, 0.02, 0.05),
+        "relative_translation": (0.0025, 0.005, 0.01, 0.02),
+        "rotation": (0.25, 0.5, 1.0, 2.0, 5.0),
+    }
     for shoe in SHOES:
         for steps in (1, 2, 3):
             for mode, resolution, multiplier in (
                 ("bilinear", 37, 1.0),
                 ("naf_normal_guide", 592, 2.0),
             ):
-                for magnitude in (0.25, 0.5, 1.0, 2.0, 5.0):
-                    abstained = (
-                        shoe == SHOE_D
-                        and steps == 3
-                        and mode == "naf_normal_guide"
-                        and magnitude == 2.0
-                    )
-                    effect = multiplier * magnitude
-                    if (
-                        shoe == SHOE_D
-                        and steps == 3
-                        and mode == "bilinear"
-                        and magnitude == 2.0
-                    ):
-                        effect = 100.0
-                    rows.append(
-                        {
-                            "backbone": "dinov3_vitl16_pixal3d",
-                            "feature_track": "user_37_grid_track",
-                            "feature_mode": mode,
-                            "resolution": resolution,
-                            "shoe_id": shoe,
-                            "quartet_id": "q0",
-                            "pair_id": f"{shoe}__q0__1__{steps + 1}",
-                            "changed_view": "1",
-                            "baseline_steps": steps,
-                            "perturbation_kind": "rotation",
-                            "magnitude": magnitude,
-                            "base_score": 0.0,
-                            "perturbed_score": np.nan if abstained else effect,
-                            "geometry_effect": np.nan if abstained else effect,
-                            "overlap": np.nan if abstained else 0.5,
-                            "abstained": abstained,
-                        }
-                    )
+                for perturbation_kind, magnitudes in magnitudes_by_kind.items():
+                    for magnitude in magnitudes:
+                        depth_boundary = (
+                            perturbation_kind == "depth_scale"
+                            and magnitude == 1.1
+                        )
+                        rotation_boundary = (
+                            perturbation_kind == "rotation"
+                            and shoe == SHOE_D
+                            and steps == 3
+                            and mode == "naf_normal_guide"
+                            and magnitude == 2.0
+                        )
+                        abstained = depth_boundary or rotation_boundary
+                        base_effect = (
+                            magnitude - 1.0
+                            if perturbation_kind == "depth_scale"
+                            else magnitude
+                        )
+                        effect = multiplier * base_effect
+                        if (
+                            perturbation_kind == "rotation"
+                            and shoe == SHOE_D
+                            and steps == 3
+                            and mode == "bilinear"
+                            and magnitude == 2.0
+                        ):
+                            effect = 100.0
+                        rows.append(
+                            {
+                                "backbone": "dinov3_vitl16_pixal3d",
+                                "feature_track": "user_37_grid_track",
+                                "feature_mode": mode,
+                                "resolution": resolution,
+                                "shoe_id": shoe,
+                                "quartet_id": "q0",
+                                "pair_id": f"{shoe}__q0__1__{steps + 1}",
+                                "changed_view": "1",
+                                "baseline_steps": steps,
+                                "perturbation_kind": perturbation_kind,
+                                "magnitude": magnitude,
+                                "base_score": 0.0,
+                                "perturbed_score": (
+                                    np.nan if abstained else effect
+                                ),
+                                "geometry_effect": (
+                                    np.nan if abstained else effect
+                                ),
+                                "overlap": np.nan if abstained else 0.5,
+                                "abstained": abstained,
+                            }
+                        )
     return pd.DataFrame(rows)
 
 
@@ -627,6 +650,30 @@ def test_module_design_interpretation_does_not_claim_an_unobserved_boundary() ->
     assert "does not provide direct evidence" in absent_text
     assert "observed rate was `0.0833`" in observed_text
     assert "candidate gating signal" in observed_text
+
+
+def test_korean_module_interpretation_uses_raw_rate_before_formatting() -> None:
+    """Catch a tiny positive rate rounding to zero and being called absent."""
+
+    frame = pd.DataFrame(
+        [
+            {
+                "baseline_steps": "all",
+                "metric": "low_finite_high_abstained_rate",
+                "estimate": 0.0,
+            }
+        ]
+    )
+
+    absent_text = adjacent16_analysis._module_design_interpretation_ko(frame)
+    tiny_text = adjacent16_analysis._module_design_interpretation_ko(
+        frame.assign(estimate=0.00001)
+    )
+
+    assert "관찰되지 않았으므로" in absent_text
+    assert "관찰되지 않았으므로" not in tiny_text
+    assert "`0.0000`" in tiny_text
+    assert "직접 검증된 것은 아니다" in tiny_text
 
 
 def test_stress_analyzability_uses_only_exact_low_high_pairs() -> None:
@@ -1064,6 +1111,17 @@ def test_analyze_adjacent16_run_publishes_exact_atomic_research_snapshot(
     ]
     for filename in FIGURE_FILENAMES:
         assert f"](figures/{filename})" in report
+    for section_index, filename in enumerate(FIGURE_FILENAMES, start=3):
+        section_start = report.index(
+            f"## {section_index}. {REPORT_SECTION_TITLES[section_index - 1]}"
+        )
+        next_section = report.index(
+            f"## {section_index + 1}. {REPORT_SECTION_TITLES[section_index]}"
+        )
+        section = report[section_start:next_section]
+        assert section.index("**그림 읽는 법.**") < section.index(
+            f"](figures/{filename})"
+        ) < section.index("**관찰된 결과.**")
 
     assert "한눈에 보는 결론" in report
     assert "관찰된 결과" in report
@@ -1091,6 +1149,12 @@ def test_analyze_adjacent16_run_publishes_exact_atomic_research_snapshot(
     disagreement_table = pd.read_parquet(
         tmp_path / "reports/tables/stress_reliability.parquet"
     )
+    backbone_table = pd.read_parquet(
+        tmp_path / "reports/tables/backbone_common37.parquet"
+    )
+    geometry_table = pd.read_parquet(
+        tmp_path / "reports/tables/geometry_low_high.parquet"
+    )
     for step in ("1", "2", "3"):
         overlap = support_table.query(
             f"baseline_steps == '{step}' and "
@@ -1102,6 +1166,79 @@ def test_analyze_adjacent16_run_publishes_exact_atomic_research_snapshot(
         ).iloc[0]["estimate"]
         assert f"`{float(overlap):.4f}`" in report
         assert f"`{float(disagreement):.4f}`" in report
+
+    for backbone_name in COMMON37_BACKBONES:
+        def backbone_value(corruption: str, endpoint: str) -> str:
+            value = backbone_table.query(
+                "baseline_steps == 'all' and "
+                f"backbone == '{backbone_name}' and "
+                f"corruption == '{corruption}' and "
+                f"endpoint == '{endpoint}'"
+            ).iloc[0]["estimate"]
+            return f"{float(value):.4f}"
+
+        assert (
+            f"- `{backbone_name}`: identity AUROC "
+            f"`{backbone_value('identity_swap', 'clean_corrupt_auroc')}`; "
+            "translation Spearman "
+            f"`{backbone_value('translation', 'severity_spearman')}`, "
+            "pairwise rank accuracy "
+            f"`{backbone_value('translation', 'pairwise_rank_accuracy')}`; "
+            "TPS Spearman "
+            f"`{backbone_value('thin_plate_warp', 'severity_spearman')}`, "
+            "pairwise rank accuracy "
+            f"`{backbone_value('thin_plate_warp', 'pairwise_rank_accuracy')}`; "
+            "JPEG absolute delta "
+            f"`{backbone_value('jpeg', 'nuisance_absolute_delta')}`."
+        ) in report
+
+    def geometry_value(
+        perturbation_kind: str,
+        magnitude: float,
+        variant: str,
+    ) -> str:
+        value = geometry_table.query(
+            "baseline_steps == 'all' and "
+            f"perturbation_kind == '{perturbation_kind}' and "
+            f"magnitude == {magnitude} and variant == '{variant}'"
+        ).iloc[0]["geometry_response"]
+        return f"{float(value):.4f}"
+
+    assert (
+        "depth_scale 1%/5%에서 L37-bilinear는 "
+        f"`{geometry_value('depth_scale', 1.01, 'L37-bilinear')}` / "
+        f"`{geometry_value('depth_scale', 1.05, 'L37-bilinear')}`, "
+        "L592-NAF는 "
+        f"`{geometry_value('depth_scale', 1.01, 'L592-NAF')}` / "
+        f"`{geometry_value('depth_scale', 1.05, 'L592-NAF')}`"
+    ) in report
+    assert (
+        "relative_depth_noise 0.5%/5%에서 L37-bilinear는 "
+        f"`{geometry_value('relative_depth_noise', 0.005, 'L37-bilinear')}` / "
+        f"`{geometry_value('relative_depth_noise', 0.05, 'L37-bilinear')}`, "
+        "L592-NAF는 "
+        f"`{geometry_value('relative_depth_noise', 0.005, 'L592-NAF')}` / "
+        f"`{geometry_value('relative_depth_noise', 0.05, 'L592-NAF')}`"
+    ) in report
+    assert (
+        "relative_translation 0.25%/2%에서 L37-bilinear는 "
+        f"`{geometry_value('relative_translation', 0.0025, 'L37-bilinear')}` / "
+        f"`{geometry_value('relative_translation', 0.02, 'L37-bilinear')}`, "
+        "L592-NAF는 "
+        f"`{geometry_value('relative_translation', 0.0025, 'L592-NAF')}` / "
+        f"`{geometry_value('relative_translation', 0.02, 'L592-NAF')}`"
+    ) in report
+    depth_boundary = geometry_table.query(
+        "baseline_steps == 'all' and perturbation_kind == 'depth_scale' "
+        "and magnitude == 1.1 and variant == 'L37-bilinear'"
+    ).iloc[0]
+    assert (
+        "depth_scale 10%에서는 common finite support "
+        f"`{int(depth_boundary['n_common_support'])}` / union finite support "
+        f"`{int(depth_boundary['n_union_support'])}`로, abstention boundary다."
+    ) in report
+    assert "DINOv3-L은 합리적인 선택이지만 모든 endpoint에서 지배적이지 않다" in report
+    assert "original DINO가 DINOv2보다 낫다는 순서는 재현하지 못했다" in report
 
     published_paths = [
         preflight_parquet,
