@@ -111,6 +111,7 @@ REPORT_SECTION_TITLES = (
     "시각화 및 재현성 부록",
 )
 CAMERA_LIMITATION = "fixed/precomputed DA3 camera (calibrated GT 아님)"
+PLOT_CAMERA_LIMITATION = "fixed/precomputed DA3 camera (not calibrated GT)"
 _CONTROLLED_SUPPORT_COMPARISONS = frozenset(
     {
         "four_backbone_common37",
@@ -2000,7 +2001,7 @@ def _build_support_figure(
     axis.set_xlabel("baseline steps")
     axis.set_ylabel("minimum directional overlap")
     _annotate_support(axis, minimum)
-    figure.suptitle(f"Adjacent support — {CAMERA_LIMITATION}")
+    figure.suptitle(f"Adjacent support — {PLOT_CAMERA_LIMITATION}")
     figure.tight_layout(rect=(0, 0, 1, 0.94))
     return figure
 

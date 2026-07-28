@@ -939,6 +939,39 @@ def test_support_common_support_and_analyzability_are_artifact_derived() -> None
     )
 
 
+def test_support_figure_uses_glyph_safe_camera_label_and_keeps_report_contract() -> None:
+    import matplotlib.pyplot as plt
+
+    tables = {
+        "support_coverage": pd.DataFrame(
+            {
+                "baseline_steps": [1, 1, 1, 2],
+                "metric": [
+                    "symmetric_coverage",
+                    "first_to_second_overlap",
+                    "second_to_first_overlap",
+                    "minimum_directional_overlap",
+                ],
+                "estimate": [1.0, 0.9, 0.8, 0.7],
+            }
+        )
+    }
+
+    figure = adjacent16_analysis._build_support_figure(tables, plt)
+    try:
+        plot_title = figure._suptitle.get_text()
+        assert adjacent16_analysis.CAMERA_LIMITATION == (
+            "fixed/precomputed DA3 camera (calibrated GT 아님)"
+        )
+        assert plot_title == (
+            "Adjacent support — fixed/precomputed DA3 camera "
+            "(not calibrated GT)"
+        )
+        assert "아님" not in plot_title
+    finally:
+        plt.close(figure)
+
+
 def test_analyze_adjacent16_run_publishes_exact_atomic_research_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
