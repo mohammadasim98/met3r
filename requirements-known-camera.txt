@@ -8,5 +8,9 @@ matplotlib>=3.7
 pandas>=2.0
 transformers>=4.56
 huggingface-hub>=0.22
+setuptools<81
+iopath>=0.1.10
+decord>=0.6
+pycocotools>=2.0
 natten
 pyarrow>=14

@@ -166,8 +166,9 @@ def test_stress_child_launch_does_not_require_fork(
     child.write_text(
         "\n".join(
             (
-                "import json, shutil, sys",
+                "import json, os, sam3, shutil, sys",
                 "from pathlib import Path",
+                "assert os.environ['SHOE_DEFORM_CODEX_SANDBOX'] == 'danger-full-access'",
                 "output = Path(sys.argv[sys.argv.index('--output-dir') + 1])",
                 "shutil.copy2(output / 'source.png', output / 'deformed.png')",
                 "shutil.copy2(output / 'source_mask.png', output / 'deformed_mask.png')",

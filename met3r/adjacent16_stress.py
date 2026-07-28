@@ -219,10 +219,14 @@ def _run_one_task(
                     command = _deformation_command(input_staging, staging)
                     environment = os.environ.copy()
                     environment["CUDA_VISIBLE_DEVICES"] = str(task.physical_gpu)
+                    environment["SHOE_DEFORM_CODEX_SANDBOX"] = (
+                        "danger-full-access"
+                    )
                     existing_pythonpath = environment.get("PYTHONPATH")
                     environment["PYTHONPATH"] = os.pathsep.join(
                         part for part in (
                             str(_BYTESIZE_RECONSTRUCTION),
+                            str(_BYTESIZE_RECONSTRUCTION / "third_party" / "sam3"),
                             existing_pythonpath,
                         )
                         if part
