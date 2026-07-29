@@ -42,7 +42,7 @@ We introduce **MEt3R** a metric for multi-view consistency in generated images. 
 
 ## 📌 Dependencies
 
-    - Python >= 3.6
+    - Python >= 3.10 for package version 1.1.0 and the known-camera extension
     - PyTorch >= 2.1.0
     - CUDA >= 11.3
     - PyTorch3D >= 0.7.5
@@ -145,3 +145,16 @@ When using **MEt3R** in your project, consider citing our work as follows.
 }</code></pre>
   </div>
 </section>
+
+## Known-camera DINO fidelity extension
+
+This branch also contains a DUSt3R-independent, fixed/precomputed-camera
+evaluation path for DINO/DINOv2/DINOv3 resolution studies, NAF guide ablations,
+geometry-versus-feature attribution, controlled corruptions, blinded human
+ratings, a config-expanded experiment design, and analysis plots. Backbone,
+NAF, and DA3 revisions plus ordered-image content identities are recorded in
+artifacts. The cameras are explicitly labeled **fixed/precomputed DA3 cameras
+(not calibrated GT)**.
+
+See [KNOWN_CAMERA_EXPERIMENT.md](KNOWN_CAMERA_EXPERIMENT.md) for the protocol,
+camera limitations, runnable CLI commands, and interpretation rules.

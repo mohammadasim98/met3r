@@ -1,0 +1,108 @@
+{
+  "experiment_id": "20260727_adjacent16_core_v1",
+  "reconstruction_root": "/root/dev/ByteSize/Reconstruction",
+  "output_root": "/root/dev/ByteSize/Reconstruction/met3r_upper_experiments/20260727_adjacent16_core_v1",
+  "stress_root": "/root/dev/ByteSize/Reconstruction/met3r_upper_experiments/20260727_adjacent16_core_v1/inputs/stress",
+  "source_root": "/root/dev/ByteSize/Reconstruction/sample_result",
+  "camera_label": "fixed/precomputed DA3 cameras (not calibrated GT)",
+  "source_size": 1080,
+  "stage_size": 504,
+  "seed": 42,
+  "camera_order": [
+    "0", "11", "22", "33", "43", "44", "45", "46", "47", "1", "2", "3",
+    "4", "5", "6", "7", "8", "9", "10", "12", "13", "14", "15", "16",
+    "17", "18", "19", "20", "21", "23", "24", "25", "26", "27", "28", "29",
+    "30", "31", "32", "34", "35", "36", "37", "38", "39", "40", "41", "42"
+  ],
+  "quartets": [
+    {"quartet_id": "q0", "view_ids": ["1", "2", "3", "4"]},
+    {"quartet_id": "q1", "view_ids": ["14", "15", "16", "17"]},
+    {"quartet_id": "q2", "view_ids": ["27", "28", "29", "30"]},
+    {"quartet_id": "q3", "view_ids": ["40", "41", "42", "0"]}
+  ],
+  "shoes": {
+    "air_huarache_run_ultra_111449": "AIR HUARACHE RUN ULTRA(111449)",
+    "air_max_90_nrg_dc6083_500": "AIR MAX 90 NRG(DC6083-500)",
+    "air_max_90_surplus_cq7743_300": "AIR MAX 90 SURPLUS(CQ7743-300)",
+    "air_tuned_max_cv6984_001": "AIR TUNED MAX(CV6984-001)"
+  },
+  "metric": {
+    "relative_depth_tolerance": 0.03,
+    "min_overlap_fraction": 0.08,
+    "confidence_percentile": 10.0
+  },
+  "physical_gpus": [0, 1, 2, 3],
+  "corruptions": {
+    "translation": [0.03, 0.06, 0.12, 0.2],
+    "thin_plate_warp": [0.25, 0.5, 0.75, 1.0],
+    "jpeg": [0.25, 0.5, 0.75, 1.0],
+    "identity_swap": [1.0]
+  },
+  "models": {
+    "dino_vitb16": {"revision": "7c446df5b9f45747937fb0d72314eb9f7b66930a"},
+    "dinov2_vitb14": {"revision": "f9e44c814b77203eaa57a6bdbbd535f21ede1415"},
+    "dinov3_vitb16": {"revision": "5931719e67bbdb9737e363e781fb0c67687896bc"},
+    "dinov3_vitl16_pixal3d": {"revision": "3c276edd87d6f6e569ff0c4400e086807d0f3881"},
+    "naf_revision": "37f2dfc180f2de53d98bd601109c0da0dd6b0f43",
+    "da3_model_id": "depth-anything/DA3NESTED-GIANT-LARGE",
+    "da3_revision": "8615eefb62f2db4f8d6ebaa59160086981672829"
+  },
+  "feature_variants": [
+    {"feature_track": "user_37_grid_track", "backbone": "dino_vitb16", "input_size": 592, "feature_mode": "bilinear", "resolution": 37},
+    {"feature_track": "user_37_grid_track", "backbone": "dinov2_vitb14", "input_size": 592, "feature_mode": "bilinear", "resolution": 37},
+    {"feature_track": "user_37_grid_track", "backbone": "dinov3_vitb16", "input_size": 592, "feature_mode": "bilinear", "resolution": 37},
+    {"feature_track": "user_37_grid_track", "backbone": "dinov3_vitl16_pixal3d", "input_size": 592, "feature_mode": "bilinear", "resolution": 37},
+    {"feature_track": "user_37_grid_track", "backbone": "dinov3_vitl16_pixal3d", "input_size": 592, "feature_mode": "bilinear", "resolution": 74},
+    {"feature_track": "user_37_grid_track", "backbone": "dinov3_vitl16_pixal3d", "input_size": 592, "feature_mode": "naf_normal_guide", "resolution": 74},
+    {"feature_track": "user_37_grid_track", "backbone": "dinov3_vitl16_pixal3d", "input_size": 592, "feature_mode": "bilinear", "resolution": 148},
+    {"feature_track": "user_37_grid_track", "backbone": "dinov3_vitl16_pixal3d", "input_size": 592, "feature_mode": "naf_normal_guide", "resolution": 148},
+    {"feature_track": "user_37_grid_track", "backbone": "dinov3_vitl16_pixal3d", "input_size": 592, "feature_mode": "bilinear", "resolution": 296},
+    {"feature_track": "user_37_grid_track", "backbone": "dinov3_vitl16_pixal3d", "input_size": 592, "feature_mode": "naf_normal_guide", "resolution": 296},
+    {"feature_track": "user_37_grid_track", "backbone": "dinov3_vitl16_pixal3d", "input_size": 592, "feature_mode": "bilinear", "resolution": 592},
+    {"feature_track": "user_37_grid_track", "backbone": "dinov3_vitl16_pixal3d", "input_size": 592, "feature_mode": "naf_normal_guide", "resolution": 592}
+  ],
+  "geometry_calibration_variant_keys": [
+    "user_37_grid_track__dinov3_vitl16_pixal3d__592__bilinear__37",
+    "user_37_grid_track__dinov3_vitl16_pixal3d__592__naf_normal_guide__592"
+  ],
+  "visualization": {
+    "policy": "posthoc_audit_only"
+  },
+  "visualization_variant_keys": [
+    "user_37_grid_track__dinov3_vitl16_pixal3d__592__bilinear__37",
+    "user_37_grid_track__dinov3_vitl16_pixal3d__592__naf_normal_guide__592"
+  ],
+  "geometry_calibration": {
+    "rotation_degrees": [0.25, 0.5, 1.0, 2.0, 5.0],
+    "relative_translation": [0.0025, 0.005, 0.01, 0.02],
+    "depth_scale": [1.01, 1.02, 1.05, 1.1],
+    "relative_depth_noise_std": [0.005, 0.01, 0.02, 0.05]
+  },
+  "preflight": {
+    "minimum_adjacent_orbit_degrees": 5.0,
+    "maximum_adjacent_orbit_degrees": 10.0,
+    "minimum_processed_image_correlation": 0.99,
+    "minimum_symmetric_pass_rate": 0.9,
+    "minimum_median_directional_overlap": 0.2,
+    "minimum_per_shoe_pair_coverage": 0.8
+  },
+  "runtime": {
+    "physical_gpu_count": 4,
+    "maximum_projected_hours": 24.0,
+    "feature_wall_time_multiplier": 1.25,
+    "fixed_finalize_hours": 2.0
+  },
+  "analyzability": {
+    "minimum_controlled_complete_series_coverage": 0.8,
+    "minimum_all_four_shoe_primary_cell_rate": 0.8,
+    "minimum_common_support_retention": 0.7,
+    "minimum_stress_symmetric_pass_rate": 0.7,
+    "maximum_unexplained_job_failures": 0
+  },
+  "expected_rows": {
+    "controlled": 31104,
+    "geometry_calibration": 6528,
+    "stress": 1152,
+    "total": 38784
+  }
+}
